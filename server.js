@@ -1124,6 +1124,10 @@ async function buildMusicPersonItem(group, forceRefresh) {
   return item;
 }
 
+function hasMusicPersonPhotoCount(item) {
+  return item && Object.prototype.hasOwnProperty.call(item, 'photoCount');
+}
+
 async function groupMusicPeopleByLetter(rows, forceRefresh) {
   const groups = new Map();
   const sortedPeople = buildMusicPersonGroups(rows).sort((a, b) => {
@@ -1141,6 +1145,7 @@ async function groupMusicPeopleByLetter(rows, forceRefresh) {
 
   items.forEach(({ person, item }) => {
     if (!hasJsonFields(item)) return;
+    if (!hasMusicPersonPhotoCount(item)) return;
     peopleTotal += 1;
 
     const letter = getMusicPersonLetterFromName(person.name);
