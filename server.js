@@ -48,7 +48,7 @@ const smugTotalPhotosInFlight = new Map();
 const ROUTES = {
   '/api/music/bands': { label: 'Music-Bands', gidEnv: 'GID_MUSIC_BANDS' },
   '/api/music/shows': { label: 'Music-Shows', gidEnv: 'GID_MUSIC_SHOWS' },
-  '/api/music/people': { label: 'Music-People', gidEnv: 'GID_MUSIC_PEOPLE' },
+  '/api/music/people': { label: 'Music-People', gidEnv: 'GID_MUSIC_PEOPLE', defaultGid: '2008484091' },
   '/api/music/venues': { label: 'Music-Venue', gidEnv: 'GID_MUSIC_VENUES' },
   '/api/wrestling/shows': { label: 'Wrestling-Shows', gidEnv: 'GID_WRESTLING_SHOWS' },
   '/api/wrestling/people': { label: 'Wrestling-People', gidEnv: 'GID_WRESTLING_PEOPLE' },
@@ -824,8 +824,71 @@ function buildMusicShowsResponse(payload) {
   };
 }
 
+function getMusicPersonName(row) {
+  return String(row.name || '').trim();
+}
+
+function getMusicPersonLetter(row) {
+  const firstChar = getMusicPersonName(row).charAt(0).toUpperCase();
+  return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
+}
+
+function buildMusicPersonItem(row) {
+  return compactJsonFields({
+    name: row.name,
+    category: row.category,
+    aliases: row.aliases,
+    bands: row.bands,
+    instrument: row.instrument
+  });
+}
+
+function groupMusicPeopleByLetter(rows) {
+  const groups = new Map();
+  const sortedRows = rows.slice().sort((a, b) => {
+    const aLetter = getMusicPersonLetter(a);
+    const bLetter = getMusicPersonLetter(b);
+
+    return aLetter.localeCompare(bLetter, undefined, { numeric: true, sensitivity: 'base' }) ||
+      getMusicPersonName(a).localeCompare(getMusicPersonName(b), undefined, { numeric: true, sensitivity: 'base' });
+  });
+
+  sortedRows.forEach((row) => {
+    const item = buildMusicPersonItem(row);
+    if (!hasJsonFields(item)) return;
+
+    const letter = getMusicPersonLetter(row);
+    if (!groups.has(letter)) groups.set(letter, []);
+    groups.get(letter).push(item);
+  });
+
+  const data = {};
+  for (const letter of ['#', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']) {
+    if (groups.has(letter)) data[letter] = groups.get(letter);
+  }
+
+  return data;
+}
+
+function buildMusicPeopleResponse(payload) {
+  const generated = new Date();
+  const data = groupMusicPeopleByLetter(payload.rows);
+  const source = { name: payload.source };
+  if (hasJsonFields(data)) source.data = data;
+
+  return {
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    stats: {
+      peopleTotal: payload.rows.filter((row) => hasJsonFields(buildMusicPersonItem(row))).length
+    },
+    route: payload.route,
+    source
+  };
+}
+
 async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
-  const gid = normalizeSheetGid(process.env[cfg.gidEnv]);
+  const gid = normalizeSheetGid(process.env[cfg.gidEnv] || cfg.defaultGid);
   const cacheKey = `${routePath}:${gid}`;
   const hit = cache.get(cacheKey);
 
@@ -880,6 +943,9 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
       }
       if (routePath === '/api/music/shows') {
         return res.json(buildMusicShowsResponse(payload));
+      }
+      if (routePath === '/api/music/people') {
+        return res.json(buildMusicPeopleResponse(payload));
       }
       return res.json(payload);
     } catch (err) {
