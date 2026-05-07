@@ -1,6 +1,34 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
+
+function loadLocalEnv() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+
+  const text = fs.readFileSync(envPath, 'utf8');
+  text.split(/\r?\n/).forEach((line) => {
+    const clean = String(line || '').trim();
+    if (!clean || clean.startsWith('#')) return;
+
+    const eqIdx = clean.indexOf('=');
+    if (eqIdx === -1) return;
+
+    const key = clean.slice(0, eqIdx).trim();
+    let value = clean.slice(eqIdx + 1).trim();
+    if (!key || process.env[key] != null) return;
+
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  });
+}
+
+loadLocalEnv();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -166,6 +194,47 @@ function getSmugAlbumImageCount(album) {
   return null;
 }
 
+function getSmugAlbumKey(album) {
+  const keys = ['AlbumKey', 'albumKey', 'Key', 'key'];
+  for (const key of keys) {
+    const value = String(album && album[key] || '').trim();
+    if (value) return value;
+  }
+
+  const candidates = [
+    album && album.Uri,
+    album && album.URI,
+    album && album.Url,
+    album && album.URL,
+    album && album.WebUri,
+    album && album.Uris && album.Uris.Album && album.Uris.Album.Uri,
+    album && album.Uris && album.Uris.Album && album.Uris.Album.URI
+  ];
+
+  for (const candidate of candidates) {
+    const match = String(candidate || '').match(/\/album\/([^/?#]+)/i);
+    if (match && match[1]) return match[1];
+  }
+
+  return '';
+}
+
+function getSmugAlbumImages(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const images = resp && (resp.AlbumImage || resp.AlbumImages || resp.Images || resp.images);
+  if (Array.isArray(images)) return images;
+  return images && typeof images === 'object' ? [images] : [];
+}
+
+function getSmugPageTotal(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const pages = resp && resp.Pages && typeof resp.Pages === 'object' ? resp.Pages : null;
+  if (!pages) return null;
+
+  const total = Number(pages.Total || pages.total);
+  return Number.isFinite(total) && total >= 0 ? total : null;
+}
+
 function getMusicBandSmugTarget(row) {
   const region = String(row.region || '').trim().replace(/^\/+|\/+$/g, '');
   const folder = String(row.smug_folder || row.slug_folder || '').trim().replace(/^\/+|\/+$/g, '');
@@ -180,12 +249,30 @@ function buildMusicBandAlbumsEndpoint(target) {
   return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!albums?_accept=application/json`;
 }
 
-function sumSmugAlbumImageCounts(albums) {
+async function getSmugAlbumTotalPhotos(album) {
+  const directCount = getSmugAlbumImageCount(album);
+  if (directCount != null) return directCount;
+
+  const albumKey = getSmugAlbumKey(album);
+  if (!albumKey) return null;
+
+  try {
+    const json = await fetchSmugJson(`/album/${encodeURIComponent(albumKey)}!images?count=1&start=1&_accept=application/json`);
+    const pageTotal = getSmugPageTotal(json);
+    if (pageTotal != null) return pageTotal;
+    return getSmugAlbumImages(json).length;
+  } catch (err) {
+    console.warn(`Music-Bands SmugMug album count failed for ${albumKey}:`, err && err.message ? err.message : String(err));
+    return null;
+  }
+}
+
+async function sumSmugAlbumImageCounts(albums) {
   let total = 0;
   let sawCount = false;
+  const counts = await mapWithConcurrency(albums, 3, getSmugAlbumTotalPhotos);
 
-  for (const album of albums) {
-    const count = getSmugAlbumImageCount(album);
+  for (const count of counts) {
     if (count == null) continue;
     sawCount = true;
     total += count;
@@ -213,7 +300,7 @@ async function fetchMusicBandTotalPhotos(row, forceRefresh) {
   const run = (async () => {
     try {
       const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
-      const total = sumSmugAlbumImageCounts(getSmugAlbums(json));
+      const total = await sumSmugAlbumImageCounts(getSmugAlbums(json));
       const totalPhotos = total > 0 ? String(total) : null;
       smugTotalPhotosCache.set(cacheKey, { totalPhotos, fetchedAt: Date.now() });
       return totalPhotos;
