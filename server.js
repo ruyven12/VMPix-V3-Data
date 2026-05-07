@@ -7,7 +7,15 @@ const PORT = process.env.PORT || 3000;
 
 const SHEET_ID = String(process.env.GOOGLE_SHEET_ID || '').trim();
 const CACHE_TTL_MS = Math.max(15_000, Number(process.env.SHEET_CACHE_TTL_MS || 1000 * 60 * 5));
+const SMUG_API_KEY = String(process.env.SMUG_API_KEY || '').trim();
+const SMUG_NICKNAME = String(process.env.SMUG_NICKNAME || 'vmpix').trim();
+const SMUG_TOTAL_PHOTOS_CACHE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.SMUG_TOTAL_PHOTOS_CACHE_TTL_MS || 1000 * 60 * 60 * 12) || 1000 * 60 * 60 * 12
+);
 const cache = new Map();
+const smugTotalPhotosCache = new Map();
+const smugTotalPhotosInFlight = new Map();
 
 const ROUTES = {
   '/api/music/bands': { label: 'Music-Bands', gidEnv: 'GID_MUSIC_BANDS' },
@@ -117,6 +125,129 @@ function formatEasternGeneratedTime(date) {
   }).format(date);
 }
 
+function buildSmugApiUrl(endpoint) {
+  const joiner = String(endpoint || '').includes('?') ? '&' : '?';
+  return `https://api.smugmug.com/api/v2${endpoint}${joiner}APIKey=${encodeURIComponent(SMUG_API_KEY)}`;
+}
+
+async function fetchSmugJson(endpoint) {
+  const res = await fetch(buildSmugApiUrl(endpoint), {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'VMPix-V3-Data/1.0'
+    }
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
+    throw new Error(`SmugMug returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+  }
+
+  return res.json();
+}
+
+function getSmugAlbums(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const albums = resp && (resp.Album || resp.Albums || resp.album || resp.albums);
+  if (Array.isArray(albums)) return albums;
+  return albums && typeof albums === 'object' ? [albums] : [];
+}
+
+function getSmugAlbumImageCount(album) {
+  const keys = ['ImageCount', 'imageCount', 'image_count', 'PhotoCount', 'photoCount', 'photo_count', 'TotalPhotos', 'totalPhotos', 'TotalImages', 'totalImages'];
+  for (const key of keys) {
+    const count = Number(album && album[key]);
+    if (Number.isFinite(count) && count >= 0) return count;
+  }
+
+  const stats = album && album.Stats && typeof album.Stats === 'object' ? album.Stats : null;
+  if (stats) return getSmugAlbumImageCount(stats);
+  return null;
+}
+
+function getMusicBandSmugTarget(row) {
+  const region = String(row.region || '').trim().replace(/^\/+|\/+$/g, '');
+  const folder = String(row.smug_folder || row.slug_folder || '').trim().replace(/^\/+|\/+$/g, '');
+  if (!region || !folder) return null;
+  return { region, folder };
+}
+
+function buildMusicBandAlbumsEndpoint(target) {
+  const path = ['Music', 'Archives', 'Bands', target.region, target.folder]
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!albums?_accept=application/json`;
+}
+
+function sumSmugAlbumImageCounts(albums) {
+  let total = 0;
+  let sawCount = false;
+
+  for (const album of albums) {
+    const count = getSmugAlbumImageCount(album);
+    if (count == null) continue;
+    sawCount = true;
+    total += count;
+  }
+
+  return sawCount ? total : null;
+}
+
+async function fetchMusicBandTotalPhotos(row, forceRefresh) {
+  if (!SMUG_API_KEY) return null;
+
+  const target = getMusicBandSmugTarget(row);
+  if (!target) return null;
+
+  const cacheKey = `${target.region}/${target.folder}`;
+  const hit = smugTotalPhotosCache.get(cacheKey);
+  if (!forceRefresh && hit && Date.now() - hit.fetchedAt < SMUG_TOTAL_PHOTOS_CACHE_TTL_MS) {
+    return hit.totalPhotos;
+  }
+
+  if (smugTotalPhotosInFlight.has(cacheKey)) {
+    return smugTotalPhotosInFlight.get(cacheKey);
+  }
+
+  const run = (async () => {
+    try {
+      const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
+      const total = sumSmugAlbumImageCounts(getSmugAlbums(json));
+      const totalPhotos = total > 0 ? String(total) : null;
+      smugTotalPhotosCache.set(cacheKey, { totalPhotos, fetchedAt: Date.now() });
+      return totalPhotos;
+    } catch (err) {
+      console.warn(`Music-Bands SmugMug totalPhotos failed for ${cacheKey}:`, err && err.message ? err.message : String(err));
+      smugTotalPhotosCache.set(cacheKey, { totalPhotos: null, fetchedAt: Date.now() });
+      return null;
+    } finally {
+      smugTotalPhotosInFlight.delete(cacheKey);
+    }
+  })();
+
+  smugTotalPhotosInFlight.set(cacheKey, run);
+  return run;
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  const results = new Array(list.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < list.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(list[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.min(Math.max(1, limit), list.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
 function compactJsonFields(fields) {
   const out = {};
   Object.entries(fields || {}).forEach(([key, value]) => {
@@ -169,12 +300,13 @@ function getMusicBandLetter(row) {
   return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
 }
 
-function buildMusicBandItem(row) {
+async function buildMusicBandItem(row, forceRefresh) {
   const band = getMusicBandName(row);
   const bandId = String(row.band_id || '').trim();
   const personnel = {};
   const members = parsePersonnelString(row.members);
   const pastMembers = parsePersonnelString(row.past_members);
+  const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh);
   const general = compactJsonFields({
     name: band,
     smug_folder: row.smug_folder || row.slug_folder,
@@ -187,9 +319,10 @@ function buildMusicBandItem(row) {
     region: row.region,
     location: row.location,
     state: row.state,
-    country: row.country,
+    totalPhotos,
     archived_sets: row.archived_sets || row.sets_archive,
-    total_sets: row.total_sets
+    total_sets: row.total_sets,
+    country: row.country
   });
   const item = {};
 
@@ -205,7 +338,7 @@ function buildMusicBandItem(row) {
   return item;
 }
 
-function groupMusicBandsByLetter(rows) {
+async function groupMusicBandsByLetter(rows, forceRefresh) {
   const groups = new Map();
   const sortedRows = rows.slice().sort((a, b) => {
     const aLetter = getMusicBandLetter(a);
@@ -218,9 +351,13 @@ function groupMusicBandsByLetter(rows) {
       getMusicBandName(a).localeCompare(getMusicBandName(b), undefined, { numeric: true, sensitivity: 'base' });
   });
 
-  for (const row of sortedRows) {
+  const items = await mapWithConcurrency(sortedRows, 4, async (row) => ({
+    row,
+    item: await buildMusicBandItem(row, forceRefresh)
+  }));
+
+  for (const { row, item } of items) {
     const letter = getMusicBandLetter(row);
-    const item = buildMusicBandItem(row);
     if (!hasJsonFields(item)) continue;
     if (!groups.has(letter)) groups.set(letter, []);
     groups.get(letter).push(item);
@@ -234,9 +371,9 @@ function groupMusicBandsByLetter(rows) {
   return data;
 }
 
-function buildMusicBandsResponse(payload) {
+async function buildMusicBandsResponse(payload, forceRefresh) {
   const generated = new Date();
-  const data = groupMusicBandsByLetter(payload.rows);
+  const data = await groupMusicBandsByLetter(payload.rows, forceRefresh);
   const source = { name: payload.source };
   if (hasJsonFields(data)) source.data = data;
 
@@ -297,9 +434,10 @@ app.get('/health', (req, res) => {
 for (const [routePath, cfg] of Object.entries(ROUTES)) {
   app.get(routePath, async (req, res) => {
     try {
-      const payload = await fetchCsvForRoute(routePath, cfg, req.query.refresh === '1');
+      const forceRefresh = req.query.refresh === '1';
+      const payload = await fetchCsvForRoute(routePath, cfg, forceRefresh);
       res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
-      res.json(routePath === '/api/music/bands' ? buildMusicBandsResponse(payload) : payload);
+      res.json(routePath === '/api/music/bands' ? await buildMusicBandsResponse(payload, forceRefresh) : payload);
     } catch (err) {
       res.status(500).json({
         ok: false,
