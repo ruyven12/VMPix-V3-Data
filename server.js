@@ -128,6 +128,10 @@ function compactJsonFields(fields) {
   return out;
 }
 
+function hasJsonFields(value) {
+  return value && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
 function parsePersonnelString(value) {
   const text = String(value || '').trim();
   if (!text) return [];
@@ -142,10 +146,12 @@ function parsePersonnelString(value) {
     if (role && !grouped.get(key).roles.includes(role)) grouped.get(key).roles.push(role);
   });
 
-  return Array.from(grouped.values()).map((item) => ({
-    name: item.name,
-    role: item.roles.join(', ')
-  }));
+  return Array.from(grouped.values()).map((item) => {
+    const person = { name: item.name };
+    const role = item.roles.join(', ');
+    if (role) person.role = role;
+    return person;
+  });
 }
 
 function getMusicBandName(row) {
@@ -165,34 +171,38 @@ function getMusicBandLetter(row) {
 
 function buildMusicBandItem(row) {
   const band = getMusicBandName(row);
+  const bandId = String(row.band_id || '').trim();
   const personnel = {};
   const members = parsePersonnelString(row.members);
   const pastMembers = parsePersonnelString(row.past_members);
+  const general = compactJsonFields({
+    name: band,
+    smug_folder: row.smug_folder || row.slug_folder,
+    logo_url: row.logo_url,
+    status: row.status,
+    tags: row.tags,
+    notes: row.notes
+  });
+  const stats = compactJsonFields({
+    region: row.region,
+    location: row.location,
+    state: row.state,
+    country: row.country,
+    archived_sets: row.archived_sets || row.sets_archive,
+    total_sets: row.total_sets
+  });
+  const item = {};
 
   if (members.length) personnel.members = members;
   if (pastMembers.length) personnel.past_members = pastMembers;
 
-  return {
-    band,
-    band_id: String(row.band_id || '').trim(),
-    general: compactJsonFields({
-      name: band,
-      smug_folder: row.smug_folder || row.slug_folder,
-      logo_url: row.logo_url,
-      status: row.status,
-      tags: row.tags,
-      notes: row.notes
-    }),
-    personnel,
-    stats: compactJsonFields({
-      region: row.region,
-      location: row.location,
-      state: row.state,
-      country: row.country,
-      archived_sets: row.archived_sets || row.sets_archive,
-      total_sets: row.total_sets
-    })
-  };
+  if (band) item.band = band;
+  if (bandId) item.band_id = bandId;
+  if (hasJsonFields(general)) item.general = general;
+  if (hasJsonFields(personnel)) item.personnel = personnel;
+  if (hasJsonFields(stats)) item.stats = stats;
+
+  return item;
 }
 
 function groupMusicBandsByLetter(rows) {
@@ -210,8 +220,10 @@ function groupMusicBandsByLetter(rows) {
 
   for (const row of sortedRows) {
     const letter = getMusicBandLetter(row);
+    const item = buildMusicBandItem(row);
+    if (!hasJsonFields(item)) continue;
     if (!groups.has(letter)) groups.set(letter, []);
-    groups.get(letter).push(buildMusicBandItem(row));
+    groups.get(letter).push(item);
   }
 
   const data = {};
@@ -224,15 +236,16 @@ function groupMusicBandsByLetter(rows) {
 
 function buildMusicBandsResponse(payload) {
   const generated = new Date();
+  const data = groupMusicBandsByLetter(payload.rows);
+  const source = { name: payload.source };
+  if (hasJsonFields(data)) source.data = data;
+
   return {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     count: payload.count,
     route: payload.route,
-    source: {
-      name: payload.source,
-      data: groupMusicBandsByLetter(payload.rows)
-    }
+    source
   };
 }
 
