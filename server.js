@@ -686,6 +686,69 @@ async function buildMusicBandsResponse(payload, forceRefresh) {
   };
 }
 
+function isMusicShowBandKey(key) {
+  const match = String(key || '').match(/^band_?(\d+)$/);
+  if (!match) return false;
+
+  const slot = Number(match[1]);
+  return Number.isInteger(slot) && slot >= 1 && slot <= 20;
+}
+
+function getMusicShowBandValue(row, slot) {
+  return String(row[`band_${slot}`] || row[`band${slot}`] || '').trim();
+}
+
+function buildMusicShowBands(row) {
+  const bands = [];
+
+  for (let slot = 1; slot <= 20; slot++) {
+    const band = getMusicShowBandValue(row, slot);
+    if (band) bands.push({ slot, band });
+  }
+
+  return bands;
+}
+
+function buildMusicShowItem(row) {
+  const item = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    if (isMusicShowBandKey(key)) return;
+    const clean = String(value || '').trim();
+    if (!clean) return;
+    item[key] = clean;
+  });
+
+  const bands = buildMusicShowBands(row);
+  if (bands.length) item.bands = bands;
+
+  return item;
+}
+
+function buildMusicShowsStats(data) {
+  return {
+    showsTotal: data.length,
+    bandsTotal: data.reduce((total, show) => total + (Array.isArray(show.bands) ? show.bands.length : 0), 0)
+  };
+}
+
+function buildMusicShowsResponse(payload) {
+  const generated = new Date();
+  const data = payload.rows
+    .map(buildMusicShowItem)
+    .filter(hasJsonFields);
+  const source = { name: payload.source };
+  if (data.length) source.data = data;
+
+  return {
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    stats: buildMusicShowsStats(data),
+    route: payload.route,
+    source
+  };
+}
+
 async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
   const gid = String(process.env[cfg.gidEnv] || '').trim();
   const cacheKey = `${routePath}:${gid}`;
@@ -737,7 +800,13 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
       const forceRefresh = req.query.refresh === '1';
       const payload = await fetchCsvForRoute(routePath, cfg, forceRefresh);
       res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
-      res.json(routePath === '/api/music/bands' ? await buildMusicBandsResponse(payload, forceRefresh) : payload);
+      if (routePath === '/api/music/bands') {
+        return res.json(await buildMusicBandsResponse(payload, forceRefresh));
+      }
+      if (routePath === '/api/music/shows') {
+        return res.json(buildMusicShowsResponse(payload));
+      }
+      return res.json(payload);
     } catch (err) {
       res.status(500).json({
         ok: false,
