@@ -352,6 +352,7 @@ function hasJsonFields(value) {
 
 function createMusicBandsStats() {
   return {
+    photosTotal: 0,
     bandsLocal: 0,
     photosLocal: 0,
     bandsRegional: 0,
@@ -359,7 +360,11 @@ function createMusicBandsStats() {
     bandsNational: 0,
     photosNational: 0,
     bandsInternational: 0,
-    photosInternational: 0
+    photosInternational: 0,
+    photosLocalPct: '0.000%',
+    photosRegionalPct: '0.000%',
+    photosNationalPct: '0.000%',
+    photosInternationalPct: '0.000%'
   };
 }
 
@@ -381,7 +386,21 @@ function addMusicBandsStats(stats, row, item) {
   const totalPhotos = Number(item && item.stats && item.stats.totalPhotos);
   if (Number.isFinite(totalPhotos) && totalPhotos > 0) {
     stats[keys.photos] += totalPhotos;
+    stats.photosTotal += totalPhotos;
   }
+}
+
+function formatMusicBandsPhotoPct(value, total) {
+  if (!Number.isFinite(total) || total <= 0) return '0.000%';
+  return `${((value / total) * 100).toFixed(3)}%`;
+}
+
+function finalizeMusicBandsStats(stats) {
+  stats.photosLocalPct = formatMusicBandsPhotoPct(stats.photosLocal, stats.photosTotal);
+  stats.photosRegionalPct = formatMusicBandsPhotoPct(stats.photosRegional, stats.photosTotal);
+  stats.photosNationalPct = formatMusicBandsPhotoPct(stats.photosNational, stats.photosTotal);
+  stats.photosInternationalPct = formatMusicBandsPhotoPct(stats.photosInternational, stats.photosTotal);
+  return stats;
 }
 
 function parsePersonnelString(value) {
@@ -491,7 +510,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
     if (groups.has(letter)) data[letter] = groups.get(letter);
   }
 
-  return { data, stats };
+  return { data, stats: finalizeMusicBandsStats(stats) };
 }
 
 async function buildMusicBandsResponse(payload, forceRefresh) {
