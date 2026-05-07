@@ -353,6 +353,7 @@ function hasJsonFields(value) {
 function createMusicBandsStats() {
   return {
     photosTotal: 0,
+    bandsTotal: 0,
     bandsLocal: 0,
     photosLocal: 0,
     bandsRegional: 0,
@@ -364,7 +365,10 @@ function createMusicBandsStats() {
     photosLocalPct: '0.000%',
     photosRegionalPct: '0.000%',
     photosNationalPct: '0.000%',
-    photosInternationalPct: '0.000%'
+    photosInternationalPct: '0.000%',
+    bandsComplete: 0,
+    bandsPartial: 0,
+    bandsNone: 0
   };
 }
 
@@ -378,6 +382,8 @@ function getMusicBandsStatsKeys(region) {
 }
 
 function addMusicBandsStats(stats, row, item) {
+  addMusicBandsSetStats(stats, row);
+
   const keys = getMusicBandsStatsKeys(row && row.region);
   if (!keys) return;
 
@@ -387,6 +393,27 @@ function addMusicBandsStats(stats, row, item) {
   if (Number.isFinite(totalPhotos) && totalPhotos > 0) {
     stats[keys.photos] += totalPhotos;
     stats.photosTotal += totalPhotos;
+  }
+}
+
+function getSetCountNumber(value) {
+  const clean = String(value || '').replace(/,/g, '').trim();
+  if (!clean) return null;
+
+  const number = Number(clean);
+  return Number.isFinite(number) ? number : null;
+}
+
+function addMusicBandsSetStats(stats, row) {
+  const totalSets = getSetCountNumber(row && row.total_sets);
+  const archivedSets = getSetCountNumber(row && (row.archived_sets || row.archive_sets || row.sets_archive));
+
+  if (totalSets == null || archivedSets == null || totalSets <= 0 || archivedSets <= 0) {
+    stats.bandsNone += 1;
+  } else if (totalSets === archivedSets) {
+    stats.bandsComplete += 1;
+  } else {
+    stats.bandsPartial += 1;
   }
 }
 
@@ -447,6 +474,7 @@ function formatMusicBandsPhotoPct(value, total) {
 }
 
 function finalizeMusicBandsStats(stats) {
+  stats.bandsTotal = stats.bandsLocal + stats.bandsRegional + stats.bandsNational + stats.bandsInternational;
   stats.photosLocalPct = formatMusicBandsPhotoPct(stats.photosLocal, stats.photosTotal);
   stats.photosRegionalPct = formatMusicBandsPhotoPct(stats.photosRegional, stats.photosTotal);
   stats.photosNationalPct = formatMusicBandsPhotoPct(stats.photosNational, stats.photosTotal);
