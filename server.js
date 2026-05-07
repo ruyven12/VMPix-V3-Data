@@ -104,6 +104,32 @@ function getCsvUrl(gid) {
   return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(SHEET_ID)}/export?format=csv&gid=${encodeURIComponent(String(gid).trim())}`;
 }
 
+function formatEasternGeneratedTime(date) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short'
+  }).format(date);
+}
+
+function buildMusicBandsResponse(payload) {
+  const generated = new Date();
+  return {
+    ok: payload.ok,
+    route: payload.route,
+    source: payload.source,
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    count: payload.count,
+    data: payload.rows
+  };
+}
+
 async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
   const gid = String(process.env[cfg.gidEnv] || '').trim();
   const cacheKey = `${routePath}:${gid}`;
@@ -154,7 +180,7 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
     try {
       const payload = await fetchCsvForRoute(routePath, cfg, req.query.refresh === '1');
       res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
-      res.json(payload);
+      res.json(routePath === '/api/music/bands' ? buildMusicBandsResponse(payload) : payload);
     } catch (err) {
       res.status(500).json({
         ok: false,
