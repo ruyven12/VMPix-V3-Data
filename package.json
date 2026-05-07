@@ -1,0 +1,16 @@
+{
+  "name": "vmpix-v3-data",
+  "version": "0.1.0",
+  "description": "Unified VMPix V3 data backend for archive tabs.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
