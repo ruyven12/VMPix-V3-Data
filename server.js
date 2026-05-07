@@ -134,10 +134,21 @@ function parseCsv(csvText) {
   return { headers: originalHeaders, normalizedHeaders: headers, rows };
 }
 
+function normalizeSheetGid(gid) {
+  const raw = String(gid || '').trim();
+  if (!raw) return '';
+
+  const match = raw.match(/[?&#]gid=([0-9]+)/i) || raw.match(/^gid=([0-9]+)$/i);
+  if (match && match[1]) return match[1];
+
+  return raw;
+}
+
 function getCsvUrl(gid) {
   if (!SHEET_ID) throw new Error('Missing GOOGLE_SHEET_ID environment variable.');
-  if (!String(gid || '').trim()) throw new Error('Missing tab GID environment variable.');
-  return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(SHEET_ID)}/export?format=csv&gid=${encodeURIComponent(String(gid).trim())}`;
+  const cleanGid = normalizeSheetGid(gid);
+  if (!cleanGid) throw new Error('Missing tab GID environment variable.');
+  return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(SHEET_ID)}/export?format=csv&gid=${encodeURIComponent(cleanGid)}`;
 }
 
 function formatEasternGeneratedTime(date) {
@@ -523,7 +534,7 @@ function applyStatsSheetRow(stats, cells) {
 }
 
 async function fetchStatsSheetCsv(forceRefresh) {
-  const gid = String(process.env.GID_STATS || '835637138').trim();
+  const gid = normalizeSheetGid(process.env.GID_STATS || '835637138');
   const cacheKey = `stats-sheet-csv:${gid}`;
   const hit = cache.get(cacheKey);
 
@@ -750,7 +761,7 @@ function buildMusicShowsResponse(payload) {
 }
 
 async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
-  const gid = String(process.env[cfg.gidEnv] || '').trim();
+  const gid = normalizeSheetGid(process.env[cfg.gidEnv]);
   const cacheKey = `${routePath}:${gid}`;
   const hit = cache.get(cacheKey);
 
