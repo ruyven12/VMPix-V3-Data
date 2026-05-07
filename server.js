@@ -736,6 +736,37 @@ function buildMusicShowItem(row) {
   return item;
 }
 
+function getMusicShowDateValue(row) {
+  const dateKeys = ['show_date', 'date', 'event_date', 'showdate', 'eventdate'];
+
+  for (const key of dateKeys) {
+    const value = String(row[key] || '').trim();
+    if (value) return value;
+  }
+
+  return '';
+}
+
+function getMusicShowDateTime(row) {
+  const value = getMusicShowDateValue(row);
+  if (!value) return null;
+
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function sortMusicShowRowsByDate(rows) {
+  return rows
+    .map((row, index) => ({ row, index, dateTime: getMusicShowDateTime(row) }))
+    .sort((a, b) => {
+      if (a.dateTime == null && b.dateTime == null) return a.index - b.index;
+      if (a.dateTime == null) return 1;
+      if (b.dateTime == null) return -1;
+      return a.dateTime - b.dateTime || a.index - b.index;
+    })
+    .map((entry) => entry.row);
+}
+
 function getMusicShowBandViewKey(band) {
   return String(band || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -768,7 +799,7 @@ function buildMusicShowsStats(data) {
 
 function buildMusicShowsResponse(payload) {
   const generated = new Date();
-  const data = payload.rows
+  const data = sortMusicShowRowsByDate(payload.rows)
     .map(buildMusicShowItem)
     .filter(hasJsonFields);
   addMusicShowBandViewCounts(data);
