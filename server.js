@@ -117,8 +117,39 @@ function formatEasternGeneratedTime(date) {
   }).format(date);
 }
 
-function getMusicBandSortValue(row) {
-  const keys = ['band', 'band_name', 'name', 'artist', 'artist_name', 'performer', 'act', 'title'];
+function compactJsonFields(fields) {
+  const out = {};
+  Object.entries(fields || {}).forEach(([key, value]) => {
+    if (value == null) return;
+    const clean = String(value).trim();
+    if (!clean) return;
+    out[key] = clean;
+  });
+  return out;
+}
+
+function parsePersonnelString(value) {
+  const text = String(value || '').trim();
+  if (!text) return [];
+
+  const grouped = new Map();
+  text.split(';').forEach((entry) => {
+    const [name, role] = entry.split('|').map((part) => String(part || '').trim());
+    if (!name) return;
+
+    const key = name.toLowerCase();
+    if (!grouped.has(key)) grouped.set(key, { name, roles: [] });
+    if (role && !grouped.get(key).roles.includes(role)) grouped.get(key).roles.push(role);
+  });
+
+  return Array.from(grouped.values()).map((item) => ({
+    name: item.name,
+    role: item.roles.join(', ')
+  }));
+}
+
+function getMusicBandName(row) {
+  const keys = ['band', 'name', 'band_name', 'artist', 'artist_name', 'performer', 'act', 'title'];
   for (const key of keys) {
     const value = String(row[key] || '').trim();
     if (value) return value;
@@ -127,14 +158,60 @@ function getMusicBandSortValue(row) {
   return String(Object.values(row).find((value) => String(value || '').trim()) || '').trim();
 }
 
+function getMusicBandLetter(row) {
+  const firstChar = getMusicBandName(row).charAt(0).toUpperCase();
+  return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
+}
+
+function buildMusicBandItem(row) {
+  const band = getMusicBandName(row);
+  const personnel = {};
+  const members = parsePersonnelString(row.members);
+  const pastMembers = parsePersonnelString(row.past_members);
+
+  if (members.length) personnel.members = members;
+  if (pastMembers.length) personnel.past_members = pastMembers;
+
+  return {
+    band,
+    band_id: String(row.band_id || '').trim(),
+    general: compactJsonFields({
+      name: band,
+      smug_folder: row.smug_folder || row.slug_folder,
+      logo_url: row.logo_url,
+      status: row.status,
+      tags: row.tags,
+      notes: row.notes
+    }),
+    personnel,
+    stats: compactJsonFields({
+      region: row.region,
+      location: row.location,
+      state: row.state,
+      country: row.country,
+      archived_sets: row.archived_sets || row.sets_archive,
+      total_sets: row.total_sets
+    })
+  };
+}
+
 function groupMusicBandsByLetter(rows) {
   const groups = new Map();
+  const sortedRows = rows.slice().sort((a, b) => {
+    const aLetter = getMusicBandLetter(a);
+    const bLetter = getMusicBandLetter(b);
+    const aBandId = String(a.band_id || '').trim();
+    const bBandId = String(b.band_id || '').trim();
 
-  for (const row of rows) {
-    const firstChar = getMusicBandSortValue(row).charAt(0).toUpperCase();
-    const letter = firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
+    return aLetter.localeCompare(bLetter, undefined, { numeric: true, sensitivity: 'base' }) ||
+      aBandId.localeCompare(bBandId, undefined, { numeric: true, sensitivity: 'base' }) ||
+      getMusicBandName(a).localeCompare(getMusicBandName(b), undefined, { numeric: true, sensitivity: 'base' });
+  });
+
+  for (const row of sortedRows) {
+    const letter = getMusicBandLetter(row);
     if (!groups.has(letter)) groups.set(letter, []);
-    groups.get(letter).push(row);
+    groups.get(letter).push(buildMusicBandItem(row));
   }
 
   const data = {};
