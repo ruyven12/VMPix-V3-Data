@@ -350,6 +350,40 @@ function hasJsonFields(value) {
   return value && typeof value === 'object' && Object.keys(value).length > 0;
 }
 
+function createMusicBandsStats() {
+  return {
+    bandsLocal: 0,
+    photosLocal: 0,
+    bandsRegional: 0,
+    photosRegional: 0,
+    bandsNational: 0,
+    photosNational: 0,
+    bandsInternational: 0,
+    photosInternational: 0
+  };
+}
+
+function getMusicBandsStatsKeys(region) {
+  const clean = String(region || '').trim().toLowerCase();
+  if (clean === 'local') return { bands: 'bandsLocal', photos: 'photosLocal' };
+  if (clean === 'regional') return { bands: 'bandsRegional', photos: 'photosRegional' };
+  if (clean === 'national') return { bands: 'bandsNational', photos: 'photosNational' };
+  if (clean === 'international') return { bands: 'bandsInternational', photos: 'photosInternational' };
+  return null;
+}
+
+function addMusicBandsStats(stats, row, item) {
+  const keys = getMusicBandsStatsKeys(row && row.region);
+  if (!keys) return;
+
+  stats[keys.bands] += 1;
+
+  const totalPhotos = Number(item && item.stats && item.stats.totalPhotos);
+  if (Number.isFinite(totalPhotos) && totalPhotos > 0) {
+    stats[keys.photos] += totalPhotos;
+  }
+}
+
 function parsePersonnelString(value) {
   const text = String(value || '').trim();
   if (!text) return [];
@@ -427,6 +461,7 @@ async function buildMusicBandItem(row, forceRefresh) {
 
 async function groupMusicBandsByLetter(rows, forceRefresh) {
   const groups = new Map();
+  const stats = createMusicBandsStats();
   const sortedRows = rows.slice().sort((a, b) => {
     const aLetter = getMusicBandLetter(a);
     const bLetter = getMusicBandLetter(b);
@@ -446,6 +481,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
   for (const { row, item } of items) {
     const letter = getMusicBandLetter(row);
     if (!hasJsonFields(item)) continue;
+    addMusicBandsStats(stats, row, item);
     if (!groups.has(letter)) groups.set(letter, []);
     groups.get(letter).push(item);
   }
@@ -455,19 +491,19 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
     if (groups.has(letter)) data[letter] = groups.get(letter);
   }
 
-  return data;
+  return { data, stats };
 }
 
 async function buildMusicBandsResponse(payload, forceRefresh) {
   const generated = new Date();
-  const data = await groupMusicBandsByLetter(payload.rows, forceRefresh);
+  const bands = await groupMusicBandsByLetter(payload.rows, forceRefresh);
   const source = { name: payload.source };
-  if (hasJsonFields(data)) source.data = data;
+  if (hasJsonFields(bands.data)) source.data = bands.data;
 
   return {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
-    count: payload.count,
+    stats: bands.stats,
     route: payload.route,
     source
   };
