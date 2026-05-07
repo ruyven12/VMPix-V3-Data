@@ -120,13 +120,14 @@ function formatEasternGeneratedTime(date) {
 function buildMusicBandsResponse(payload) {
   const generated = new Date();
   return {
-    ok: payload.ok,
-    route: payload.route,
-    source: payload.source,
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     count: payload.count,
-    data: payload.rows
+    route: payload.route,
+    source: {
+      name: payload.source,
+      data: payload.rows
+    }
   };
 }
 
