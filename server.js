@@ -44,6 +44,8 @@ const SMUG_TOTAL_PHOTOS_CACHE_TTL_MS = Math.max(
 const cache = new Map();
 const smugTotalPhotosCache = new Map();
 const smugTotalPhotosInFlight = new Map();
+const smugPeoplePhotoCountCache = new Map();
+const smugPeoplePhotoCountInFlight = new Map();
 
 const ROUTES = {
   '/api/music/bands': { label: 'Music-Bands', gidEnv: 'GID_MUSIC_BANDS' },
@@ -244,6 +246,116 @@ function getSmugPageTotal(json) {
 
   const total = Number(pages.Total || pages.total);
   return Number.isFinite(total) && total >= 0 ? total : null;
+}
+
+function getSmugPageCount(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const pages = resp && resp.Pages && typeof resp.Pages === 'object' ? resp.Pages : null;
+  if (!pages) return null;
+
+  const count = Number(pages.Count || pages.count);
+  return Number.isFinite(count) && count >= 0 ? count : null;
+}
+
+function hasSmugNextPage(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const pages = resp && resp.Pages && typeof resp.Pages === 'object' ? resp.Pages : null;
+  return !!(pages && (pages.NextPage || pages.nextPage));
+}
+
+function getSmugSearchImages(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const images = resp && (resp.Image || resp.Images || resp.AlbumImage || resp.AlbumImages || resp.image || resp.images);
+  if (Array.isArray(images)) return images;
+  return images && typeof images === 'object' ? [images] : [];
+}
+
+function getSmugImageCaption(image) {
+  const direct = image && (image.Caption || image.CaptionText || image.caption || image.captionText);
+  if (typeof direct === 'string') return direct.trim();
+
+  const nested = image && image.Image && (image.Image.Caption || image.Image.CaptionText || image.Image.caption || image.Image.captionText);
+  return typeof nested === 'string' ? nested.trim() : '';
+}
+
+function normalizePersonCaptionText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function captionMatchesPersonName(caption, personName) {
+  const cleanCaption = normalizePersonCaptionText(caption);
+  const cleanName = normalizePersonCaptionText(personName);
+  if (!cleanCaption || !cleanName) return false;
+
+  const captionParts = cleanCaption
+    .replace(/[\uFF1B\u037E]/g, ';')
+    .split(/\s*;\s*/g)
+    .map((part) => normalizePersonCaptionText(part).toLowerCase())
+    .filter(Boolean);
+  if (captionParts.includes(cleanName.toLowerCase())) return true;
+
+  return new RegExp(`(^|[^a-z0-9])${escapeRegExp(cleanName)}([^a-z0-9]|$)`, 'i').test(cleanCaption);
+}
+
+async function searchSmugCaptionPhotoCount(personName) {
+  let photoCount = 0;
+  let start = 1;
+  const count = 200;
+  const query = encodeURIComponent(normalizePersonCaptionText(personName));
+
+  while (true) {
+    const json = await fetchSmugJson(`/user/${encodeURIComponent(SMUG_NICKNAME)}!imagesearch?q=${query}&count=${count}&start=${start}&_accept=application/json&_expand=Image`);
+    const images = getSmugSearchImages(json);
+    if (!images.length) break;
+
+    images.forEach((image) => {
+      if (captionMatchesPersonName(getSmugImageCaption(image), personName)) photoCount += 1;
+    });
+
+    const pageCount = getSmugPageCount(json);
+    if (!hasSmugNextPage(json) || pageCount == null || pageCount < count) break;
+    start += pageCount;
+  }
+
+  return photoCount;
+}
+
+async function fetchMusicPersonPhotoCount(personName, forceRefresh) {
+  if (!SMUG_API_KEY) return null;
+
+  const cleanName = normalizePersonCaptionText(personName);
+  if (!cleanName) return null;
+
+  const cacheKey = cleanName.toLowerCase();
+  const hit = smugPeoplePhotoCountCache.get(cacheKey);
+  if (!forceRefresh && hit && Date.now() - hit.fetchedAt < SMUG_TOTAL_PHOTOS_CACHE_TTL_MS) {
+    return hit.photoCount;
+  }
+
+  if (smugPeoplePhotoCountInFlight.has(cacheKey)) {
+    return smugPeoplePhotoCountInFlight.get(cacheKey);
+  }
+
+  const run = (async () => {
+    try {
+      const photoCount = await searchSmugCaptionPhotoCount(cleanName);
+      smugPeoplePhotoCountCache.set(cacheKey, { photoCount, fetchedAt: Date.now() });
+      return photoCount;
+    } catch (err) {
+      console.warn(`Music-People SmugMug photoCount failed for ${cleanName}:`, err && err.message ? err.message : String(err));
+      smugPeoplePhotoCountCache.set(cacheKey, { photoCount: null, fetchedAt: Date.now() });
+      return null;
+    } finally {
+      smugPeoplePhotoCountInFlight.delete(cacheKey);
+    }
+  })();
+
+  smugPeoplePhotoCountInFlight.set(cacheKey, run);
+  return run;
 }
 
 function getMusicBandSmugTarget(row) {
@@ -833,7 +945,7 @@ function getMusicPersonLetter(row) {
   return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
 }
 
-function buildMusicPersonItem(row) {
+function buildMusicPersonBaseItem(row) {
   return compactJsonFields({
     name: row.name,
     category: row.category,
@@ -843,7 +955,17 @@ function buildMusicPersonItem(row) {
   });
 }
 
-function groupMusicPeopleByLetter(rows) {
+async function buildMusicPersonItem(row, forceRefresh) {
+  const item = buildMusicPersonBaseItem(row);
+  if (!item.name) return item;
+
+  const photoCount = await fetchMusicPersonPhotoCount(item.name, forceRefresh);
+  if (photoCount != null) item.photoCount = photoCount;
+
+  return item;
+}
+
+async function groupMusicPeopleByLetter(rows, forceRefresh) {
   const groups = new Map();
   const sortedRows = rows.slice().sort((a, b) => {
     const aLetter = getMusicPersonLetter(a);
@@ -852,10 +974,15 @@ function groupMusicPeopleByLetter(rows) {
     return aLetter.localeCompare(bLetter, undefined, { numeric: true, sensitivity: 'base' }) ||
       getMusicPersonName(a).localeCompare(getMusicPersonName(b), undefined, { numeric: true, sensitivity: 'base' });
   });
+  const items = await mapWithConcurrency(sortedRows, 2, async (row) => ({
+    row,
+    item: await buildMusicPersonItem(row, forceRefresh)
+  }));
+  let peopleTotal = 0;
 
-  sortedRows.forEach((row) => {
-    const item = buildMusicPersonItem(row);
+  items.forEach(({ row, item }) => {
     if (!hasJsonFields(item)) return;
+    peopleTotal += 1;
 
     const letter = getMusicPersonLetter(row);
     if (!groups.has(letter)) groups.set(letter, []);
@@ -867,20 +994,20 @@ function groupMusicPeopleByLetter(rows) {
     if (groups.has(letter)) data[letter] = groups.get(letter);
   }
 
-  return data;
+  return { data, peopleTotal };
 }
 
-function buildMusicPeopleResponse(payload) {
+async function buildMusicPeopleResponse(payload, forceRefresh) {
   const generated = new Date();
-  const data = groupMusicPeopleByLetter(payload.rows);
+  const people = await groupMusicPeopleByLetter(payload.rows, forceRefresh);
   const source = { name: payload.source };
-  if (hasJsonFields(data)) source.data = data;
+  if (hasJsonFields(people.data)) source.data = people.data;
 
   return {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     stats: {
-      peopleTotal: payload.rows.filter((row) => hasJsonFields(buildMusicPersonItem(row))).length
+      peopleTotal: people.peopleTotal
     },
     route: payload.route,
     source
@@ -945,7 +1072,7 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
         return res.json(buildMusicShowsResponse(payload));
       }
       if (routePath === '/api/music/people') {
-        return res.json(buildMusicPeopleResponse(payload));
+        return res.json(await buildMusicPeopleResponse(payload, forceRefresh));
       }
       return res.json(payload);
     } catch (err) {
