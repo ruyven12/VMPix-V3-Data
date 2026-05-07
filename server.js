@@ -390,6 +390,57 @@ function addMusicBandsStats(stats, row, item) {
   }
 }
 
+function getPositiveNumber(value) {
+  const number = Number(String(value || '').replace(/,/g, '').trim());
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function getRankByValue(values) {
+  const uniqueValues = Array.from(new Set(values.filter((value) => value != null))).sort((a, b) => b - a);
+  const ranks = new Map();
+  uniqueValues.forEach((value, idx) => {
+    ranks.set(value, String(idx + 1));
+  });
+  return ranks;
+}
+
+function orderMusicBandStats(stats, photoRank, setRank) {
+  const source = stats && typeof stats === 'object' ? stats : {};
+  const ordered = {};
+
+  ['region', 'location', 'state', 'totalPhotos'].forEach((key) => {
+    if (source[key] != null) ordered[key] = source[key];
+  });
+  if (photoRank) ordered.photoRank = photoRank;
+  ['archived_sets', 'total_sets'].forEach((key) => {
+    if (source[key] != null) ordered[key] = source[key];
+  });
+  if (setRank) ordered.setRank = setRank;
+  if (source.country != null) ordered.country = source.country;
+
+  return ordered;
+}
+
+function addMusicBandItemRanks(items) {
+  const itemList = items
+    .map((entry) => entry && entry.item)
+    .filter((item) => item && item.stats && typeof item.stats === 'object');
+  const photoValues = itemList.map((item) => getPositiveNumber(item.stats.totalPhotos));
+  const setValues = itemList.map((item) => getPositiveNumber(item.stats.total_sets));
+  const photoRanks = getRankByValue(photoValues);
+  const setRanks = getRankByValue(setValues);
+
+  itemList.forEach((item) => {
+    const totalPhotos = getPositiveNumber(item.stats.totalPhotos);
+    const totalSets = getPositiveNumber(item.stats.total_sets);
+    item.stats = orderMusicBandStats(
+      item.stats,
+      totalPhotos == null ? '' : photoRanks.get(totalPhotos),
+      totalSets == null ? '' : setRanks.get(totalSets)
+    );
+  });
+}
+
 function formatMusicBandsPhotoPct(value, total) {
   if (!Number.isFinite(total) || total <= 0) return '0.000%';
   return `${((value / total) * 100).toFixed(3)}%`;
@@ -496,6 +547,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
     row,
     item: await buildMusicBandItem(row, forceRefresh)
   }));
+  addMusicBandItemRanks(items);
 
   for (const { row, item } of items) {
     const letter = getMusicBandLetter(row);
