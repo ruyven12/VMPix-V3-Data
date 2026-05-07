@@ -117,6 +117,34 @@ function formatEasternGeneratedTime(date) {
   }).format(date);
 }
 
+function getMusicBandSortValue(row) {
+  const keys = ['band', 'band_name', 'name', 'artist', 'artist_name', 'performer', 'act', 'title'];
+  for (const key of keys) {
+    const value = String(row[key] || '').trim();
+    if (value) return value;
+  }
+
+  return String(Object.values(row).find((value) => String(value || '').trim()) || '').trim();
+}
+
+function groupMusicBandsByLetter(rows) {
+  const groups = new Map();
+
+  for (const row of rows) {
+    const firstChar = getMusicBandSortValue(row).charAt(0).toUpperCase();
+    const letter = firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
+    if (!groups.has(letter)) groups.set(letter, []);
+    groups.get(letter).push(row);
+  }
+
+  const data = {};
+  for (const letter of ['#', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']) {
+    if (groups.has(letter)) data[letter] = groups.get(letter);
+  }
+
+  return data;
+}
+
 function buildMusicBandsResponse(payload) {
   const generated = new Date();
   return {
@@ -126,7 +154,7 @@ function buildMusicBandsResponse(payload) {
     route: payload.route,
     source: {
       name: payload.source,
-      data: payload.rows
+      data: groupMusicBandsByLetter(payload.rows)
     }
   };
 }
