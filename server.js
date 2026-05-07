@@ -281,52 +281,30 @@ async function sumSmugAlbumImageCounts(albums) {
   return sawCount ? total : null;
 }
 
-async function fetchMusicBandTotalPhotos(row, forceRefresh, debugInfo) {
-  if (!SMUG_API_KEY) {
-    if (debugInfo) debugInfo.skippedNoApiKey += 1;
-    return null;
-  }
+async function fetchMusicBandTotalPhotos(row, forceRefresh) {
+  if (!SMUG_API_KEY) return null;
 
   const target = getMusicBandSmugTarget(row);
-  if (!target) {
-    if (debugInfo) debugInfo.skippedNoTarget += 1;
-    return null;
-  }
+  if (!target) return null;
 
   const cacheKey = `${target.region}/${target.folder}`;
   const hit = smugTotalPhotosCache.get(cacheKey);
   if (!forceRefresh && hit && Date.now() - hit.fetchedAt < SMUG_TOTAL_PHOTOS_CACHE_TTL_MS) {
-    if (debugInfo) debugInfo.cacheHits += 1;
     return hit.totalPhotos;
   }
 
   if (smugTotalPhotosInFlight.has(cacheKey)) {
-    if (debugInfo) debugInfo.inFlightHits += 1;
     return smugTotalPhotosInFlight.get(cacheKey);
   }
 
-  if (debugInfo) debugInfo.requests += 1;
   const run = (async () => {
     try {
       const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
       const total = await sumSmugAlbumImageCounts(getSmugAlbums(json));
       const totalPhotos = total > 0 ? String(total) : null;
       smugTotalPhotosCache.set(cacheKey, { totalPhotos, fetchedAt: Date.now() });
-      if (debugInfo) {
-        if (totalPhotos) debugInfo.found += 1;
-        else debugInfo.zeroOrMissing += 1;
-      }
       return totalPhotos;
     } catch (err) {
-      if (debugInfo) {
-        debugInfo.failures += 1;
-        if (debugInfo.errors.length < 5) {
-          debugInfo.errors.push({
-            target: cacheKey,
-            error: err && err.message ? err.message : String(err)
-          });
-        }
-      }
       console.warn(`Music-Bands SmugMug totalPhotos failed for ${cacheKey}:`, err && err.message ? err.message : String(err));
       smugTotalPhotosCache.set(cacheKey, { totalPhotos: null, fetchedAt: Date.now() });
       return null;
@@ -355,22 +333,6 @@ async function mapWithConcurrency(items, limit, mapper) {
   const workerCount = Math.min(Math.max(1, limit), list.length);
   await Promise.all(Array.from({ length: workerCount }, worker));
   return results;
-}
-
-function createSmugDebugInfo() {
-  return {
-    configured: !!SMUG_API_KEY,
-    nickname: SMUG_NICKNAME,
-    requests: 0,
-    cacheHits: 0,
-    inFlightHits: 0,
-    found: 0,
-    zeroOrMissing: 0,
-    skippedNoApiKey: 0,
-    skippedNoTarget: 0,
-    failures: 0,
-    errors: []
-  };
 }
 
 function compactJsonFields(fields) {
@@ -425,13 +387,13 @@ function getMusicBandLetter(row) {
   return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
 }
 
-async function buildMusicBandItem(row, forceRefresh, debugInfo) {
+async function buildMusicBandItem(row, forceRefresh) {
   const band = getMusicBandName(row);
   const bandId = String(row.band_id || '').trim();
   const personnel = {};
   const members = parsePersonnelString(row.members);
   const pastMembers = parsePersonnelString(row.past_members);
-  const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh, debugInfo);
+  const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh);
   const general = compactJsonFields({
     name: band,
     smug_folder: row.smug_folder || row.slug_folder,
@@ -463,7 +425,7 @@ async function buildMusicBandItem(row, forceRefresh, debugInfo) {
   return item;
 }
 
-async function groupMusicBandsByLetter(rows, forceRefresh, debugInfo) {
+async function groupMusicBandsByLetter(rows, forceRefresh) {
   const groups = new Map();
   const sortedRows = rows.slice().sort((a, b) => {
     const aLetter = getMusicBandLetter(a);
@@ -478,7 +440,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh, debugInfo) {
 
   const items = await mapWithConcurrency(sortedRows, 4, async (row) => ({
     row,
-    item: await buildMusicBandItem(row, forceRefresh, debugInfo)
+    item: await buildMusicBandItem(row, forceRefresh)
   }));
 
   for (const { row, item } of items) {
@@ -496,23 +458,19 @@ async function groupMusicBandsByLetter(rows, forceRefresh, debugInfo) {
   return data;
 }
 
-async function buildMusicBandsResponse(payload, forceRefresh, debug) {
+async function buildMusicBandsResponse(payload, forceRefresh) {
   const generated = new Date();
-  const debugInfo = debug ? createSmugDebugInfo() : null;
-  const data = await groupMusicBandsByLetter(payload.rows, forceRefresh, debugInfo);
+  const data = await groupMusicBandsByLetter(payload.rows, forceRefresh);
   const source = { name: payload.source };
   if (hasJsonFields(data)) source.data = data;
 
-  const response = {
+  return {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     count: payload.count,
     route: payload.route,
     source
   };
-
-  if (debugInfo) response.debug = { smugTotalPhotos: debugInfo };
-  return response;
 }
 
 async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
@@ -556,7 +514,6 @@ app.get('/health', (req, res) => {
     service: 'vmpix-v3-data',
     time: new Date().toISOString(),
     sheetConfigured: !!SHEET_ID,
-    smugConfigured: !!SMUG_API_KEY,
     routes: Object.keys(ROUTES)
   });
 });
@@ -565,10 +522,9 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
   app.get(routePath, async (req, res) => {
     try {
       const forceRefresh = req.query.refresh === '1';
-      const debug = req.query.debug === '1';
       const payload = await fetchCsvForRoute(routePath, cfg, forceRefresh);
       res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
-      res.json(routePath === '/api/music/bands' ? await buildMusicBandsResponse(payload, forceRefresh, debug) : payload);
+      res.json(routePath === '/api/music/bands' ? await buildMusicBandsResponse(payload, forceRefresh) : payload);
     } catch (err) {
       res.status(500).json({
         ok: false,
