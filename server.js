@@ -368,7 +368,13 @@ function createMusicBandsStats() {
     photosInternationalPct: '0.000%',
     bandsComplete: 0,
     bandsPartial: 0,
-    bandsNone: 0
+    bandsNone: 0,
+    photosDone: 0,
+    photosDonePct: '0.00%',
+    photosEditing: 0,
+    photosEditingPct: '0.00%',
+    photosNone: 0,
+    photosNonePct: '0.00%'
   };
 }
 
@@ -479,6 +485,77 @@ function finalizeMusicBandsStats(stats) {
   stats.photosRegionalPct = formatMusicBandsPhotoPct(stats.photosRegional, stats.photosTotal);
   stats.photosNationalPct = formatMusicBandsPhotoPct(stats.photosNational, stats.photosTotal);
   stats.photosInternationalPct = formatMusicBandsPhotoPct(stats.photosInternational, stats.photosTotal);
+  return stats;
+}
+
+function normalizeStatsLabel(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function parseStatsSheetNumber(value) {
+  const clean = String(value || '').replace(/,/g, '').trim();
+  if (!clean) return 0;
+
+  const number = Number(clean);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function parseStatsSheetPercent(value) {
+  const clean = String(value || '').trim();
+  return clean || '0.00%';
+}
+
+function applyStatsSheetRow(stats, cells) {
+  const label = normalizeStatsLabel(cells[0]);
+  const count = parseStatsSheetNumber(cells[1]);
+  const pct = parseStatsSheetPercent(cells[2]);
+
+  if (label === 'onsite') {
+    stats.photosDone = count;
+    stats.photosDonePct = pct;
+  } else if (label === 'inprogress') {
+    stats.photosEditing = count;
+    stats.photosEditingPct = pct;
+  } else if (label === 'notedited') {
+    stats.photosNone = count;
+    stats.photosNonePct = pct;
+  }
+}
+
+async function fetchStatsSheetCsv(forceRefresh) {
+  const gid = String(process.env.GID_STATS || '835637138').trim();
+  const cacheKey = `stats-sheet-csv:${gid}`;
+  const hit = cache.get(cacheKey);
+
+  if (!forceRefresh && hit && Date.now() - hit.fetchedAt < CACHE_TTL_MS) {
+    return hit.csvText;
+  }
+
+  const res = await fetch(getCsvUrl(gid), { headers: { Accept: 'text/csv,text/plain,*/*' } });
+  const csvText = await res.text();
+
+  if (!res.ok) {
+    const snippet = csvText.slice(0, 200).replace(/\s+/g, ' ').trim();
+    throw new Error(`Stats sheet returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+  }
+
+  cache.set(cacheKey, { csvText, fetchedAt: Date.now() });
+  return csvText;
+}
+
+async function addStatsSheetPhotoProgress(stats, forceRefresh) {
+  try {
+    const csvText = await fetchStatsSheetCsv(forceRefresh);
+    const lines = String(csvText || '').replace(/^\uFEFF/, '').split(/\r?\n/);
+
+    lines.forEach((line) => {
+      if (!String(line || '').trim()) return;
+      applyStatsSheetRow(stats, parseCsvLine(line));
+    });
+  } catch (err) {
+    console.warn('Music-Bands Stats sheet photo progress failed:', err && err.message ? err.message : String(err));
+  }
+
   return stats;
 }
 
@@ -596,6 +673,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
 async function buildMusicBandsResponse(payload, forceRefresh) {
   const generated = new Date();
   const bands = await groupMusicBandsByLetter(payload.rows, forceRefresh);
+  await addStatsSheetPhotoProgress(bands.stats, forceRefresh);
   const source = { name: payload.source };
   if (hasJsonFields(bands.data)) source.data = bands.data;
 
