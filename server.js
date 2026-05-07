@@ -705,6 +705,13 @@ function isMusicShowBandKey(key) {
   return Number.isInteger(slot) && slot >= 1 && slot <= 20;
 }
 
+function isMusicShowGpsKey(key) {
+  const clean = String(key || '').trim().toLowerCase();
+  return clean === 'gps' ||
+    clean.startsWith('gps_') ||
+    ['latitude', 'longitude', 'lat', 'lng', 'lon', 'coordinates', 'coords'].includes(clean);
+}
+
 function getMusicShowBandValue(row, slot) {
   return String(row[`band_${slot}`] || row[`band${slot}`] || '').trim();
 }
@@ -725,6 +732,7 @@ function buildMusicShowItem(row) {
 
   Object.entries(row || {}).forEach(([key, value]) => {
     if (isMusicShowBandKey(key)) return;
+    if (isMusicShowGpsKey(key)) return;
     const clean = String(value || '').trim();
     if (!clean) return;
     item[key] = clean;
