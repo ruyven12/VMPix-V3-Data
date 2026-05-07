@@ -704,6 +704,84 @@ function parsePersonnelString(value) {
   });
 }
 
+function splitMusicSemicolonList(value) {
+  return String(value || '')
+    .replace(/[\uFF1B\u037E]/g, ';')
+    .split(/\s*;\s*/g)
+    .map((part) => String(part || '').trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function splitMusicRoleList(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+
+  const parts = splitMusicSemicolonList(raw);
+  if (parts.length > 1 || raw.includes(';')) return parts;
+
+  return raw
+    .split(/\s*,\s*/g)
+    .map((part) => String(part || '').trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function formatMusicInstrument(value) {
+  const parts = splitMusicSemicolonList(value);
+  return parts.length ? parts.join(', ') : String(value || '').trim();
+}
+
+function normalizeMusicLookupKey(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function getMusicPersonBandValues(row) {
+  return splitMusicSemicolonList(row.band || row.bands);
+}
+
+function addMusicPersonRole(list, personName, role) {
+  const name = String(personName || '').trim().replace(/\s+/g, ' ');
+  if (!name) return;
+
+  const key = normalizeMusicLookupKey(name);
+  let person = list.find((entry) => normalizeMusicLookupKey(entry.name) === key);
+  if (!person) {
+    person = { name };
+    list.push(person);
+  }
+
+  const roles = new Map();
+  splitMusicRoleList(person.role).forEach((part) => roles.set(normalizeMusicLookupKey(part), part));
+  splitMusicRoleList(role).forEach((part) => roles.set(normalizeMusicLookupKey(part), part));
+
+  const roleText = Array.from(roles.values()).join(', ');
+  if (roleText) person.role = roleText;
+}
+
+function buildMusicPeopleBandPersonnelLookup(rows) {
+  const lookup = new Map();
+
+  rows.forEach((row) => {
+    const personName = getMusicPersonName(row);
+    if (!personName) return;
+
+    const role = formatMusicInstrument(row.instrument);
+    getMusicPersonBandValues(row).forEach((bandName) => {
+      const bandKey = normalizeMusicLookupKey(bandName);
+      if (!bandKey) return;
+      if (!lookup.has(bandKey)) lookup.set(bandKey, []);
+      addMusicPersonRole(lookup.get(bandKey), personName, role);
+    });
+  });
+
+  return lookup;
+}
+
+function getMusicPeopleMembersForBand(bandName, peoplePersonnelLookup) {
+  if (!peoplePersonnelLookup || typeof peoplePersonnelLookup.get !== 'function') return [];
+  const members = peoplePersonnelLookup.get(normalizeMusicLookupKey(bandName));
+  return Array.isArray(members) ? members.map((member) => ({ ...member })) : [];
+}
+
 function getMusicBandName(row) {
   const keys = ['band', 'name', 'band_name', 'artist', 'artist_name', 'performer', 'act', 'title'];
   for (const key of keys) {
@@ -719,11 +797,12 @@ function getMusicBandLetter(row) {
   return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
 }
 
-async function buildMusicBandItem(row, forceRefresh) {
+async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
   const band = getMusicBandName(row);
   const bandId = String(row.band_id || '').trim();
   const personnel = {};
-  const members = parsePersonnelString(row.members);
+  const peopleMembers = getMusicPeopleMembersForBand(band, peoplePersonnelLookup);
+  const members = peopleMembers.length ? peopleMembers : parsePersonnelString(row.members);
   const pastMembers = parsePersonnelString(row.past_members);
   const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh);
   const general = compactJsonFields({
@@ -757,7 +836,7 @@ async function buildMusicBandItem(row, forceRefresh) {
   return item;
 }
 
-async function groupMusicBandsByLetter(rows, forceRefresh) {
+async function groupMusicBandsByLetter(rows, forceRefresh, peoplePersonnelLookup) {
   const groups = new Map();
   const stats = createMusicBandsStats();
   const sortedRows = rows.slice().sort((a, b) => {
@@ -773,7 +852,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
 
   const items = await mapWithConcurrency(sortedRows, 4, async (row) => ({
     row,
-    item: await buildMusicBandItem(row, forceRefresh)
+    item: await buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup)
   }));
   addMusicBandItemRanks(items);
 
@@ -795,7 +874,14 @@ async function groupMusicBandsByLetter(rows, forceRefresh) {
 
 async function buildMusicBandsResponse(payload, forceRefresh) {
   const generated = new Date();
-  const bands = await groupMusicBandsByLetter(payload.rows, forceRefresh);
+  let peoplePersonnelLookup = new Map();
+  try {
+    const peoplePayload = await fetchCsvForRoute('/api/music/people', ROUTES['/api/music/people'], forceRefresh);
+    peoplePersonnelLookup = buildMusicPeopleBandPersonnelLookup(peoplePayload.rows);
+  } catch (err) {
+    console.warn('Music-Bands People personnel lookup failed:', err && err.message ? err.message : String(err));
+  }
+  const bands = await groupMusicBandsByLetter(payload.rows, forceRefresh, peoplePersonnelLookup);
   await addStatsSheetPhotoProgress(bands.stats, forceRefresh);
   const source = { name: payload.source };
   if (hasJsonFields(bands.data)) source.data = bands.data;
@@ -940,23 +1026,96 @@ function getMusicPersonName(row) {
   return String(row.name || '').trim();
 }
 
-function getMusicPersonLetter(row) {
-  const firstChar = getMusicPersonName(row).charAt(0).toUpperCase();
+function getMusicPersonLetterFromName(name) {
+  const firstChar = String(name || '').trim().charAt(0).toUpperCase();
   return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
 }
 
-function buildMusicPersonBaseItem(row) {
-  return compactJsonFields({
-    name: row.name,
-    category: row.category,
-    aliases: row.aliases,
-    bands: row.bands,
-    instrument: row.instrument
+function getMusicPersonLetter(row) {
+  return getMusicPersonLetterFromName(getMusicPersonName(row));
+}
+
+function addMusicPersonGroupValue(values, value) {
+  splitMusicSemicolonList(value).forEach((part) => {
+    const key = normalizeMusicLookupKey(part);
+    if (key && !values.has(key)) values.set(key, part);
   });
 }
 
-async function buildMusicPersonItem(row, forceRefresh) {
-  const item = buildMusicPersonBaseItem(row);
+function addMusicPersonRelationship(group, bandName, instrument) {
+  const band = String(bandName || '').trim().replace(/\s+/g, ' ');
+  if (!band) return;
+
+  const bandKey = normalizeMusicLookupKey(band);
+  if (!group.relationships.has(bandKey)) {
+    group.relationships.set(bandKey, { band, instruments: new Map() });
+  }
+
+  const relationship = group.relationships.get(bandKey);
+  splitMusicRoleList(instrument).forEach((part) => {
+    const key = normalizeMusicLookupKey(part);
+    if (key && !relationship.instruments.has(key)) relationship.instruments.set(key, part);
+  });
+}
+
+function buildMusicPersonGroups(rows) {
+  const groups = new Map();
+
+  rows.forEach((row) => {
+    const name = getMusicPersonName(row);
+    if (!name) return;
+
+    const key = normalizeMusicLookupKey(name);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        name,
+        categories: new Map(),
+        aliases: new Map(),
+        instruments: new Map(),
+        relationships: new Map()
+      });
+    }
+
+    const group = groups.get(key);
+    addMusicPersonGroupValue(group.categories, row.category);
+    addMusicPersonGroupValue(group.aliases, row.aliases);
+
+    const instrument = formatMusicInstrument(row.instrument);
+    const bands = getMusicPersonBandValues(row);
+    if (bands.length) {
+      bands.forEach((bandName) => addMusicPersonRelationship(group, bandName, instrument));
+    } else {
+      addMusicPersonGroupValue(group.instruments, instrument);
+    }
+  });
+
+  return Array.from(groups.values());
+}
+
+function buildMusicPersonRelationshipItem(relationship) {
+  const item = { band: relationship.band };
+  const instrument = Array.from(relationship.instruments.values()).join(', ');
+  if (instrument) item.instrument = instrument;
+  return item;
+}
+
+function buildMusicPersonBaseItem(group) {
+  const item = { name: group.name };
+  const category = Array.from(group.categories.values()).join(', ');
+  const aliases = Array.from(group.aliases.values()).join(', ');
+  const bands = Array.from(group.relationships.values()).map(buildMusicPersonRelationshipItem);
+  const instrument = Array.from(group.instruments.values()).join(', ');
+
+  if (category) item.category = category;
+  if (aliases) item.aliases = aliases;
+  if (bands.length) item.bands = bands;
+  if (!bands.length && instrument) item.instrument = instrument;
+
+  return item;
+}
+
+async function buildMusicPersonItem(group, forceRefresh) {
+  const item = buildMusicPersonBaseItem(group);
   if (!item.name) return item;
 
   const photoCount = await fetchMusicPersonPhotoCount(item.name, forceRefresh);
@@ -967,24 +1126,24 @@ async function buildMusicPersonItem(row, forceRefresh) {
 
 async function groupMusicPeopleByLetter(rows, forceRefresh) {
   const groups = new Map();
-  const sortedRows = rows.slice().sort((a, b) => {
-    const aLetter = getMusicPersonLetter(a);
-    const bLetter = getMusicPersonLetter(b);
+  const sortedPeople = buildMusicPersonGroups(rows).sort((a, b) => {
+    const aLetter = getMusicPersonLetterFromName(a.name);
+    const bLetter = getMusicPersonLetterFromName(b.name);
 
     return aLetter.localeCompare(bLetter, undefined, { numeric: true, sensitivity: 'base' }) ||
-      getMusicPersonName(a).localeCompare(getMusicPersonName(b), undefined, { numeric: true, sensitivity: 'base' });
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
   });
-  const items = await mapWithConcurrency(sortedRows, 2, async (row) => ({
-    row,
-    item: await buildMusicPersonItem(row, forceRefresh)
+  const items = await mapWithConcurrency(sortedPeople, 2, async (person) => ({
+    person,
+    item: await buildMusicPersonItem(person, forceRefresh)
   }));
   let peopleTotal = 0;
 
-  items.forEach(({ row, item }) => {
+  items.forEach(({ person, item }) => {
     if (!hasJsonFields(item)) return;
     peopleTotal += 1;
 
-    const letter = getMusicPersonLetter(row);
+    const letter = getMusicPersonLetterFromName(person.name);
     if (!groups.has(letter)) groups.set(letter, []);
     groups.get(letter).push(item);
   });
