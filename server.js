@@ -736,6 +736,29 @@ function buildMusicShowItem(row) {
   return item;
 }
 
+function getMusicShowBandViewKey(band) {
+  return String(band || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function addMusicShowBandViewCounts(data) {
+  const counts = new Map();
+
+  data.forEach((show) => {
+    if (!Array.isArray(show.bands)) return;
+
+    show.bands.forEach((entry) => {
+      const key = getMusicShowBandViewKey(entry.band);
+      if (!key) return;
+
+      const bandViewCount = (counts.get(key) || 0) + 1;
+      counts.set(key, bandViewCount);
+      entry.bandViewCount = bandViewCount;
+    });
+  });
+
+  return data;
+}
+
 function buildMusicShowsStats(data) {
   return {
     showsTotal: data.length,
@@ -748,6 +771,7 @@ function buildMusicShowsResponse(payload) {
   const data = payload.rows
     .map(buildMusicShowItem)
     .filter(hasJsonFields);
+  addMusicShowBandViewCounts(data);
   const source = { name: payload.source };
   if (data.length) source.data = data;
 
