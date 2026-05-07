@@ -755,14 +755,14 @@ function getMusicShowDateTime(row) {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-function sortMusicShowRowsByDate(rows) {
+function sortMusicShowRowsByDate(rows, newestFirst = false) {
   return rows
     .map((row, index) => ({ row, index, dateTime: getMusicShowDateTime(row) }))
     .sort((a, b) => {
       if (a.dateTime == null && b.dateTime == null) return a.index - b.index;
       if (a.dateTime == null) return 1;
       if (b.dateTime == null) return -1;
-      return a.dateTime - b.dateTime || a.index - b.index;
+      return (newestFirst ? b.dateTime - a.dateTime : a.dateTime - b.dateTime) || a.index - b.index;
     })
     .map((entry) => entry.row);
 }
@@ -803,13 +803,14 @@ function buildMusicShowsResponse(payload) {
     .map(buildMusicShowItem)
     .filter(hasJsonFields);
   addMusicShowBandViewCounts(data);
+  const newestFirstData = sortMusicShowRowsByDate(data, true);
   const source = { name: payload.source };
-  if (data.length) source.data = data;
+  if (newestFirstData.length) source.data = newestFirstData;
 
   return {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
-    stats: buildMusicShowsStats(data),
+    stats: buildMusicShowsStats(newestFirstData),
     route: payload.route,
     source
   };
