@@ -1528,6 +1528,108 @@ function getPositiveLimit(value) {
   return Number.isInteger(limit) && limit > 0 ? limit : null;
 }
 
+function getClampedLimit(value) {
+  const limit = Number(String(value || '').trim());
+  if (!Number.isInteger(limit)) return 50;
+  return Math.min(100, Math.max(1, limit));
+}
+
+function getPageNumber(value) {
+  const page = Number(String(value || '').trim());
+  return Number.isInteger(page) && page > 0 ? page : 1;
+}
+
+function buildMusicBandsDbQueryOptions(query) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const search = String(query.search || '').trim();
+  const region = String(query.region || '').trim();
+  const status = String(query.status || '').trim();
+  const sortFields = {
+    band: 'band',
+    band_id: 'band_id',
+    region: 'region',
+    status: 'status',
+    created_at: 'created_at',
+    updated_at: 'updated_at'
+  };
+  const requestedSort = String(query.sort || 'band').trim().toLowerCase();
+  const sortField = sortFields[requestedSort] ? requestedSort : 'band';
+  const dir = String(query.dir || 'asc').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+
+  if (search) {
+    values.push(`%${search}%`);
+    const idx = values.length;
+    where.push(`(
+      band ILIKE $${idx}
+      OR band_id ILIKE $${idx}
+      OR coalesce(smug_folder, '') ILIKE $${idx}
+      OR coalesce(region, '') ILIKE $${idx}
+      OR coalesce(location, '') ILIKE $${idx}
+      OR coalesce(state, '') ILIKE $${idx}
+      OR coalesce(country, '') ILIKE $${idx}
+      OR coalesce(tags, '') ILIKE $${idx}
+      OR coalesce(status, '') ILIKE $${idx}
+      OR coalesce(notes, '') ILIKE $${idx}
+      OR coalesce(members, '') ILIKE $${idx}
+      OR coalesce(past_members, '') ILIKE $${idx}
+      OR general::text ILIKE $${idx}
+      OR personnel::text ILIKE $${idx}
+      OR stats::text ILIKE $${idx}
+    )`);
+    filters.search = search;
+  }
+
+  if (region) {
+    values.push(region.toLowerCase());
+    where.push(`region_key = $${values.length}`);
+    filters.region = region;
+  }
+
+  if (status) {
+    values.push(status.toLowerCase());
+    where.push(`(status_key = $${values.length} OR completion_status = $${values.length})`);
+    filters.status = status;
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    filters,
+    sort: {
+      field: sortField,
+      dir
+    },
+    orderBySql: `${sortFields[sortField]} ${dir.toUpperCase()}, band ASC`
+  };
+}
+
+const MUSIC_BANDS_DB_BASE_SQL = `
+  WITH band_rows AS (
+    SELECT
+      *,
+      lower(trim(coalesce(region, ''))) AS region_key,
+      lower(trim(coalesce(status, ''))) AS status_key,
+      coalesce(total_sets, 0) AS total_set_count,
+      coalesce(archived_sets, 0) AS archived_set_count
+    FROM music_bands
+  ),
+  filtered_bands AS (
+    SELECT
+      *,
+      CASE
+        WHEN status_key IN ('complete', 'completed') THEN 'complete'
+        WHEN status_key = 'partial' THEN 'partial'
+        WHEN status_key IN ('none', 'no', 'missing') THEN 'none'
+        WHEN total_set_count > 0 AND archived_set_count > 0 AND total_set_count = archived_set_count THEN 'complete'
+        WHEN total_set_count > 0 AND archived_set_count > 0 AND total_set_count <> archived_set_count THEN 'partial'
+        ELSE 'none'
+      END AS completion_status
+    FROM band_rows
+  )
+`;
+
 async function handleMusicBandsDbRequest(req, res, routePath) {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -1535,10 +1637,29 @@ async function handleMusicBandsDbRequest(req, res, routePath) {
     }
 
     const generated = new Date();
-    const limit = getPositiveLimit(req.query.limit);
-    const result = limit
-      ? await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC LIMIT $1', [limit])
-      : await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC');
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildMusicBandsDbQueryOptions(req.query);
+    const countResult = await dbPool.query(
+      `${MUSIC_BANDS_DB_BASE_SQL}
+       SELECT count(*)::int AS total FROM filtered_bands ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `${MUSIC_BANDS_DB_BASE_SQL}
+       SELECT band, band_id, general, personnel, stats
+       FROM filtered_bands
+       ${options.whereSql}
+       ORDER BY ${options.orderBySql}
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
 
     res.json({
       ok: true,
@@ -1547,6 +1668,12 @@ async function handleMusicBandsDbRequest(req, res, routePath) {
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
       count: result.rows.length,
+      total,
+      page,
+      limit,
+      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      filters: options.filters,
+      sort: options.sort,
       data: result.rows.map(buildMusicBandDbApiItem)
     });
   } catch (err) {
