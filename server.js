@@ -1316,10 +1316,53 @@ function slugifyMusicBandId(value) {
     .replace(/^-+|-+$/g, '');
 }
 
-function buildMusicBandDbRow(row) {
+function parseMusicBandImportPersonnel(value) {
+  return String(value || '')
+    .split(';')
+    .map((entry) => {
+      const clean = String(entry || '').trim();
+      if (!clean) return null;
+
+      const pipeIdx = clean.indexOf('|');
+      const name = String(pipeIdx === -1 ? clean : clean.slice(0, pipeIdx)).trim();
+      const role = String(pipeIdx === -1 ? '' : clean.slice(pipeIdx + 1)).trim();
+      return name ? { name, role } : null;
+    })
+    .filter(Boolean);
+}
+
+function stringifyDbJson(value) {
+  return JSON.stringify(value && typeof value === 'object' ? value : {});
+}
+
+async function buildMusicBandDbRow(row, forceRefresh) {
   const band = toDbText(getMusicBandName(row));
   const providedBandId = toDbText(row.band_id);
   const generatedBandId = providedBandId ? null : slugifyMusicBandId(band);
+  const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh);
+  const general = compactJsonFields({
+    name: band,
+    smug_folder: row.smug_folder || row.slug_folder,
+    logo_url: row.logo_url,
+    status: row.status,
+    tags: row.tags,
+    notes: row.notes
+  });
+  const personnel = {};
+  const members = parseMusicBandImportPersonnel(row.members);
+  const pastMembers = parseMusicBandImportPersonnel(row.past_members);
+  const stats = compactJsonFields({
+    region: row.region,
+    location: row.location,
+    state: row.state,
+    totalPhotos,
+    archived_sets: row.archived_sets || row.sets_archive,
+    total_sets: row.total_sets,
+    country: row.country
+  });
+
+  if (members.length) personnel.members = members;
+  if (pastMembers.length) personnel.past_members = pastMembers;
 
   return {
     band_id: providedBandId || generatedBandId || null,
@@ -1337,7 +1380,11 @@ function buildMusicBandDbRow(row) {
     status: toDbText(row.status),
     notes: toDbText(row.notes),
     archived_sets: toDbInteger(row.archived_sets || row.sets_archive),
-    total_sets: toDbInteger(row.total_sets)
+    total_sets: toDbInteger(row.total_sets),
+    general,
+    personnel,
+    stats,
+    raw_sheet: compactJsonFields(row)
   };
 }
 
@@ -1358,12 +1405,17 @@ async function upsertMusicBandDbRow(client, item) {
       status,
       notes,
       archived_sets,
-      total_sets
+      total_sets,
+      general,
+      personnel,
+      stats,
+      raw_sheet
     )
     VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10,
-      $11, $12, $13, $14, $15
+      $11, $12, $13, $14, $15,
+      $16::jsonb, $17::jsonb, $18::jsonb, $19::jsonb
     )
     ON CONFLICT (band_id) DO UPDATE SET
       band = EXCLUDED.band,
@@ -1380,6 +1432,10 @@ async function upsertMusicBandDbRow(client, item) {
       notes = EXCLUDED.notes,
       archived_sets = EXCLUDED.archived_sets,
       total_sets = EXCLUDED.total_sets,
+      general = EXCLUDED.general,
+      personnel = EXCLUDED.personnel,
+      stats = EXCLUDED.stats,
+      raw_sheet = EXCLUDED.raw_sheet,
       updated_at = NOW()
   `, [
     item.band_id,
@@ -1396,7 +1452,11 @@ async function upsertMusicBandDbRow(client, item) {
     item.status,
     item.notes,
     item.archived_sets,
-    item.total_sets
+    item.total_sets,
+    stringifyDbJson(item.general),
+    stringifyDbJson(item.personnel),
+    stringifyDbJson(item.stats),
+    stringifyDbJson(item.raw_sheet)
   ]);
 }
 
@@ -1408,6 +1468,11 @@ async function importMusicBandsToDatabase(forceRefresh) {
   const payload = await fetchCsvForRoute('/api/music/bands', ROUTES['/api/music/bands'], forceRefresh);
   const rows = payload.rows.map(normalizeMusicBandImportRow);
   logMusicBandImportDebug(payload, rows);
+  const items = await mapWithConcurrency(rows, 4, async (row) => ({
+    row,
+    item: await buildMusicBandDbRow(row, forceRefresh)
+  }));
+  addMusicBandItemRanks(items);
   const client = await dbPool.connect();
   const result = {
     ok: true,
@@ -1425,9 +1490,7 @@ async function importMusicBandsToDatabase(forceRefresh) {
   try {
     await client.query('BEGIN');
 
-    for (const row of rows) {
-      const item = buildMusicBandDbRow(row);
-
+    for (const { item } of items) {
       if (!item.band) {
         result.skipped += 1;
         result.skippedMissingBand += 1;
@@ -1448,6 +1511,16 @@ async function importMusicBandsToDatabase(forceRefresh) {
   } finally {
     client.release();
   }
+}
+
+function buildMusicBandDbApiItem(row) {
+  return {
+    band: row.band,
+    band_id: row.band_id,
+    general: row.general && typeof row.general === 'object' ? row.general : {},
+    personnel: row.personnel && typeof row.personnel === 'object' ? row.personnel : {},
+    stats: row.stats && typeof row.stats === 'object' ? row.stats : {}
+  };
 }
 
 app.get('/health', (req, res) => {
@@ -1545,7 +1618,7 @@ app.get('/api/v3/music/bands/db', async (req, res) => {
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
       count: result.rows.length,
-      data: result.rows
+      data: result.rows.map(buildMusicBandDbApiItem)
     });
   } catch (err) {
     res.status(500).json({
