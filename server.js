@@ -60,6 +60,25 @@ const ROUTES = {
   '/api/stats': { label: 'Stats', gidEnv: 'GID_STATS' }
 };
 
+async function applyDatabaseSchema() {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schemaSql = await fs.promises.readFile(schemaPath, 'utf8');
+    if (!schemaSql.trim()) {
+      throw new Error('schema.sql is empty.');
+    }
+
+    await dbPool.query(schemaSql);
+    console.log('PostgreSQL schema applied successfully.');
+  } catch (err) {
+    console.error('PostgreSQL schema apply failed:', err && err.message ? err.message : String(err));
+  }
+}
+
 function allowCors(req, res, next) {
   const origin = req.headers.origin || '';
   const allowList = String(process.env.CORS_ALLOW_ORIGINS || '')
@@ -1247,6 +1266,33 @@ app.get('/health/db', async (req, res) => {
   }
 });
 
+app.get('/health/tables', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const result = await dbPool.query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'
+      ORDER BY table_name
+    `);
+
+    res.json({
+      ok: true,
+      tables: result.rows.map((row) => row.table_name)
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      tables: [],
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
 for (const [routePath, cfg] of Object.entries(ROUTES)) {
   app.get(routePath, async (req, res) => {
     try {
@@ -1288,6 +1334,11 @@ app.use((req, res) => {
   res.status(404).json({ ok: false, error: 'Not found', path: req.path });
 });
 
-app.listen(PORT, () => {
-  console.log(`VMPix V3 Data API listening on ${PORT}`);
-});
+async function startServer() {
+  await applyDatabaseSchema();
+  app.listen(PORT, () => {
+    console.log(`VMPix V3 Data API listening on ${PORT}`);
+  });
+}
+
+startServer();
