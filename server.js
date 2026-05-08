@@ -1247,6 +1247,66 @@ function toDbInteger(value) {
   return Number.isFinite(number) ? Math.trunc(number) : 0;
 }
 
+function normalizeImportHeaderKey(key) {
+  return String(key || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/[\uFEFF\u200B-\u200D\u2060]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+const MUSIC_BAND_IMPORT_HEADER_ALIASES = {
+  band: 'band',
+  name: 'band',
+  band_name: 'band',
+  band_id: 'band_id',
+  bandid: 'band_id',
+  smug_folder: 'smug_folder',
+  smugfolder: 'smug_folder',
+  slug_folder: 'slug_folder',
+  slugfolder: 'slug_folder',
+  logo_url: 'logo_url',
+  logourl: 'logo_url',
+  region: 'region',
+  location: 'location',
+  state: 'state',
+  country: 'country',
+  members: 'members',
+  past_members: 'past_members',
+  pastmembers: 'past_members',
+  tags: 'tags',
+  status: 'status',
+  notes: 'notes',
+  archived_sets: 'archived_sets',
+  archivedsets: 'archived_sets',
+  sets_archive: 'sets_archive',
+  setsarchive: 'sets_archive',
+  total_sets: 'total_sets',
+  totalsets: 'total_sets'
+};
+
+function normalizeMusicBandImportRow(row) {
+  const out = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const normalizedKey = normalizeImportHeaderKey(key);
+    const compactKey = normalizedKey.replace(/_/g, '');
+    const canonicalKey = MUSIC_BAND_IMPORT_HEADER_ALIASES[normalizedKey] ||
+      MUSIC_BAND_IMPORT_HEADER_ALIASES[compactKey] ||
+      normalizedKey;
+    out[canonicalKey] = value;
+  });
+
+  return out;
+}
+
+function logMusicBandImportDebug(payload, rows) {
+  console.log('Music-Bands import detected headers:', payload.normalizedHeaders || []);
+  console.log('Music-Bands import first parsed row keys:', rows[0] ? Object.keys(rows[0]) : []);
+}
+
 function buildMusicBandDbRow(row) {
   return {
     band_id: toDbText(row.band_id),
@@ -1332,13 +1392,15 @@ async function importMusicBandsToDatabase(forceRefresh) {
   }
 
   const payload = await fetchCsvForRoute('/api/music/bands', ROUTES['/api/music/bands'], forceRefresh);
+  const rows = payload.rows.map(normalizeMusicBandImportRow);
+  logMusicBandImportDebug(payload, rows);
   const client = await dbPool.connect();
   const result = {
     ok: true,
     route: '/admin/import/music/bands',
     source: 'Music-Bands',
     table: 'music_bands',
-    rowsRead: payload.rows.length,
+    rowsRead: rows.length,
     upserted: 0,
     skipped: 0,
     skippedMissingBand: 0,
@@ -1348,7 +1410,7 @@ async function importMusicBandsToDatabase(forceRefresh) {
   try {
     await client.query('BEGIN');
 
-    for (const row of payload.rows) {
+    for (const row of rows) {
       const item = buildMusicBandDbRow(row);
 
       if (!item.band) {
