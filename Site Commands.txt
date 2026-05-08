@@ -1,113 +1,337 @@
 VMPix-V3 Data — Site Commands Reference
+Last updated: 2026-05-08
 
 Base URL:
 https://vmpix-data.onrender.com
+
+Local syntax check:
+node --check server.js
 
 
 ==================================================
 CORE HEALTH ROUTES
 ==================================================
 
-/health
+GET /health
 Basic backend health check.
 
-/health/db
+Full URL:
+https://vmpix-data.onrender.com/health
+
+
+GET /health/db
 Tests PostgreSQL connection.
 
-/health/tables
+Full URL:
+https://vmpix-data.onrender.com/health/db
+
+
+GET /health/tables
 Lists PostgreSQL tables currently available.
 
-
-==================================================
-MUSIC-BANDS ROUTES
-==================================================
-
-Original Google Sheets / JSON Route
-
-/api/music/bands
-
-Current sheet-backed Music-Bands JSON route.
-Preserved intentionally.
+Full URL:
+https://vmpix-data.onrender.com/health/tables
 
 
 ==================================================
-POSTGRESQL MUSIC-BANDS ROUTES
+MUSIC-BANDS — SHEET ROUTE
 ==================================================
 
-DB Read Route
+GET /api/music/bands
+Original Google Sheets / JSON route.
 
-/api/music/bands/db
+IMPORTANT:
+This route is intentionally preserved and should not be changed while building DB routes.
 
-Reads Music-Bands directly from PostgreSQL.
-
-Supports:
-?limit=10
-
-Example:
-/api/music/bands/db?limit=10
+Full URL:
+https://vmpix-data.onrender.com/api/music/bands
 
 
 ==================================================
-MUSIC-BANDS STATS ROUTE
+MUSIC-BANDS — POSTGRESQL DB ROUTE
 ==================================================
 
-/api/music/bands/stats
+GET /api/music/bands/db
+Reads Music-Bands directly from PostgreSQL table music_bands.
 
-Returns grouped stats:
-- bandTotals
-- photoTotals
-- percentages
+Current DB band JSON shape includes:
+- band
+- band_id
+- general
+- personnel
+- stats
+
+Supported query features:
+- limit
+- page
+- search
+- region filter
+- status filter
+- sorting
+- sort direction
+
+Metadata returned:
+- ok
+- route
+- source
+- generatedAt
+- generatedTime
+- count
+- total
+- page
+- limit
+- totalPages
+- filters
+- sort
+- data
+
+Safe limits:
+- default limit: 50
+- max limit: 100
+- minimum page: 1
+
+Examples:
+https://vmpix-data.onrender.com/api/music/bands/db?limit=25&page=1
+https://vmpix-data.onrender.com/api/music/bands/db?search=slayer
+https://vmpix-data.onrender.com/api/music/bands/db?region=Local
+https://vmpix-data.onrender.com/api/music/bands/db?status=complete
+https://vmpix-data.onrender.com/api/music/bands/db?sort=band&dir=asc
+https://vmpix-data.onrender.com/api/music/bands/db?region=Local&status=partial&search=dead&limit=20&page=2
 
 
 ==================================================
-IMPORT / ADMIN ROUTES
+MUSIC-BANDS — STATS ROUTE
 ==================================================
 
-Music-Bands Import Route
+GET /api/music/bands/stats
+Returns grouped Music-Bands stats.
 
-/admin/import/music/bands
+Full URL:
+https://vmpix-data.onrender.com/api/music/bands/stats
 
+Expected grouped stats include:
+- band totals
+- photo totals
+- percentages / grouped completion info where available
+
+
+==================================================
+MUSIC-BANDS — IMPORT / ADMIN ROUTE
+==================================================
+
+GET /admin/import/music/bands
 Imports Google Sheet Music-Bands data into PostgreSQL.
 
-Supports forced refresh:
-/admin/import/music/bands?refresh=1
+Forced refresh:
+https://vmpix-data.onrender.com/admin/import/music/bands?refresh=1
 
 Current behavior:
-- reads Google Sheets
+- reads Google Sheets tab Music-Bands
 - parses rows
 - generates band_id if missing
-- upserts into PostgreSQL
+- upserts into PostgreSQL table music_bands
 - updates JSONB smart fields
+
+IMPORTANT:
+This route mutates/imports data. Use intentionally.
+
+
+==================================================
+MUSIC-SHOWS — PLANNED / NEXT ROUTES
+==================================================
+
+Sheet tab:
+Music-Shows
+
+PostgreSQL table:
+music_shows
+
+Primary ID:
+show_id
+
+ID behavior:
+- show_id counts oldest to newest
+- oldest show = 1
+- newest show = highest number
+
+Bands behavior:
+- Sheet has band_1 through band_20
+- Importer converts those columns into a readable bands array
+- Empty band cells are ignored
+- Slot order is preserved
+- bandViewCount tracks historical appearance count up to that show
+
+Target show object shape:
+
+{
+  "show_id": 1,
+  "name": "Burning Time w/ Loki",
+  "venue": "Colisee Club",
+  "city": "Lewiston",
+  "state": "Maine",
+  "date": "3/14/26",
+  "poster": "https://...",
+  "notes": "",
+  "camera_1": "Canon EOS R6 Mark II",
+  "camera_2": "",
+  "bands": [
+    {
+      "slot": 1,
+      "band": "Loki",
+      "bandViewCount": 13
+    },
+    {
+      "slot": 2,
+      "band": "Burning Time",
+      "bandViewCount": 8
+    }
+  ],
+  "stats": {
+    "bandCount": 2
+  }
+}
+
+
+==================================================
+MUSIC-SHOWS — IMPORT / ADMIN ROUTE TO ADD
+==================================================
+
+GET /admin/import/music/shows?refresh=1
+Imports Google Sheet Music-Shows data into PostgreSQL table music_shows.
+
+Full URL:
+https://vmpix-data.onrender.com/admin/import/music/shows?refresh=1
+
+Expected behavior:
+- reads Google Sheets tab Music-Shows
+- processes rows chronologically oldest to newest
+- assigns show_id in chronological order
+- converts band_1 through band_20 into bands array
+- calculates bandViewCount historically
+- upserts into PostgreSQL table music_shows
+- does not affect music_bands
+
+IMPORTANT:
+This route mutates/imports data. Use intentionally.
+
+
+==================================================
+MUSIC-SHOWS — DB ROUTE TO ADD
+==================================================
+
+GET /api/music/shows/db
+Reads Music-Shows directly from PostgreSQL table music_shows.
+
+Expected query features:
+- limit
+- page
+- search
+- state filter
+- city filter
+- venue filter
+- band filter
+- sorting
+- sort direction
+
+Expected metadata returned:
+- ok
+- route
+- source
+- generatedAt
+- generatedTime
+- count
+- total
+- page
+- limit
+- totalPages
+- filters
+- sort
+- stats
+- data
+
+Safe limits:
+- default limit: 50
+- max limit: 100
+- minimum page: 1
+
+Examples:
+https://vmpix-data.onrender.com/api/music/shows/db?limit=25&page=1
+https://vmpix-data.onrender.com/api/music/shows/db?search=loki
+https://vmpix-data.onrender.com/api/music/shows/db?state=Maine
+https://vmpix-data.onrender.com/api/music/shows/db?city=Portland
+https://vmpix-data.onrender.com/api/music/shows/db?venue=Aura
+https://vmpix-data.onrender.com/api/music/shows/db?band=Loki
+https://vmpix-data.onrender.com/api/music/shows/db?sort=date&dir=desc
+https://vmpix-data.onrender.com/api/music/shows/db?band=Loki&state=Maine&limit=20&page=2
+
+
+==================================================
+MUSIC-SHOWS — STATS ROUTE TO ADD
+==================================================
+
+GET /api/music/shows/stats
+Returns grouped Music-Shows stats.
+
+Full URL:
+https://vmpix-data.onrender.com/api/music/shows/stats
+
+Expected grouped stats:
+- total shows
+- total band appearances
+- unique bands
+- shows by year
+- shows by state
+- shows by city
+- shows by venue
+- top bands by appearance count
 
 
 ==================================================
 TEMPORARY LEGACY / TEST ROUTE
 ==================================================
 
-/api/v3/music/bands/db
+GET /api/v3/music/bands/db
+Temporary alias to PostgreSQL Music-Bands DB route.
 
-Temporary alias to PostgreSQL DB route.
+Full URL:
+https://vmpix-data.onrender.com/api/v3/music/bands/db
+
+Note:
 Can likely be removed later once frontend standardizes.
 
 
 ==================================================
-CURRENT QUERY PARAMS SUPPORTED
+QUICK TEST CHECKLIST AFTER MUSIC-SHOWS WORK
 ==================================================
 
-DB Limit
+1. Syntax check locally:
+node --check server.js
 
-?limit=10
+2. Confirm backend health:
+https://vmpix-data.onrender.com/health
+https://vmpix-data.onrender.com/health/db
+https://vmpix-data.onrender.com/health/tables
 
-Example:
-/api/music/bands/db?limit=3
+3. Import Music-Shows:
+https://vmpix-data.onrender.com/admin/import/music/shows?refresh=1
 
+4. Test Music-Shows DB route:
+https://vmpix-data.onrender.com/api/music/shows/db?limit=25&page=1
+https://vmpix-data.onrender.com/api/music/shows/db?search=loki
+https://vmpix-data.onrender.com/api/music/shows/db?state=Maine
+https://vmpix-data.onrender.com/api/music/shows/db?city=Portland
+https://vmpix-data.onrender.com/api/music/shows/db?venue=Aura
+https://vmpix-data.onrender.com/api/music/shows/db?band=Loki
+https://vmpix-data.onrender.com/api/music/shows/db?sort=date&dir=desc
+https://vmpix-data.onrender.com/api/music/shows/db?band=Loki&state=Maine&limit=20&page=2
 
-Force Refresh Import
+5. Test Music-Shows stats:
+https://vmpix-data.onrender.com/api/music/shows/stats
 
-?refresh=1
-
-Example:
-/admin/import/music/bands?refresh=1
+6. Confirm Music-Bands still works:
+https://vmpix-data.onrender.com/api/music/bands
+https://vmpix-data.onrender.com/api/music/bands/db?limit=10&page=1
+https://vmpix-data.onrender.com/api/music/bands/stats
 
 
 ==================================================
@@ -125,12 +349,15 @@ Implemented:
 - DB health checks
 - importer/upsert system
 - stable API routes
+- DB search
+- DB filters
+- DB sorting
+- DB pagination
+- safe SQL parameters
+- allowlisted ORDER BY fields
+- limit clamp to 100
 
-Not yet implemented:
-- search
-- pagination
-- filters
-- sorting
+Future / not yet implemented:
 - caching
 - relationships
 - venue linking
@@ -143,19 +370,17 @@ Not yet implemented:
 
 
 ==================================================
-CURRENT SMART JSON SHAPE
+IMPORTANT PROJECT RULES
 ==================================================
 
-Each DB band supports:
-
-- general
-- personnel
-- stats
-
-Example structure:
-
-band
-band_id
-general { ... }
-personnel { ... }
-stats { ... }
+- This repo is VMPix-V3 Data only.
+- Do not edit the live/original VMPix site from here.
+- Backend only.
+- No frontend edits.
+- Surgical changes only.
+- Do not break existing routes.
+- Do not change /api/music/bands.
+- Keep changes efficient because of rate/data caps.
+- Read-only API routes must not mutate/import data.
+- Import/admin routes should only run when explicitly called.
+- Always run node --check server.js before saying done.

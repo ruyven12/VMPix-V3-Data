@@ -99,3 +99,44 @@ ALTER TABLE IF EXISTS music_shows
 
 CREATE UNIQUE INDEX IF NOT EXISTS music_shows_show_id_key
     ON music_shows (show_id);
+
+CREATE TABLE IF NOT EXISTS music_people (
+    id SERIAL PRIMARY KEY,
+    person_id INTEGER UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT,
+    aliases JSONB DEFAULT '[]'::jsonb,
+    bands JSONB DEFAULT '[]'::jsonb,
+    associations JSONB DEFAULT '[]'::jsonb,
+    stats JSONB DEFAULT '{}'::jsonb,
+    raw_sheet JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS person_id INTEGER;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS name TEXT;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS category TEXT;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS aliases JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS bands JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS associations JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS stats JSONB DEFAULT '{}'::jsonb;
+
+ALTER TABLE IF EXISTS music_people
+    ADD COLUMN IF NOT EXISTS raw_sheet JSONB DEFAULT '{}'::jsonb;
+
+CREATE UNIQUE INDEX IF NOT EXISTS music_people_person_id_key
+    ON music_people (person_id);

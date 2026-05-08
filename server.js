@@ -1761,6 +1761,210 @@ async function importMusicShowsToDatabase(forceRefresh) {
   }
 }
 
+const MUSIC_PERSON_IMPORT_HEADER_ALIASES = {
+  name: 'name',
+  person: 'name',
+  category: 'category',
+  aliases: 'aliases',
+  alias: 'aliases',
+  bands: 'bands',
+  band: 'bands',
+  instrument: 'instrument',
+  instruments: 'instrument',
+  association: 'association',
+  associations: 'association'
+};
+
+function normalizeMusicPersonImportRow(row) {
+  const out = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const normalizedKey = normalizeImportHeaderKey(key);
+    const compactKey = normalizedKey.replace(/_/g, '');
+    const canonicalKey = MUSIC_PERSON_IMPORT_HEADER_ALIASES[normalizedKey] ||
+      MUSIC_PERSON_IMPORT_HEADER_ALIASES[compactKey] ||
+      normalizedKey;
+    out[canonicalKey] = value;
+  });
+
+  return out;
+}
+
+function splitMusicDelimitedList(value) {
+  return String(value || '')
+    .replace(/[\uFF1B\u037E]/g, ';')
+    .split(/\s*[;,]\s*/g)
+    .map((part) => String(part || '').trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function addMusicPersonMapValue(map, value) {
+  const clean = String(value || '').trim().replace(/\s+/g, ' ');
+  const key = normalizeMusicLookupKey(clean);
+  if (key && !map.has(key)) map.set(key, clean);
+}
+
+function formatMusicPersonDbInstrument(value) {
+  return splitMusicDelimitedList(value).join(', ');
+}
+
+function addMusicPersonDbBand(group, bandName, instrument) {
+  const band = String(bandName || '').trim().replace(/\s+/g, ' ');
+  if (!band) return;
+
+  const cleanInstrument = formatMusicPersonDbInstrument(instrument);
+  const key = `${normalizeMusicLookupKey(band)}|${normalizeMusicLookupKey(cleanInstrument)}`;
+  if (group.bandPairs.has(key)) return;
+
+  const item = { band };
+  if (cleanInstrument) item.instrument = cleanInstrument;
+  group.bandPairs.set(key, item);
+}
+
+function buildMusicPersonDbGroups(rows) {
+  const groups = new Map();
+  let skippedMissingName = 0;
+
+  rows.forEach((row) => {
+    const name = String(row.name || '').trim().replace(/\s+/g, ' ');
+    if (!name) {
+      skippedMissingName += 1;
+      return;
+    }
+
+    const key = normalizeMusicLookupKey(name);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        name,
+        categories: new Map(),
+        aliases: new Map(),
+        associations: new Map(),
+        bandPairs: new Map(),
+        rawRows: []
+      });
+    }
+
+    const group = groups.get(key);
+    if (!group.name || group.name === group.name.toLowerCase()) group.name = name;
+    addMusicPersonMapValue(group.categories, row.category);
+    splitMusicDelimitedList(row.aliases).forEach((alias) => addMusicPersonMapValue(group.aliases, alias));
+    splitMusicDelimitedList(row.association).forEach((association) => addMusicPersonMapValue(group.associations, association));
+
+    const bands = splitMusicDelimitedList(row.bands);
+    bands.forEach((bandName) => addMusicPersonDbBand(group, bandName, row.instrument));
+    group.rawRows.push(compactJsonFields(row));
+  });
+
+  return { groups: Array.from(groups.values()), skippedMissingName };
+}
+
+function buildMusicPersonDbRows(rows) {
+  const grouped = buildMusicPersonDbGroups(rows);
+  const people = grouped.groups.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+  const items = people.map((person, index) => {
+    const aliases = Array.from(person.aliases.values());
+    const bands = Array.from(person.bandPairs.values()).sort((a, b) => {
+      return a.band.localeCompare(b.band, undefined, { numeric: true, sensitivity: 'base' }) ||
+        String(a.instrument || '').localeCompare(String(b.instrument || ''), undefined, { numeric: true, sensitivity: 'base' });
+    });
+    const associations = Array.from(person.associations.values());
+
+    return {
+      person_id: index + 1,
+      name: person.name,
+      category: Array.from(person.categories.values()).join(', ') || null,
+      aliases,
+      bands,
+      associations,
+      stats: {
+        bandCount: bands.length,
+        aliasCount: aliases.length,
+        associationCount: associations.length
+      },
+      raw_sheet: { rows: person.rawRows }
+    };
+  });
+
+  return { items, skippedMissingName: grouped.skippedMissingName };
+}
+
+async function upsertMusicPersonDbRow(client, item) {
+  await client.query(`
+    INSERT INTO music_people (
+      person_id,
+      name,
+      category,
+      aliases,
+      bands,
+      associations,
+      stats,
+      raw_sheet
+    )
+    VALUES (
+      $1, $2, $3, $4::jsonb,
+      $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb
+    )
+    ON CONFLICT (person_id) DO UPDATE SET
+      name = EXCLUDED.name,
+      category = EXCLUDED.category,
+      aliases = EXCLUDED.aliases,
+      bands = EXCLUDED.bands,
+      associations = EXCLUDED.associations,
+      stats = EXCLUDED.stats,
+      raw_sheet = EXCLUDED.raw_sheet,
+      updated_at = NOW()
+  `, [
+    item.person_id,
+    item.name,
+    item.category,
+    stringifyDbJson(item.aliases),
+    stringifyDbJson(item.bands),
+    stringifyDbJson(item.associations),
+    stringifyDbJson(item.stats),
+    stringifyDbJson(item.raw_sheet)
+  ]);
+}
+
+async function importMusicPeopleToDatabase(forceRefresh) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    throw new Error('Missing DATABASE_URL environment variable.');
+  }
+
+  const payload = await fetchCsvForRoute('/api/music/people', ROUTES['/api/music/people'], forceRefresh);
+  const rows = payload.rows.map(normalizeMusicPersonImportRow);
+  const built = buildMusicPersonDbRows(rows);
+  const client = await dbPool.connect();
+  const result = {
+    ok: true,
+    route: '/admin/import/music/people',
+    source: 'Music-People',
+    table: 'music_people',
+    rowsRead: payload.rows.length,
+    peopleTotal: built.items.length,
+    upserted: 0,
+    skipped: built.skippedMissingName,
+    skippedMissingName: built.skippedMissingName,
+    duplicatesCombined: Math.max(0, rows.length - built.skippedMissingName - built.items.length)
+  };
+
+  try {
+    await client.query('BEGIN');
+
+    for (const item of built.items) {
+      await upsertMusicPersonDbRow(client, item);
+      result.upserted += 1;
+    }
+
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function buildMusicBandDbApiItem(row) {
   return {
     band: row.band,
@@ -2271,6 +2475,255 @@ async function buildMusicShowsDbStatsResponse() {
   };
 }
 
+function buildMusicPersonDbApiItem(row) {
+  return {
+    person_id: toIntegerCount(row.person_id),
+    name: row.name || '',
+    category: row.category || '',
+    aliases: Array.isArray(row.aliases) ? row.aliases : [],
+    bands: Array.isArray(row.bands) ? row.bands : [],
+    associations: Array.isArray(row.associations) ? row.associations : [],
+    stats: row.stats && typeof row.stats === 'object' ? row.stats : {}
+  };
+}
+
+function buildMusicPeopleDbQueryOptions(query) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const search = String(query.search || '').trim();
+  const category = String(query.category || '').trim();
+  const band = String(query.band || '').trim();
+  const instrument = String(query.instrument || '').trim();
+  const association = String(query.association || '').trim();
+  const sortFields = {
+    person_id: 'person_id',
+    name: 'name',
+    category: 'category',
+    created_at: 'created_at',
+    updated_at: 'updated_at'
+  };
+  const requestedSort = String(query.sort || 'name').trim().toLowerCase();
+  const sortField = sortFields[requestedSort] ? requestedSort : 'name';
+  const dir = String(query.dir || 'asc').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+  const bandsArraySql = "CASE WHEN jsonb_typeof(bands) = 'array' THEN bands ELSE '[]'::jsonb END";
+  const aliasesArraySql = "CASE WHEN jsonb_typeof(aliases) = 'array' THEN aliases ELSE '[]'::jsonb END";
+  const associationsArraySql = "CASE WHEN jsonb_typeof(associations) = 'array' THEN associations ELSE '[]'::jsonb END";
+
+  if (search) {
+    values.push(`%${search}%`);
+    const idx = values.length;
+    where.push(`(
+      name ILIKE $${idx}
+      OR coalesce(category, '') ILIKE $${idx}
+      OR aliases::text ILIKE $${idx}
+      OR bands::text ILIKE $${idx}
+      OR associations::text ILIKE $${idx}
+      OR raw_sheet::text ILIKE $${idx}
+    )`);
+    filters.search = search;
+  }
+
+  if (category) {
+    values.push(category.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM regexp_split_to_table(coalesce(category, ''), '\\s*,\\s*') AS category_item(value)
+      WHERE lower(trim(value)) = $${values.length}
+    )`);
+    filters.category = category;
+  }
+
+  if (band) {
+    values.push(band.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(${bandsArraySql}) AS band_item
+      WHERE lower(trim(coalesce(band_item->>'band', ''))) = $${values.length}
+    )`);
+    filters.band = band;
+  }
+
+  if (instrument) {
+    values.push(`%${instrument.toLowerCase()}%`);
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(${bandsArraySql}) AS band_item
+      WHERE lower(coalesce(band_item->>'instrument', '')) LIKE $${values.length}
+    )`);
+    filters.instrument = instrument;
+  }
+
+  if (association) {
+    values.push(association.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(${associationsArraySql}) AS association_item
+      WHERE lower(trim(association_item)) = $${values.length}
+    )`);
+    filters.association = association;
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    filters,
+    sort: {
+      field: sortField,
+      dir
+    },
+    orderBySql: `${sortFields[sortField]} ${dir.toUpperCase()} NULLS LAST, name ASC`,
+    bandsArraySql,
+    aliasesArraySql,
+    associationsArraySql
+  };
+}
+
+async function handleMusicPeopleDbRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildMusicPeopleDbQueryOptions(req.query);
+    const countResult = await dbPool.query(
+      `SELECT count(*)::int AS total FROM music_people ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `SELECT person_id, name, category, aliases, bands, associations, stats
+       FROM music_people
+       ${options.whereSql}
+       ORDER BY ${options.orderBySql}
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
+    const data = result.rows.map(buildMusicPersonDbApiItem);
+
+    res.json({
+      ok: true,
+      route: '/api/music/people/db',
+      source: {
+        type: 'postgres',
+        table: 'music_people'
+      },
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: data.length,
+      total,
+      page,
+      limit,
+      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      filters: options.filters,
+      sort: options.sort,
+      stats: {
+        peopleTotal: total
+      },
+      data
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/music/people/db',
+      source: {
+        type: 'postgres',
+        table: 'music_people'
+      },
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildMusicPeopleDbStatsResponse() {
+  const generated = new Date();
+  const bandsArraySql = "CASE WHEN jsonb_typeof(bands) = 'array' THEN bands ELSE '[]'::jsonb END";
+  const totalsQuery = dbPool.query(`
+    WITH category_items AS (
+      SELECT person_id, lower(trim(value)) AS category
+      FROM music_people
+      CROSS JOIN LATERAL regexp_split_to_table(coalesce(category, ''), '\\s*,\\s*') AS category_item(value)
+      WHERE trim(value) <> ''
+    )
+    SELECT
+      (SELECT count(*)::int FROM music_people) AS total_people,
+      (SELECT count(DISTINCT person_id)::int FROM category_items WHERE category IN ('performer', 'performers')) AS total_performers,
+      (SELECT count(DISTINCT person_id)::int FROM category_items WHERE category IN ('friend', 'friends')) AS total_friends,
+      (SELECT count(DISTINCT category)::int FROM category_items) AS total_categories
+  `);
+  const uniqueBandsQuery = dbPool.query(`
+    SELECT count(DISTINCT lower(trim(band_item->>'band')))::int AS unique_bands
+    FROM music_people
+    CROSS JOIN LATERAL jsonb_array_elements(${bandsArraySql}) AS band_item
+    WHERE trim(coalesce(band_item->>'band', '')) <> ''
+  `);
+  const topBandsQuery = dbPool.query(`
+    SELECT band_item->>'band' AS band, count(DISTINCT person_id)::int AS people_count
+    FROM music_people
+    CROSS JOIN LATERAL jsonb_array_elements(${bandsArraySql}) AS band_item
+    WHERE trim(coalesce(band_item->>'band', '')) <> ''
+    GROUP BY 1
+    ORDER BY people_count DESC, band ASC
+    LIMIT 25
+  `);
+  const topInstrumentsQuery = dbPool.query(`
+    SELECT instrument, count(DISTINCT person_id)::int AS people_count
+    FROM music_people
+    CROSS JOIN LATERAL jsonb_array_elements(${bandsArraySql}) AS band_item
+    CROSS JOIN LATERAL regexp_split_to_table(coalesce(band_item->>'instrument', ''), '\\s*,\\s*') AS instrument_item(instrument)
+    WHERE trim(instrument) <> ''
+    GROUP BY 1
+    ORDER BY people_count DESC, instrument ASC
+    LIMIT 25
+  `);
+  const peopleByCategoryQuery = dbPool.query(`
+    SELECT category_name AS category, count(DISTINCT person_id)::int AS people_count
+    FROM music_people
+    CROSS JOIN LATERAL regexp_split_to_table(coalesce(category, ''), '\\s*,\\s*') AS category_item(category_name)
+    WHERE trim(category_name) <> ''
+    GROUP BY 1
+    ORDER BY people_count DESC, category ASC
+  `);
+  const [totalsResult, uniqueBandsResult, topBandsResult, topInstrumentsResult, peopleByCategoryResult] = await Promise.all([
+    totalsQuery,
+    uniqueBandsQuery,
+    topBandsQuery,
+    topInstrumentsQuery,
+    peopleByCategoryQuery
+  ]);
+  const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+  const uniqueBands = uniqueBandsResult.rows && uniqueBandsResult.rows[0] ? uniqueBandsResult.rows[0] : {};
+
+  return {
+    ok: true,
+    route: '/api/music/people/stats',
+    source: {
+      type: 'postgres',
+      table: 'music_people'
+    },
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    totals: {
+      peopleTotal: toIntegerCount(totals.total_people),
+      performersTotal: toIntegerCount(totals.total_performers),
+      friendsTotal: toIntegerCount(totals.total_friends),
+      categoriesTotal: toIntegerCount(totals.total_categories),
+      uniqueBands: toIntegerCount(uniqueBands.unique_bands)
+    },
+    topBands: topBandsResult.rows.map((row) => ({ band: row.band, peopleCount: toIntegerCount(row.people_count) })),
+    topInstruments: topInstrumentsResult.rows.map((row) => ({ instrument: row.instrument, peopleCount: toIntegerCount(row.people_count) })),
+    peopleByCategory: peopleByCategoryResult.rows.map((row) => ({ category: row.category, peopleCount: toIntegerCount(row.people_count) }))
+  };
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -2360,6 +2813,21 @@ app.get('/admin/import/music/shows', async (req, res) => {
   }
 });
 
+app.get('/admin/import/music/people', async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === '1';
+    const result = await importMusicPeopleToDatabase(forceRefresh);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/admin/import/music/people',
+      source: 'Music-People',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
 app.get('/api/music/bands/db', async (req, res) => {
   return handleMusicBandsDbRequest(req, res, '/api/music/bands/db');
 });
@@ -2401,6 +2869,30 @@ app.get('/api/music/shows/stats', async (req, res) => {
       ok: false,
       route: '/api/music/shows/stats',
       source: 'PostgreSQL:music_shows',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/music/people/db', async (req, res) => {
+  return handleMusicPeopleDbRequest(req, res);
+});
+
+app.get('/api/music/people/stats', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    res.json(await buildMusicPeopleDbStatsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/music/people/stats',
+      source: {
+        type: 'postgres',
+        table: 'music_people'
+      },
       error: err && err.message ? err.message : String(err)
     });
   }
