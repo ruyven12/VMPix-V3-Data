@@ -1,0 +1,161 @@
+VMPix-V3 Data — Site Commands Reference
+
+Base URL:
+https://vmpix-data.onrender.com
+
+
+==================================================
+CORE HEALTH ROUTES
+==================================================
+
+/health
+Basic backend health check.
+
+/health/db
+Tests PostgreSQL connection.
+
+/health/tables
+Lists PostgreSQL tables currently available.
+
+
+==================================================
+MUSIC-BANDS ROUTES
+==================================================
+
+Original Google Sheets / JSON Route
+
+/api/music/bands
+
+Current sheet-backed Music-Bands JSON route.
+Preserved intentionally.
+
+
+==================================================
+POSTGRESQL MUSIC-BANDS ROUTES
+==================================================
+
+DB Read Route
+
+/api/music/bands/db
+
+Reads Music-Bands directly from PostgreSQL.
+
+Supports:
+?limit=10
+
+Example:
+/api/music/bands/db?limit=10
+
+
+==================================================
+MUSIC-BANDS STATS ROUTE
+==================================================
+
+/api/music/bands/stats
+
+Returns grouped stats:
+- bandTotals
+- photoTotals
+- percentages
+
+
+==================================================
+IMPORT / ADMIN ROUTES
+==================================================
+
+Music-Bands Import Route
+
+/admin/import/music/bands
+
+Imports Google Sheet Music-Bands data into PostgreSQL.
+
+Supports forced refresh:
+/admin/import/music/bands?refresh=1
+
+Current behavior:
+- reads Google Sheets
+- parses rows
+- generates band_id if missing
+- upserts into PostgreSQL
+- updates JSONB smart fields
+
+
+==================================================
+TEMPORARY LEGACY / TEST ROUTE
+==================================================
+
+/api/v3/music/bands/db
+
+Temporary alias to PostgreSQL DB route.
+Can likely be removed later once frontend standardizes.
+
+
+==================================================
+CURRENT QUERY PARAMS SUPPORTED
+==================================================
+
+DB Limit
+
+?limit=10
+
+Example:
+/api/music/bands/db?limit=3
+
+
+Force Refresh Import
+
+?refresh=1
+
+Example:
+/admin/import/music/bands?refresh=1
+
+
+==================================================
+CURRENT MUSIC-BANDS DB FEATURES
+==================================================
+
+Implemented:
+- PostgreSQL
+- schema.sql
+- auto schema apply
+- JSONB storage
+- smart personnel parsing
+- generated timestamps
+- grouped stats
+- DB health checks
+- importer/upsert system
+- stable API routes
+
+Not yet implemented:
+- search
+- pagination
+- filters
+- sorting
+- caching
+- relationships
+- venue linking
+- people linking
+- SmugMug sync
+- auth/admin protection
+- cron imports
+- automatic stats table
+- write APIs
+
+
+==================================================
+CURRENT SMART JSON SHAPE
+==================================================
+
+Each DB band supports:
+
+- general
+- personnel
+- stats
+
+Example structure:
+
+band
+band_id
+general { ... }
+personnel { ... }
+stats { ... }
