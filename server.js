@@ -1524,6 +1524,39 @@ app.get('/admin/import/music/bands', async (req, res) => {
   }
 });
 
+app.get('/api/v3/music/bands/db', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const rawLimit = String(req.query.limit || '').trim();
+    const limit = rawLimit ? Number(rawLimit) : null;
+    const hasLimit = Number.isInteger(limit) && limit > 0;
+    const result = hasLimit
+      ? await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC LIMIT $1', [limit])
+      : await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC');
+
+    res.json({
+      ok: true,
+      route: '/api/v3/music/bands/db',
+      source: 'PostgreSQL:music_bands',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: result.rows.length,
+      data: result.rows
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/v3/music/bands/db',
+      source: 'PostgreSQL:music_bands',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
 for (const [routePath, cfg] of Object.entries(ROUTES)) {
   app.get(routePath, async (req, res) => {
     try {
