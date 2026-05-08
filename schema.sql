@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS music_bands (
+    id SERIAL PRIMARY KEY,
+    band_id TEXT UNIQUE,
+    band TEXT NOT NULL,
+    smug_folder TEXT,
+    logo_url TEXT,
+    region TEXT,
+    location TEXT,
+    state TEXT,
+    country TEXT,
+    members TEXT,
+    past_members TEXT,
+    tags TEXT,
+    status TEXT,
+    notes TEXT,
+    archived_sets INTEGER DEFAULT 0,
+    total_sets INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
