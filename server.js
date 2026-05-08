@@ -1965,6 +1965,286 @@ async function importMusicPeopleToDatabase(forceRefresh) {
   }
 }
 
+const MUSIC_VENUE_IMPORT_HEADER_ALIASES = {
+  venue: 'venue',
+  name: 'venue',
+  city: 'city',
+  state: 'state',
+  gps_lat: 'gps_lat',
+  gpslat: 'gps_lat',
+  latitude: 'gps_lat',
+  lat: 'gps_lat',
+  gps_lng: 'gps_lng',
+  gpslng: 'gps_lng',
+  gps_lon: 'gps_lng',
+  gpslon: 'gps_lng',
+  longitude: 'gps_lng',
+  lng: 'gps_lng',
+  lon: 'gps_lng',
+  logo: 'logo',
+  logo_url: 'logo',
+  logourl: 'logo',
+  description: 'description',
+  notes: 'notes',
+  status: 'status'
+};
+
+function normalizeMusicVenueImportRow(row) {
+  const out = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const normalizedKey = normalizeImportHeaderKey(key);
+    const compactKey = normalizedKey.replace(/_/g, '');
+    const canonicalKey = MUSIC_VENUE_IMPORT_HEADER_ALIASES[normalizedKey] ||
+      MUSIC_VENUE_IMPORT_HEADER_ALIASES[compactKey] ||
+      normalizedKey;
+    out[canonicalKey] = value;
+  });
+
+  return out;
+}
+
+function cleanMusicVenueText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function getMusicVenueGroupKey(row) {
+  return [
+    normalizeMusicLookupKey(row.venue),
+    normalizeMusicLookupKey(row.city),
+    normalizeMusicLookupKey(row.state)
+  ].join('|');
+}
+
+function setMusicVenueGroupValue(group, key, value) {
+  const clean = cleanMusicVenueText(value);
+  if (clean && !group[key]) group[key] = clean;
+}
+
+function buildMusicVenueDbGroups(rows) {
+  const groups = new Map();
+  let skippedMissingVenue = 0;
+
+  rows.forEach((row) => {
+    const venue = cleanMusicVenueText(row.venue);
+    if (!venue) {
+      skippedMissingVenue += 1;
+      return;
+    }
+
+    const key = getMusicVenueGroupKey(row);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        venue: '',
+        city: '',
+        state: '',
+        gps_lat: '',
+        gps_lng: '',
+        logo: '',
+        description: '',
+        notes: '',
+        status: '',
+        rawRows: []
+      });
+    }
+
+    const group = groups.get(key);
+    setMusicVenueGroupValue(group, 'venue', row.venue);
+    setMusicVenueGroupValue(group, 'city', row.city);
+    setMusicVenueGroupValue(group, 'state', row.state);
+    setMusicVenueGroupValue(group, 'gps_lat', row.gps_lat);
+    setMusicVenueGroupValue(group, 'gps_lng', row.gps_lng);
+    setMusicVenueGroupValue(group, 'logo', row.logo);
+    setMusicVenueGroupValue(group, 'description', row.description);
+    setMusicVenueGroupValue(group, 'notes', row.notes);
+    setMusicVenueGroupValue(group, 'status', row.status);
+    group.rawRows.push(compactJsonFields(row));
+  });
+
+  return { groups: Array.from(groups.values()), skippedMissingVenue };
+}
+
+function getMusicVenueShowCountKey(venue, city, state) {
+  return [
+    normalizeMusicLookupKey(venue),
+    normalizeMusicLookupKey(city),
+    normalizeMusicLookupKey(state)
+  ].join('|');
+}
+
+async function getMusicVenueShowCountMaps(client) {
+  const exact = new Map();
+  const venueOnly = new Map();
+
+  try {
+    const result = await client.query(`
+      SELECT
+        lower(trim(coalesce(venue, ''))) AS venue_key,
+        lower(trim(coalesce(city, ''))) AS city_key,
+        lower(trim(coalesce(state, ''))) AS state_key,
+        count(*)::int AS show_count
+      FROM music_shows
+      WHERE trim(coalesce(venue, '')) <> ''
+      GROUP BY 1, 2, 3
+    `);
+
+    result.rows.forEach((row) => {
+      const count = toIntegerCount(row.show_count);
+      const venueKey = normalizeMusicLookupKey(row.venue_key);
+      const exactKey = [venueKey, normalizeMusicLookupKey(row.city_key), normalizeMusicLookupKey(row.state_key)].join('|');
+      exact.set(exactKey, (exact.get(exactKey) || 0) + count);
+      venueOnly.set(venueKey, (venueOnly.get(venueKey) || 0) + count);
+    });
+  } catch (err) {
+    console.warn('Music-Venues showCount lookup skipped:', err && err.message ? err.message : String(err));
+  }
+
+  return { exact, venueOnly };
+}
+
+function getMusicVenueShowCount(venue, showCounts) {
+  const exactKey = getMusicVenueShowCountKey(venue.venue, venue.city, venue.state);
+  const venueKey = normalizeMusicLookupKey(venue.venue);
+  if (showCounts.exact.has(exactKey)) return showCounts.exact.get(exactKey);
+  return showCounts.venueOnly.get(venueKey) || 0;
+}
+
+function buildMusicVenueDbRows(rows, showCounts) {
+  const grouped = buildMusicVenueDbGroups(rows);
+  const venues = grouped.groups.sort((a, b) => {
+    return a.venue.localeCompare(b.venue, undefined, { numeric: true, sensitivity: 'base' }) ||
+      a.city.localeCompare(b.city, undefined, { numeric: true, sensitivity: 'base' }) ||
+      a.state.localeCompare(b.state, undefined, { numeric: true, sensitivity: 'base' });
+  });
+  const items = venues.map((venue, index) => {
+    const showCount = getMusicVenueShowCount(venue, showCounts);
+
+    return {
+      venue_id: index + 1,
+      venue: venue.venue,
+      city: venue.city || null,
+      state: venue.state || null,
+      gps_lat: venue.gps_lat || null,
+      gps_lng: venue.gps_lng || null,
+      logo: venue.logo || null,
+      description: venue.description || null,
+      notes: venue.notes || null,
+      status: venue.status || null,
+      location: {
+        gps_lat: venue.gps_lat || '',
+        gps_lng: venue.gps_lng || ''
+      },
+      media: {
+        logo: venue.logo || ''
+      },
+      stats: {
+        showCount
+      },
+      raw_sheet: { rows: venue.rawRows }
+    };
+  });
+
+  return { items, skippedMissingVenue: grouped.skippedMissingVenue };
+}
+
+async function upsertMusicVenueDbRow(client, item) {
+  await client.query(`
+    INSERT INTO music_venues (
+      venue_id,
+      venue,
+      city,
+      state,
+      gps_lat,
+      gps_lng,
+      logo,
+      description,
+      notes,
+      status,
+      location,
+      media,
+      stats,
+      raw_sheet
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6, $7,
+      $8, $9, $10, $11::jsonb, $12::jsonb,
+      $13::jsonb, $14::jsonb
+    )
+    ON CONFLICT (venue_id) DO UPDATE SET
+      venue = EXCLUDED.venue,
+      city = EXCLUDED.city,
+      state = EXCLUDED.state,
+      gps_lat = EXCLUDED.gps_lat,
+      gps_lng = EXCLUDED.gps_lng,
+      logo = EXCLUDED.logo,
+      description = EXCLUDED.description,
+      notes = EXCLUDED.notes,
+      status = EXCLUDED.status,
+      location = EXCLUDED.location,
+      media = EXCLUDED.media,
+      stats = EXCLUDED.stats,
+      raw_sheet = EXCLUDED.raw_sheet,
+      updated_at = NOW()
+  `, [
+    item.venue_id,
+    item.venue,
+    item.city,
+    item.state,
+    item.gps_lat,
+    item.gps_lng,
+    item.logo,
+    item.description,
+    item.notes,
+    item.status,
+    stringifyDbJson(item.location),
+    stringifyDbJson(item.media),
+    stringifyDbJson(item.stats),
+    stringifyDbJson(item.raw_sheet)
+  ]);
+}
+
+async function importMusicVenuesToDatabase(forceRefresh) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    throw new Error('Missing DATABASE_URL environment variable.');
+  }
+
+  const payload = await fetchCsvForRoute('/api/music/venues', ROUTES['/api/music/venues'], forceRefresh);
+  const rows = payload.rows.map(normalizeMusicVenueImportRow);
+  const client = await dbPool.connect();
+
+  try {
+    const showCounts = await getMusicVenueShowCountMaps(client);
+    const built = buildMusicVenueDbRows(rows, showCounts);
+    const result = {
+      ok: true,
+      route: '/admin/import/music/venues',
+      source: 'Music-Venue',
+      table: 'music_venues',
+      rowsRead: payload.rows.length,
+      venuesTotal: built.items.length,
+      upserted: 0,
+      skipped: built.skippedMissingVenue,
+      skippedMissingVenue: built.skippedMissingVenue,
+      duplicatesCombined: Math.max(0, rows.length - built.skippedMissingVenue - built.items.length)
+    };
+
+    await client.query('BEGIN');
+
+    for (const item of built.items) {
+      await upsertMusicVenueDbRow(client, item);
+      result.upserted += 1;
+    }
+
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function buildMusicBandDbApiItem(row) {
   return {
     band: row.band,
@@ -2724,6 +3004,542 @@ async function buildMusicPeopleDbStatsResponse() {
   };
 }
 
+function buildMusicVenueDbApiItem(row) {
+  const location = row.location && typeof row.location === 'object' ? row.location : {};
+  const media = row.media && typeof row.media === 'object' ? row.media : {};
+  const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
+  stats.showCount = toIntegerCount(stats.showCount);
+
+  return {
+    venue_id: row.venue_id,
+    venue: row.venue || '',
+    city: row.city || '',
+    state: row.state || '',
+    location: {
+      gps_lat: String(location.gps_lat || row.gps_lat || ''),
+      gps_lng: String(location.gps_lng || row.gps_lng || '')
+    },
+    media: {
+      logo: String(media.logo || row.logo || '')
+    },
+    description: row.description || '',
+    notes: row.notes || '',
+    status: row.status || '',
+    stats
+  };
+}
+
+function buildMusicVenuesDbQueryOptions(query) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const search = String(query.search || '').trim();
+  const city = String(query.city || '').trim();
+  const state = String(query.state || '').trim();
+  const status = String(query.status || '').trim();
+  const sortFields = {
+    venue_id: 'venue_id',
+    venue: 'venue',
+    city: 'city',
+    state: 'state',
+    status: 'status',
+    created_at: 'created_at',
+    updated_at: 'updated_at'
+  };
+  const requestedSort = String(query.sort || 'venue').trim().toLowerCase();
+  const sortField = sortFields[requestedSort] ? requestedSort : 'venue';
+  const dir = String(query.dir || 'asc').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+
+  if (search) {
+    values.push(`%${search}%`);
+    const idx = values.length;
+    where.push(`(
+      venue ILIKE $${idx}
+      OR coalesce(city, '') ILIKE $${idx}
+      OR coalesce(state, '') ILIKE $${idx}
+      OR coalesce(status, '') ILIKE $${idx}
+      OR coalesce(description, '') ILIKE $${idx}
+      OR coalesce(notes, '') ILIKE $${idx}
+      OR coalesce(logo, '') ILIKE $${idx}
+      OR location::text ILIKE $${idx}
+      OR media::text ILIKE $${idx}
+      OR stats::text ILIKE $${idx}
+      OR raw_sheet::text ILIKE $${idx}
+    )`);
+    filters.search = search;
+  }
+
+  if (city) {
+    values.push(city.toLowerCase());
+    where.push(`lower(trim(coalesce(city, ''))) = $${values.length}`);
+    filters.city = city;
+  }
+
+  if (state) {
+    values.push(state.toLowerCase());
+    where.push(`lower(trim(coalesce(state, ''))) = $${values.length}`);
+    filters.state = state;
+  }
+
+  if (status) {
+    values.push(status.toLowerCase());
+    where.push(`lower(trim(coalesce(status, ''))) = $${values.length}`);
+    filters.status = status;
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    filters,
+    sort: {
+      field: sortField,
+      dir
+    },
+    orderBySql: `${sortFields[sortField]} ${dir.toUpperCase()} NULLS LAST, venue ASC, city ASC, state ASC`
+  };
+}
+
+async function handleMusicVenuesDbRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildMusicVenuesDbQueryOptions(req.query);
+    const countResult = await dbPool.query(
+      `SELECT count(*)::int AS total FROM music_venues ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `SELECT venue_id, venue, city, state, gps_lat, gps_lng, logo, description, notes, status, location, media, stats
+       FROM music_venues
+       ${options.whereSql}
+       ORDER BY ${options.orderBySql}
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
+    const data = result.rows.map(buildMusicVenueDbApiItem);
+
+    res.json({
+      ok: true,
+      route: '/api/music/venues/db',
+      source: {
+        type: 'postgres',
+        table: 'music_venues'
+      },
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: data.length,
+      total,
+      page,
+      limit,
+      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      filters: options.filters,
+      sort: options.sort,
+      stats: {
+        venuesTotal: total
+      },
+      data
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/music/venues/db',
+      source: {
+        type: 'postgres',
+        table: 'music_venues'
+      },
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildMusicVenuesDbStatsResponse() {
+  const generated = new Date();
+  const totalsQuery = dbPool.query(`
+    SELECT
+      count(*)::int AS total_venues,
+      count(*) FILTER (
+        WHERE trim(coalesce(gps_lat, '')) <> ''
+          AND trim(coalesce(gps_lng, '')) <> ''
+      )::int AS venues_with_gps,
+      count(*) FILTER (
+        WHERE trim(coalesce(gps_lat, '')) = ''
+          OR trim(coalesce(gps_lng, '')) = ''
+      )::int AS venues_missing_gps,
+      count(*) FILTER (WHERE trim(coalesce(logo, '')) <> '')::int AS venues_with_logo,
+      count(*) FILTER (WHERE trim(coalesce(logo, '')) = '')::int AS venues_missing_logo
+    FROM music_venues
+  `);
+  const byStateQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(state), ''), 'Unknown') AS state, count(*)::int AS venue_count
+    FROM music_venues
+    GROUP BY 1
+    ORDER BY venue_count DESC, state ASC
+  `);
+  const byCityQuery = dbPool.query(`
+    SELECT
+      coalesce(nullif(trim(city), ''), 'Unknown') AS city,
+      coalesce(nullif(trim(state), ''), 'Unknown') AS state,
+      count(*)::int AS venue_count
+    FROM music_venues
+    GROUP BY 1, 2
+    ORDER BY venue_count DESC, city ASC, state ASC
+  `);
+  const byStatusQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(status), ''), 'Unknown') AS status, count(*)::int AS venue_count
+    FROM music_venues
+    GROUP BY 1
+    ORDER BY venue_count DESC, status ASC
+  `);
+  const [totalsResult, byStateResult, byCityResult, byStatusResult] = await Promise.all([
+    totalsQuery,
+    byStateQuery,
+    byCityQuery,
+    byStatusQuery
+  ]);
+  const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+
+  return {
+    ok: true,
+    route: '/api/music/venues/stats',
+    source: {
+      type: 'postgres',
+      table: 'music_venues'
+    },
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    totals: {
+      venuesTotal: toIntegerCount(totals.total_venues),
+      venuesWithGps: toIntegerCount(totals.venues_with_gps),
+      venuesMissingGps: toIntegerCount(totals.venues_missing_gps),
+      venuesWithLogo: toIntegerCount(totals.venues_with_logo),
+      venuesMissingLogo: toIntegerCount(totals.venues_missing_logo)
+    },
+    venuesByState: byStateResult.rows.map((row) => ({ state: row.state, venueCount: toIntegerCount(row.venue_count) })),
+    venuesByCity: byCityResult.rows.map((row) => ({ city: row.city, state: row.state, venueCount: toIntegerCount(row.venue_count) })),
+    venuesByStatus: byStatusResult.rows.map((row) => ({ status: row.status, venueCount: toIntegerCount(row.venue_count) }))
+  };
+}
+
+function getImportLogRowsWritten(result) {
+  if (!result || typeof result !== 'object') return 0;
+  if (result.upserted != null) return toIntegerCount(result.upserted);
+  if (result.importedRows != null) return toIntegerCount(result.importedRows);
+  if (result.rowsInserted != null) return toIntegerCount(result.rowsInserted);
+  return 0;
+}
+
+async function writeSystemImportLog(entry) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) return;
+
+    await dbPool.query(`
+      INSERT INTO system_import_logs (
+        area,
+        route,
+        status,
+        rows_read,
+        rows_inserted,
+        rows_updated,
+        error_message,
+        started_at,
+        finished_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `, [
+      entry.area,
+      entry.route,
+      entry.status,
+      toIntegerCount(entry.rows_read),
+      toIntegerCount(entry.rows_inserted),
+      toIntegerCount(entry.rows_updated),
+      entry.error_message || null,
+      entry.started_at,
+      entry.finished_at
+    ]);
+  } catch (err) {
+    console.warn('Import log write failed:', err && err.message ? err.message : String(err));
+  }
+}
+
+async function runLoggedMusicImport(req, res, config) {
+  const startedAt = new Date();
+
+  try {
+    const forceRefresh = req.query.refresh === '1';
+    const result = await config.importer(forceRefresh);
+    await writeSystemImportLog({
+      area: 'music',
+      route: config.route,
+      status: 'success',
+      rows_read: result && result.rowsRead,
+      rows_inserted: getImportLogRowsWritten(result),
+      rows_updated: 0,
+      started_at: startedAt,
+      finished_at: new Date()
+    });
+    res.json(result);
+  } catch (err) {
+    await writeSystemImportLog({
+      area: 'music',
+      route: config.route,
+      status: 'error',
+      rows_read: 0,
+      rows_inserted: 0,
+      rows_updated: 0,
+      error_message: err && err.message ? err.message : String(err),
+      started_at: startedAt,
+      finished_at: new Date()
+    });
+    res.status(500).json({
+      ok: false,
+      route: config.route,
+      source: config.source,
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+const MUSIC_STATUS_TABLES = ['music_bands', 'music_shows', 'music_people', 'music_venues'];
+const MUSIC_STATUS_IMPORT_ROUTES = {
+  '/admin/import/music/bands': 'bandsLastImport',
+  '/admin/import/music/shows': 'showsLastImport',
+  '/admin/import/music/people': 'peopleLastImport',
+  '/admin/import/music/venues': 'venuesLastImport'
+};
+
+function formatStatusTimestamp(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
+}
+
+async function getExistingPublicTables(tableNames) {
+  const result = await dbPool.query(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_type = 'BASE TABLE'
+      AND table_name = ANY($1::text[])
+  `, [tableNames]);
+
+  return new Set(result.rows.map((row) => row.table_name));
+}
+
+async function getMusicStatusTableCount(tableName, exists, warnings) {
+  if (!exists) return 0;
+
+  try {
+    const result = await dbPool.query(`SELECT count(*)::int AS count FROM ${tableName}`);
+    return toIntegerCount(result.rows && result.rows[0] && result.rows[0].count);
+  } catch (err) {
+    warnings.push(`Unable to count ${tableName}: ${err && err.message ? err.message : String(err)}`);
+    return 0;
+  }
+}
+
+async function getMusicStatusQualityCount(tableName, exists, sql, warnings) {
+  if (!exists) return 0;
+
+  try {
+    const result = await dbPool.query(sql);
+    return toIntegerCount(result.rows && result.rows[0] && result.rows[0].count);
+  } catch (err) {
+    warnings.push(`Unable to check ${tableName}: ${err && err.message ? err.message : String(err)}`);
+    return 0;
+  }
+}
+
+async function getMusicStatusLastImports(logTableExists, warnings) {
+  const imports = {
+    bandsLastImport: '',
+    showsLastImport: '',
+    peopleLastImport: '',
+    venuesLastImport: ''
+  };
+
+  if (!logTableExists) {
+    warnings.push('Missing table: system_import_logs');
+    return imports;
+  }
+
+  try {
+    const routes = Object.keys(MUSIC_STATUS_IMPORT_ROUTES);
+    const result = await dbPool.query(`
+      SELECT DISTINCT ON (route)
+        route,
+        coalesce(finished_at, created_at) AS import_time
+      FROM system_import_logs
+      WHERE area = $1
+        AND route = ANY($2::text[])
+      ORDER BY route, coalesce(finished_at, created_at) DESC
+    `, ['music', routes]);
+
+    result.rows.forEach((row) => {
+      const key = MUSIC_STATUS_IMPORT_ROUTES[row.route];
+      if (key) imports[key] = formatStatusTimestamp(row.import_time);
+    });
+  } catch (err) {
+    warnings.push(`Unable to read import logs: ${err && err.message ? err.message : String(err)}`);
+  }
+
+  return imports;
+}
+
+async function buildMusicStatusResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const response = {
+    ok: true,
+    route: '/api/status/music',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    database: {
+      connected: false
+    },
+    tables: {
+      music_bands: false,
+      music_shows: false,
+      music_people: false,
+      music_venues: false
+    },
+    counts: {
+      bands: 0,
+      shows: 0,
+      people: 0,
+      venues: 0
+    },
+    imports: {
+      bandsLastImport: '',
+      showsLastImport: '',
+      peopleLastImport: '',
+      venuesLastImport: ''
+    },
+    warnings,
+    dataQuality: {
+      venuesMissingGps: 0,
+      venuesMissingLogo: 0,
+      showsMissingPoster: 0,
+      peopleMissingBands: 0,
+      bandsMissingStatus: 0
+    }
+  };
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable.');
+    return response;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+    response.database.connected = true;
+  } catch (err) {
+    warnings.push(`Database disconnected: ${err && err.message ? err.message : String(err)}`);
+    return response;
+  }
+
+  const allStatusTables = MUSIC_STATUS_TABLES.concat(['system_import_logs']);
+  let existingTables;
+  try {
+    existingTables = await getExistingPublicTables(allStatusTables);
+  } catch (err) {
+    warnings.push(`Unable to inspect database tables: ${err && err.message ? err.message : String(err)}`);
+    return response;
+  }
+
+  MUSIC_STATUS_TABLES.forEach((tableName) => {
+    response.tables[tableName] = existingTables.has(tableName);
+    if (!response.tables[tableName]) warnings.push(`Missing table: ${tableName}`);
+  });
+
+  const [
+    bandsCount,
+    showsCount,
+    peopleCount,
+    venuesCount,
+    venuesMissingGps,
+    venuesMissingLogo,
+    showsMissingPoster,
+    peopleMissingBands,
+    bandsMissingStatus,
+    imports
+  ] = await Promise.all([
+    getMusicStatusTableCount('music_bands', response.tables.music_bands, warnings),
+    getMusicStatusTableCount('music_shows', response.tables.music_shows, warnings),
+    getMusicStatusTableCount('music_people', response.tables.music_people, warnings),
+    getMusicStatusTableCount('music_venues', response.tables.music_venues, warnings),
+    getMusicStatusQualityCount(
+      'music_venues',
+      response.tables.music_venues,
+      `SELECT count(*)::int AS count FROM music_venues WHERE trim(coalesce(gps_lat, '')) = '' OR trim(coalesce(gps_lng, '')) = ''`,
+      warnings
+    ),
+    getMusicStatusQualityCount(
+      'music_venues',
+      response.tables.music_venues,
+      `SELECT count(*)::int AS count FROM music_venues WHERE trim(coalesce(logo, '')) = ''`,
+      warnings
+    ),
+    getMusicStatusQualityCount(
+      'music_shows',
+      response.tables.music_shows,
+      `SELECT count(*)::int AS count FROM music_shows WHERE trim(coalesce(poster, '')) = ''`,
+      warnings
+    ),
+    getMusicStatusQualityCount(
+      'music_people',
+      response.tables.music_people,
+      `SELECT count(*)::int AS count
+       FROM music_people
+       WHERE CASE
+         WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
+         ELSE 0
+       END = 0`,
+      warnings
+    ),
+    getMusicStatusQualityCount(
+      'music_bands',
+      response.tables.music_bands,
+      `SELECT count(*)::int AS count FROM music_bands WHERE trim(coalesce(status, '')) = ''`,
+      warnings
+    ),
+    getMusicStatusLastImports(existingTables.has('system_import_logs'), warnings)
+  ]);
+
+  response.counts = {
+    bands: bandsCount,
+    shows: showsCount,
+    people: peopleCount,
+    venues: venuesCount
+  };
+  response.imports = imports;
+  response.dataQuality = {
+    venuesMissingGps,
+    venuesMissingLogo,
+    showsMissingPoster,
+    peopleMissingBands,
+    bandsMissingStatus
+  };
+
+  if (venuesMissingGps > 0) warnings.push(`${venuesMissingGps} venues missing GPS.`);
+  if (venuesMissingLogo > 0) warnings.push(`${venuesMissingLogo} venues missing logo.`);
+  if (showsMissingPoster > 0) warnings.push(`${showsMissingPoster} shows missing poster.`);
+  if (peopleMissingBands > 0) warnings.push(`${peopleMissingBands} people missing bands.`);
+  if (bandsMissingStatus > 0) warnings.push(`${bandsMissingStatus} bands missing status.`);
+
+  return response;
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -2784,45 +3600,44 @@ app.get('/health/tables', async (req, res) => {
 });
 
 app.get('/admin/import/music/bands', async (req, res) => {
-  try {
-    const forceRefresh = req.query.refresh === '1';
-    const result = await importMusicBandsToDatabase(forceRefresh);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/admin/import/music/bands',
-      source: 'Music-Bands',
-      error: err && err.message ? err.message : String(err)
-    });
-  }
+  return runLoggedMusicImport(req, res, {
+    route: '/admin/import/music/bands',
+    source: 'Music-Bands',
+    importer: importMusicBandsToDatabase
+  });
 });
 
 app.get('/admin/import/music/shows', async (req, res) => {
-  try {
-    const forceRefresh = req.query.refresh === '1';
-    const result = await importMusicShowsToDatabase(forceRefresh);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/admin/import/music/shows',
-      source: 'Music-Shows',
-      error: err && err.message ? err.message : String(err)
-    });
-  }
+  return runLoggedMusicImport(req, res, {
+    route: '/admin/import/music/shows',
+    source: 'Music-Shows',
+    importer: importMusicShowsToDatabase
+  });
 });
 
 app.get('/admin/import/music/people', async (req, res) => {
+  return runLoggedMusicImport(req, res, {
+    route: '/admin/import/music/people',
+    source: 'Music-People',
+    importer: importMusicPeopleToDatabase
+  });
+});
+
+app.get('/admin/import/music/venues', async (req, res) => {
+  return runLoggedMusicImport(req, res, {
+    route: '/admin/import/music/venues',
+    source: 'Music-Venue',
+    importer: importMusicVenuesToDatabase
+  });
+});
+
+app.get('/api/status/music', async (req, res) => {
   try {
-    const forceRefresh = req.query.refresh === '1';
-    const result = await importMusicPeopleToDatabase(forceRefresh);
-    res.json(result);
+    res.json(await buildMusicStatusResponse());
   } catch (err) {
     res.status(500).json({
       ok: false,
-      route: '/admin/import/music/people',
-      source: 'Music-People',
+      route: '/api/status/music',
       error: err && err.message ? err.message : String(err)
     });
   }
@@ -2892,6 +3707,30 @@ app.get('/api/music/people/stats', async (req, res) => {
       source: {
         type: 'postgres',
         table: 'music_people'
+      },
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/music/venues/db', async (req, res) => {
+  return handleMusicVenuesDbRequest(req, res);
+});
+
+app.get('/api/music/venues/stats', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    res.json(await buildMusicVenuesDbStatsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/music/venues/stats',
+      source: {
+        type: 'postgres',
+        table: 'music_venues'
       },
       error: err && err.message ? err.message : String(err)
     });
