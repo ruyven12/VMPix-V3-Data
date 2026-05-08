@@ -30,6 +30,8 @@ function loadLocalEnv() {
 
 loadLocalEnv();
 
+const dbPool = require('./db');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -1221,6 +1223,28 @@ app.get('/health', (req, res) => {
     sheetConfigured: !!SHEET_ID,
     routes: Object.keys(ROUTES)
   });
+});
+
+app.get('/health/db', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const result = await dbPool.query('SELECT NOW()');
+    const row = result.rows && result.rows[0] ? result.rows[0] : {};
+    res.json({
+      ok: true,
+      database: 'connected',
+      time: row.now
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      database: 'disconnected',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
 });
 
 for (const [routePath, cfg] of Object.entries(ROUTES)) {
