@@ -1523,6 +1523,145 @@ function buildMusicBandDbApiItem(row) {
   };
 }
 
+function getPositiveLimit(value) {
+  const limit = Number(String(value || '').trim());
+  return Number.isInteger(limit) && limit > 0 ? limit : null;
+}
+
+async function handleMusicBandsDbRequest(req, res, routePath) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const limit = getPositiveLimit(req.query.limit);
+    const result = limit
+      ? await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC LIMIT $1', [limit])
+      : await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC');
+
+    res.json({
+      ok: true,
+      route: routePath,
+      source: 'PostgreSQL:music_bands',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: result.rows.length,
+      data: result.rows.map(buildMusicBandDbApiItem)
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: routePath,
+      source: 'PostgreSQL:music_bands',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+function toIntegerCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : 0;
+}
+
+async function getMusicBandsDbStats() {
+  const result = await dbPool.query(`
+    WITH band_rows AS (
+      SELECT
+        lower(trim(coalesce(region, ''))) AS region_key,
+        lower(trim(coalesce(status, ''))) AS status_key,
+        coalesce(total_sets, 0) AS total_set_count,
+        coalesce(archived_sets, 0) AS archived_set_count,
+        CASE
+          WHEN coalesce(stats->>'totalPhotos', '') ~ '^[0-9]+(\\.[0-9]+)?$'
+            THEN (stats->>'totalPhotos')::numeric
+          ELSE 0
+        END AS photo_count
+      FROM music_bands
+    ),
+    normalized AS (
+      SELECT
+        *,
+        CASE
+          WHEN status_key IN ('complete', 'completed') THEN 'complete'
+          WHEN status_key = 'partial' THEN 'partial'
+          WHEN status_key IN ('none', 'no', 'missing') THEN 'none'
+          WHEN total_set_count > 0 AND archived_set_count > 0 AND total_set_count = archived_set_count THEN 'complete'
+          WHEN total_set_count > 0 AND archived_set_count > 0 AND total_set_count <> archived_set_count THEN 'partial'
+          ELSE 'none'
+        END AS completion_status
+      FROM band_rows
+    )
+    SELECT
+      count(*)::int AS bands_total,
+      count(*) FILTER (WHERE region_key = 'local')::int AS bands_local,
+      count(*) FILTER (WHERE region_key = 'regional')::int AS bands_regional,
+      count(*) FILTER (WHERE region_key = 'national')::int AS bands_national,
+      count(*) FILTER (WHERE region_key = 'international')::int AS bands_international,
+      count(*) FILTER (WHERE completion_status = 'complete')::int AS bands_complete,
+      count(*) FILTER (WHERE completion_status = 'partial')::int AS bands_partial,
+      count(*) FILTER (WHERE completion_status = 'none')::int AS bands_none,
+      coalesce(sum(photo_count), 0)::int AS photos_total,
+      coalesce(sum(photo_count) FILTER (WHERE region_key = 'local'), 0)::int AS photos_local,
+      coalesce(sum(photo_count) FILTER (WHERE region_key = 'regional'), 0)::int AS photos_regional,
+      coalesce(sum(photo_count) FILTER (WHERE region_key = 'national'), 0)::int AS photos_national,
+      coalesce(sum(photo_count) FILTER (WHERE region_key = 'international'), 0)::int AS photos_international
+    FROM normalized
+  `);
+
+  return result.rows && result.rows[0] ? result.rows[0] : {};
+}
+
+async function buildMusicBandsDbStatsResponse(forceRefresh) {
+  const generated = new Date();
+  const dbStats = await getMusicBandsDbStats();
+  const progressStats = createMusicBandsStats();
+  await addStatsSheetPhotoProgress(progressStats, forceRefresh);
+
+  const photosTotal = toIntegerCount(dbStats.photos_total);
+  const photosLocal = toIntegerCount(dbStats.photos_local);
+  const photosRegional = toIntegerCount(dbStats.photos_regional);
+  const photosNational = toIntegerCount(dbStats.photos_national);
+  const photosInternational = toIntegerCount(dbStats.photos_international);
+
+  return {
+    ok: true,
+    route: '/api/music/bands/stats',
+    source: 'PostgreSQL:music_bands',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    bandTotals: {
+      bandsTotal: toIntegerCount(dbStats.bands_total),
+      bandsLocal: toIntegerCount(dbStats.bands_local),
+      bandsRegional: toIntegerCount(dbStats.bands_regional),
+      bandsNational: toIntegerCount(dbStats.bands_national),
+      bandsInternational: toIntegerCount(dbStats.bands_international),
+      bandsComplete: toIntegerCount(dbStats.bands_complete),
+      bandsPartial: toIntegerCount(dbStats.bands_partial),
+      bandsNone: toIntegerCount(dbStats.bands_none)
+    },
+    photoTotals: {
+      photosTotal,
+      photosLocal,
+      photosRegional,
+      photosNational,
+      photosInternational,
+      photosDone: progressStats.photosDone,
+      photosEditing: progressStats.photosEditing,
+      photosNone: progressStats.photosNone
+    },
+    percentages: {
+      photosLocalPct: formatMusicBandsPhotoPct(photosLocal, photosTotal),
+      photosRegionalPct: formatMusicBandsPhotoPct(photosRegional, photosTotal),
+      photosNationalPct: formatMusicBandsPhotoPct(photosNational, photosTotal),
+      photosInternationalPct: formatMusicBandsPhotoPct(photosInternational, photosTotal),
+      photosDonePct: progressStats.photosDonePct,
+      photosEditingPct: progressStats.photosEditingPct,
+      photosNonePct: progressStats.photosNonePct
+    }
+  };
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -1597,33 +1736,25 @@ app.get('/admin/import/music/bands', async (req, res) => {
   }
 });
 
+app.get('/api/music/bands/db', async (req, res) => {
+  return handleMusicBandsDbRequest(req, res, '/api/music/bands/db');
+});
+
 app.get('/api/v3/music/bands/db', async (req, res) => {
+  return handleMusicBandsDbRequest(req, res, '/api/v3/music/bands/db');
+});
+
+app.get('/api/music/bands/stats', async (req, res) => {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
       throw new Error('Missing DATABASE_URL environment variable.');
     }
 
-    const generated = new Date();
-    const rawLimit = String(req.query.limit || '').trim();
-    const limit = rawLimit ? Number(rawLimit) : null;
-    const hasLimit = Number.isInteger(limit) && limit > 0;
-    const result = hasLimit
-      ? await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC LIMIT $1', [limit])
-      : await dbPool.query('SELECT * FROM music_bands ORDER BY band ASC');
-
-    res.json({
-      ok: true,
-      route: '/api/v3/music/bands/db',
-      source: 'PostgreSQL:music_bands',
-      generatedAt: generated.toISOString(),
-      generatedTime: formatEasternGeneratedTime(generated),
-      count: result.rows.length,
-      data: result.rows.map(buildMusicBandDbApiItem)
-    });
+    res.json(await buildMusicBandsDbStatsResponse(req.query.refresh === '1'));
   } catch (err) {
     res.status(500).json({
       ok: false,
-      route: '/api/v3/music/bands/db',
+      route: '/api/music/bands/stats',
       source: 'PostgreSQL:music_bands',
       error: err && err.message ? err.message : String(err)
     });
