@@ -1234,6 +1234,149 @@ async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
   return payload;
 }
 
+function toDbText(value) {
+  const clean = String(value || '').trim();
+  return clean || null;
+}
+
+function toDbInteger(value) {
+  const clean = String(value || '').replace(/,/g, '').trim();
+  if (!clean) return 0;
+
+  const number = Number(clean);
+  return Number.isFinite(number) ? Math.trunc(number) : 0;
+}
+
+function buildMusicBandDbRow(row) {
+  return {
+    band_id: toDbText(row.band_id),
+    band: toDbText(getMusicBandName(row)),
+    smug_folder: toDbText(row.smug_folder || row.slug_folder),
+    logo_url: toDbText(row.logo_url),
+    region: toDbText(row.region),
+    location: toDbText(row.location),
+    state: toDbText(row.state),
+    country: toDbText(row.country),
+    members: toDbText(row.members),
+    past_members: toDbText(row.past_members),
+    tags: toDbText(row.tags),
+    status: toDbText(row.status),
+    notes: toDbText(row.notes),
+    archived_sets: toDbInteger(row.archived_sets || row.sets_archive),
+    total_sets: toDbInteger(row.total_sets)
+  };
+}
+
+async function upsertMusicBandDbRow(client, item) {
+  await client.query(`
+    INSERT INTO music_bands (
+      band_id,
+      band,
+      smug_folder,
+      logo_url,
+      region,
+      location,
+      state,
+      country,
+      members,
+      past_members,
+      tags,
+      status,
+      notes,
+      archived_sets,
+      total_sets
+    )
+    VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9, $10,
+      $11, $12, $13, $14, $15
+    )
+    ON CONFLICT (band_id) DO UPDATE SET
+      band = EXCLUDED.band,
+      smug_folder = EXCLUDED.smug_folder,
+      logo_url = EXCLUDED.logo_url,
+      region = EXCLUDED.region,
+      location = EXCLUDED.location,
+      state = EXCLUDED.state,
+      country = EXCLUDED.country,
+      members = EXCLUDED.members,
+      past_members = EXCLUDED.past_members,
+      tags = EXCLUDED.tags,
+      status = EXCLUDED.status,
+      notes = EXCLUDED.notes,
+      archived_sets = EXCLUDED.archived_sets,
+      total_sets = EXCLUDED.total_sets,
+      updated_at = NOW()
+  `, [
+    item.band_id,
+    item.band,
+    item.smug_folder,
+    item.logo_url,
+    item.region,
+    item.location,
+    item.state,
+    item.country,
+    item.members,
+    item.past_members,
+    item.tags,
+    item.status,
+    item.notes,
+    item.archived_sets,
+    item.total_sets
+  ]);
+}
+
+async function importMusicBandsToDatabase(forceRefresh) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    throw new Error('Missing DATABASE_URL environment variable.');
+  }
+
+  const payload = await fetchCsvForRoute('/api/music/bands', ROUTES['/api/music/bands'], forceRefresh);
+  const client = await dbPool.connect();
+  const result = {
+    ok: true,
+    route: '/admin/import/music/bands',
+    source: 'Music-Bands',
+    table: 'music_bands',
+    rowsRead: payload.rows.length,
+    upserted: 0,
+    skipped: 0,
+    skippedMissingBand: 0,
+    skippedMissingBandId: 0
+  };
+
+  try {
+    await client.query('BEGIN');
+
+    for (const row of payload.rows) {
+      const item = buildMusicBandDbRow(row);
+
+      if (!item.band) {
+        result.skipped += 1;
+        result.skippedMissingBand += 1;
+        continue;
+      }
+
+      if (!item.band_id) {
+        result.skipped += 1;
+        result.skippedMissingBandId += 1;
+        continue;
+      }
+
+      await upsertMusicBandDbRow(client, item);
+      result.upserted += 1;
+    }
+
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -1288,6 +1431,21 @@ app.get('/health/tables', async (req, res) => {
     res.status(500).json({
       ok: false,
       tables: [],
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/admin/import/music/bands', async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === '1';
+    const result = await importMusicBandsToDatabase(forceRefresh);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/admin/import/music/bands',
+      source: 'Music-Bands',
       error: err && err.message ? err.message : String(err)
     });
   }
