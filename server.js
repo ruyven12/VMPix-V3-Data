@@ -1307,10 +1307,24 @@ function logMusicBandImportDebug(payload, rows) {
   console.log('Music-Bands import first parsed row keys:', rows[0] ? Object.keys(rows[0]) : []);
 }
 
+function slugifyMusicBandId(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 function buildMusicBandDbRow(row) {
+  const band = toDbText(getMusicBandName(row));
+  const providedBandId = toDbText(row.band_id);
+  const generatedBandId = providedBandId ? null : slugifyMusicBandId(band);
+
   return {
-    band_id: toDbText(row.band_id),
-    band: toDbText(getMusicBandName(row)),
+    band_id: providedBandId || generatedBandId || null,
+    generatedBandId: !!generatedBandId,
+    band,
     smug_folder: toDbText(row.smug_folder || row.slug_folder),
     logo_url: toDbText(row.logo_url),
     region: toDbText(row.region),
@@ -1404,7 +1418,8 @@ async function importMusicBandsToDatabase(forceRefresh) {
     upserted: 0,
     skipped: 0,
     skippedMissingBand: 0,
-    skippedMissingBandId: 0
+    skippedMissingBandId: 0,
+    generatedBandIds: 0
   };
 
   try {
@@ -1419,11 +1434,7 @@ async function importMusicBandsToDatabase(forceRefresh) {
         continue;
       }
 
-      if (!item.band_id) {
-        result.skipped += 1;
-        result.skippedMissingBandId += 1;
-        continue;
-      }
+      if (item.generatedBandId) result.generatedBandIds += 1;
 
       await upsertMusicBandDbRow(client, item);
       result.upserted += 1;
