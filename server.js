@@ -4637,6 +4637,15 @@ app.get('/admin/import/wrestling/shows', async (req, res) => {
   });
 });
 
+app.get('/admin/import/wrestling/people', async (req, res) => {
+  return runLoggedImport(req, res, {
+    area: 'wrestling',
+    route: '/admin/import/wrestling/people',
+    source: 'Wrestling-People',
+    importer: importWrestlingPeopleToDatabase
+  });
+});
+
 app.get('/api/wrestling/people/import', async (req, res) => {
   return runLoggedImport(req, res, {
     area: 'wrestling',

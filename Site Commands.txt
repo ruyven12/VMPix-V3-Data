@@ -397,6 +397,9 @@ Required Render env var:
 GID_WRESTLING_PEOPLE
 
 Import route:
+https://vmpix-data.onrender.com/admin/import/wrestling/people?refresh=1
+
+API import alias:
 https://vmpix-data.onrender.com/api/wrestling/people/import?refresh=1
 
 DB route:
