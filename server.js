@@ -2247,8 +2247,7 @@ async function importMusicVenuesToDatabase(forceRefresh) {
 
 const WRESTLING_MATCHES_SHEET_CONFIG = {
   label: 'Wrestling-Matches',
-  gidEnv: ROUTES['/api/wrestling/shows'].gidEnv,
-  defaultGid: ROUTES['/api/wrestling/shows'].defaultGid
+  gidEnv: 'GID_WRESTLING_MATCHES'
 };
 
 const WRESTLING_MATCH_IMPORT_HEADER_ALIASES = {
