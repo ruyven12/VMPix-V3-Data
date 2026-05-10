@@ -2752,6 +2752,230 @@ async function importWrestlingPeopleToDatabase(forceRefresh) {
   }
 }
 
+const WRESTLING_VENUES_SHEET_CONFIG = {
+  label: 'Wrestling-Venue',
+  gidEnv: 'GID_WRESTLING_VENUES'
+};
+
+const WRESTLING_VENUE_IMPORT_HEADER_ALIASES = {
+  venue_id: 'venue_id',
+  venueid: 'venue_id',
+  venue_name: 'venue_name',
+  venuename: 'venue_name',
+  venue: 'venue_name',
+  name: 'venue_name',
+  city: 'city',
+  state: 'state',
+  country: 'country',
+  region: 'region',
+  venue_type: 'venue_type',
+  venuetype: 'venue_type',
+  type: 'venue_type',
+  status: 'status',
+  latitude: 'latitude',
+  lat: 'latitude',
+  gps_lat: 'latitude',
+  gpslat: 'latitude',
+  longitude: 'longitude',
+  lng: 'longitude',
+  lon: 'longitude',
+  gps_lng: 'longitude',
+  gpslng: 'longitude',
+  notes: 'notes',
+  note: 'notes'
+};
+
+function normalizeWrestlingVenueImportRow(row) {
+  const out = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const normalizedKey = normalizeImportHeaderKey(key);
+    const compactKey = normalizedKey.replace(/_/g, '');
+    const canonicalKey = WRESTLING_VENUE_IMPORT_HEADER_ALIASES[normalizedKey] ||
+      WRESTLING_VENUE_IMPORT_HEADER_ALIASES[compactKey] ||
+      normalizedKey;
+    out[canonicalKey] = value;
+  });
+
+  return out;
+}
+
+function toNullableNumber(value) {
+  const clean = String(value || '').replace(/,/g, '').trim();
+  if (!clean) return null;
+
+  const number = Number(clean);
+  return Number.isFinite(number) ? number : null;
+}
+
+function createEmptyWrestlingVenueGeo() {
+  return {
+    formatted_address: null,
+    county: null,
+    timezone: null,
+    postal_code: null,
+    google_maps_url: null,
+    apple_maps_url: null,
+    osm_url: null,
+    geohash: null,
+    elevation: null,
+    venue_image: null,
+    nearby_airports: [],
+    weather_region: null
+  };
+}
+
+function buildWrestlingVenueFallbackId(row) {
+  return slugifyMusicBandId([
+    row.venue_name,
+    row.city,
+    row.state,
+    row.country
+  ].filter(Boolean).join(' '));
+}
+
+function buildWrestlingVenueDbRows(rows) {
+  const items = [];
+  const seen = new Set();
+  let skippedMissingVenue = 0;
+  let generatedVenueIds = 0;
+
+  rows.forEach((row) => {
+    const venueName = cleanMusicVenueText(row.venue_name);
+    if (!venueName) {
+      skippedMissingVenue += 1;
+      return;
+    }
+
+    const providedVenueId = cleanMusicVenueText(row.venue_id);
+    const generatedVenueId = providedVenueId ? '' : buildWrestlingVenueFallbackId({ ...row, venue_name: venueName });
+    const venueId = providedVenueId || generatedVenueId;
+    if (!venueId || seen.has(venueId)) return;
+    if (generatedVenueId) generatedVenueIds += 1;
+    seen.add(venueId);
+
+    items.push({
+      venue_id: venueId,
+      venue_name: venueName,
+      city: toDbText(row.city),
+      state: toDbText(row.state),
+      country: toDbText(row.country),
+      region: toDbText(row.region),
+      venue_type: toDbText(row.venue_type),
+      status: toDbText(row.status),
+      latitude: toNullableNumber(row.latitude),
+      longitude: toNullableNumber(row.longitude),
+      notes: toDbText(row.notes),
+      geo: createEmptyWrestlingVenueGeo(),
+      raw_sheet: compactJsonFields(row)
+    });
+  });
+
+  items.sort((a, b) => {
+    return a.venue_name.localeCompare(b.venue_name, undefined, { numeric: true, sensitivity: 'base' }) ||
+      String(a.city || '').localeCompare(String(b.city || ''), undefined, { numeric: true, sensitivity: 'base' }) ||
+      String(a.state || '').localeCompare(String(b.state || ''), undefined, { numeric: true, sensitivity: 'base' });
+  });
+
+  return { items, skippedMissingVenue, generatedVenueIds };
+}
+
+async function upsertWrestlingVenueDbRow(client, item) {
+  await client.query(`
+    INSERT INTO wrestling_venues (
+      venue_id,
+      venue_name,
+      city,
+      state,
+      country,
+      region,
+      venue_type,
+      status,
+      latitude,
+      longitude,
+      notes,
+      geo,
+      raw_sheet
+    )
+    VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9, $10,
+      $11, $12::jsonb, $13::jsonb
+    )
+    ON CONFLICT (venue_id) DO UPDATE SET
+      venue_name = EXCLUDED.venue_name,
+      city = EXCLUDED.city,
+      state = EXCLUDED.state,
+      country = EXCLUDED.country,
+      region = EXCLUDED.region,
+      venue_type = EXCLUDED.venue_type,
+      status = EXCLUDED.status,
+      latitude = EXCLUDED.latitude,
+      longitude = EXCLUDED.longitude,
+      notes = EXCLUDED.notes,
+      geo = EXCLUDED.geo,
+      raw_sheet = EXCLUDED.raw_sheet,
+      updated_at = NOW()
+  `, [
+    item.venue_id,
+    item.venue_name,
+    item.city,
+    item.state,
+    item.country,
+    item.region,
+    item.venue_type,
+    item.status,
+    item.latitude,
+    item.longitude,
+    item.notes,
+    stringifyDbJson(item.geo),
+    stringifyDbJson(item.raw_sheet)
+  ]);
+}
+
+async function importWrestlingVenuesToDatabase(forceRefresh) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    throw new Error('Missing DATABASE_URL environment variable.');
+  }
+  if (!normalizeSheetGid(process.env.GID_WRESTLING_VENUES)) {
+    throw new Error('Missing GID_WRESTLING_VENUES environment variable.');
+  }
+
+  const payload = await fetchCsvForRoute('/admin/import/wrestling/venues', WRESTLING_VENUES_SHEET_CONFIG, forceRefresh);
+  const rows = payload.rows.map(normalizeWrestlingVenueImportRow);
+  const built = buildWrestlingVenueDbRows(rows);
+  const client = await dbPool.connect();
+  const result = {
+    ok: true,
+    route: '/admin/import/wrestling/venues',
+    source: 'Wrestling-Venue',
+    table: 'wrestling_venues',
+    rowsRead: payload.rows.length,
+    importedRows: built.items.length,
+    upserted: 0,
+    skipped: built.skippedMissingVenue,
+    skippedMissingVenue: built.skippedMissingVenue,
+    generatedVenueIds: built.generatedVenueIds
+  };
+
+  try {
+    await client.query('BEGIN');
+
+    for (const item of built.items) {
+      await upsertWrestlingVenueDbRow(client, item);
+      result.upserted += 1;
+    }
+
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function buildMusicBandDbApiItem(row) {
   return {
     band: row.band,
@@ -3801,6 +4025,252 @@ async function buildWrestlingPeopleDbStatsResponse() {
   };
 }
 
+function buildWrestlingVenueDbApiItem(row) {
+  const geo = {
+    ...createEmptyWrestlingVenueGeo(),
+    ...(row.geo && typeof row.geo === 'object' ? row.geo : {})
+  };
+  if (!Array.isArray(geo.nearby_airports)) geo.nearby_airports = [];
+
+  return {
+    venue_id: row.venue_id || '',
+    venue_name: row.venue_name || '',
+    city: row.city || '',
+    state: row.state || '',
+    country: row.country || '',
+    region: row.region || '',
+    venue_type: row.venue_type || '',
+    status: row.status || '',
+    latitude: toNullableNumber(row.latitude),
+    longitude: toNullableNumber(row.longitude),
+    notes: row.notes || '',
+    geo
+  };
+}
+
+function buildWrestlingVenuesDbQueryOptions(query) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const search = String(query.search || '').trim();
+  const city = String(query.city || '').trim();
+  const state = String(query.state || '').trim();
+  const country = String(query.country || '').trim();
+  const region = String(query.region || '').trim();
+  const venueType = String(query.venue_type || '').trim();
+  const status = String(query.status || '').trim();
+  const requestedSort = String(query.sort || 'name_asc').trim().toLowerCase();
+  const requestedDir = String(query.dir || 'asc').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+  const sortTokens = {
+    name_asc: { field: 'venue_name', dir: 'asc', key: 'name_asc' },
+    name_desc: { field: 'venue_name', dir: 'desc', key: 'name_desc' },
+    city_asc: { field: 'city', dir: 'asc', key: 'city_asc' },
+    state_asc: { field: 'state', dir: 'asc', key: 'state_asc' }
+  };
+  const sortFields = {
+    name: 'venue_name',
+    venue_name: 'venue_name',
+    city: 'city',
+    state: 'state'
+  };
+  const tokenSort = sortTokens[requestedSort];
+  const fieldSort = sortFields[requestedSort]
+    ? { field: sortFields[requestedSort], dir: requestedDir, key: `${requestedSort}_${requestedDir}` }
+    : null;
+  const sort = tokenSort || fieldSort || sortTokens.name_asc;
+
+  if (search) {
+    values.push(`%${search}%`);
+    const idx = values.length;
+    where.push(`(
+      coalesce(venue_name, '') ILIKE $${idx}
+      OR coalesce(city, '') ILIKE $${idx}
+      OR coalesce(state, '') ILIKE $${idx}
+      OR coalesce(country, '') ILIKE $${idx}
+      OR coalesce(region, '') ILIKE $${idx}
+      OR coalesce(venue_type, '') ILIKE $${idx}
+      OR coalesce(status, '') ILIKE $${idx}
+      OR coalesce(notes, '') ILIKE $${idx}
+    )`);
+    filters.search = search;
+  }
+
+  if (city) {
+    values.push(city.toLowerCase());
+    where.push(`lower(trim(coalesce(city, ''))) = $${values.length}`);
+    filters.city = city;
+  }
+
+  if (state) {
+    values.push(state.toLowerCase());
+    where.push(`lower(trim(coalesce(state, ''))) = $${values.length}`);
+    filters.state = state;
+  }
+
+  if (country) {
+    values.push(country.toLowerCase());
+    where.push(`lower(trim(coalesce(country, ''))) = $${values.length}`);
+    filters.country = country;
+  }
+
+  if (region) {
+    values.push(region.toLowerCase());
+    where.push(`lower(trim(coalesce(region, ''))) = $${values.length}`);
+    filters.region = region;
+  }
+
+  if (venueType) {
+    values.push(venueType.toLowerCase());
+    where.push(`lower(trim(coalesce(venue_type, ''))) = $${values.length}`);
+    filters.venue_type = venueType;
+  }
+
+  if (status) {
+    values.push(status.toLowerCase());
+    where.push(`lower(trim(coalesce(status, ''))) = $${values.length}`);
+    filters.status = status;
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    filters,
+    sort: {
+      field: sort.field,
+      dir: sort.dir,
+      key: sort.key
+    },
+    orderBySql: `${sort.field} ${sort.dir.toUpperCase()} NULLS LAST, venue_name ASC, city ASC, state ASC`
+  };
+}
+
+async function handleWrestlingVenuesDbRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildWrestlingVenuesDbQueryOptions(req.query);
+    const countResult = await dbPool.query(
+      `SELECT count(*)::int AS total FROM wrestling_venues ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `SELECT venue_id, venue_name, city, state, country, region, venue_type, status, latitude, longitude, notes, geo
+       FROM wrestling_venues
+       ${options.whereSql}
+       ORDER BY ${options.orderBySql}
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
+    const items = result.rows.map(buildWrestlingVenueDbApiItem);
+
+    res.json({
+      ok: true,
+      route: '/api/wrestling/venues/db',
+      source: 'db',
+      section: 'wrestling',
+      type: 'venues',
+      count: items.length,
+      page,
+      limit,
+      total,
+      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      filters: options.filters,
+      sort: options.sort,
+      items
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/wrestling/venues/db',
+      source: 'db',
+      section: 'wrestling',
+      type: 'venues',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildWrestlingVenuesDbStatsResponse() {
+  const generated = new Date();
+  const totalsQuery = dbPool.query(`
+    SELECT
+      count(*)::int AS total_venues,
+      count(*) FILTER (WHERE latitude IS NOT NULL AND longitude IS NOT NULL)::int AS with_gps,
+      count(*) FILTER (WHERE latitude IS NULL OR longitude IS NULL)::int AS without_gps
+    FROM wrestling_venues
+  `);
+  const byStatusQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(status), ''), 'Unknown') AS status, count(*)::int AS count
+    FROM wrestling_venues
+    GROUP BY 1
+    ORDER BY count DESC, status ASC
+  `);
+  const byStateQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(state), ''), 'Unknown') AS state, count(*)::int AS count
+    FROM wrestling_venues
+    GROUP BY 1
+    ORDER BY count DESC, state ASC
+  `);
+  const byCityQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(city), ''), 'Unknown') AS city, count(*)::int AS count
+    FROM wrestling_venues
+    GROUP BY 1
+    ORDER BY count DESC, city ASC
+  `);
+  const byRegionQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(region), ''), 'Unknown') AS region, count(*)::int AS count
+    FROM wrestling_venues
+    GROUP BY 1
+    ORDER BY count DESC, region ASC
+  `);
+  const byVenueTypeQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(venue_type), ''), 'Unknown') AS venue_type, count(*)::int AS count
+    FROM wrestling_venues
+    GROUP BY 1
+    ORDER BY count DESC, venue_type ASC
+  `);
+  const [totalsResult, byStatusResult, byStateResult, byCityResult, byRegionResult, byVenueTypeResult] = await Promise.all([
+    totalsQuery,
+    byStatusQuery,
+    byStateQuery,
+    byCityQuery,
+    byRegionQuery,
+    byVenueTypeQuery
+  ]);
+  const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+
+  return {
+    ok: true,
+    route: '/api/wrestling/venues/stats',
+    source: 'db',
+    section: 'wrestling',
+    type: 'venues',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    total_venues: toIntegerCount(totals.total_venues),
+    by_status: byStatusResult.rows.map((row) => ({ status: row.status, count: toIntegerCount(row.count) })),
+    by_state: byStateResult.rows.map((row) => ({ state: row.state, count: toIntegerCount(row.count) })),
+    by_city: byCityResult.rows.map((row) => ({ city: row.city, count: toIntegerCount(row.count) })),
+    by_region: byRegionResult.rows.map((row) => ({ region: row.region, count: toIntegerCount(row.count) })),
+    by_venue_type: byVenueTypeResult.rows.map((row) => ({ venue_type: row.venue_type, count: toIntegerCount(row.count) })),
+    with_gps: toIntegerCount(totals.with_gps),
+    without_gps: toIntegerCount(totals.without_gps)
+  };
+}
+
 function buildMusicPersonDbApiItem(row) {
   return {
     person_id: toIntegerCount(row.person_id),
@@ -4700,6 +5170,15 @@ app.get('/admin/import/wrestling/people', async (req, res) => {
   });
 });
 
+app.get('/admin/import/wrestling/venues', async (req, res) => {
+  return runLoggedImport(req, res, {
+    area: 'wrestling',
+    route: '/admin/import/wrestling/venues',
+    source: 'Wrestling-Venue',
+    importer: importWrestlingVenuesToDatabase
+  });
+});
+
 app.get('/api/wrestling/people/import', async (req, res) => {
   return runLoggedImport(req, res, {
     area: 'wrestling',
@@ -4805,6 +5284,29 @@ app.get('/api/wrestling/people/stats', async (req, res) => {
       source: 'db',
       type: 'wrestling_people',
       route: '/api/wrestling/people/stats',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/wrestling/venues/db', async (req, res) => {
+  return handleWrestlingVenuesDbRequest(req, res);
+});
+
+app.get('/api/wrestling/venues/stats', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    res.json(await buildWrestlingVenuesDbStatsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/wrestling/venues/stats',
+      source: 'db',
+      section: 'wrestling',
+      type: 'venues',
       error: err && err.message ? err.message : String(err)
     });
   }

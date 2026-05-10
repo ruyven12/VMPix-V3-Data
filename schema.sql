@@ -375,3 +375,70 @@ ALTER TABLE IF EXISTS wrestling_people
 
 CREATE UNIQUE INDEX IF NOT EXISTS wrestling_people_slug_key
     ON wrestling_people (slug);
+
+CREATE TABLE IF NOT EXISTS wrestling_venues (
+    id SERIAL PRIMARY KEY,
+    venue_id TEXT UNIQUE,
+    venue_name TEXT NOT NULL,
+    city TEXT,
+    state TEXT,
+    country TEXT,
+    region TEXT,
+    venue_type TEXT,
+    status TEXT,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    notes TEXT,
+    geo JSONB DEFAULT '{}'::jsonb,
+    raw_sheet JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS venue_id TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS venue_name TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS city TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS state TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS country TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS region TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS venue_type TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS status TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS notes TEXT;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS geo JSONB DEFAULT '{}'::jsonb;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS raw_sheet JSONB DEFAULT '{}'::jsonb;
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
+ALTER TABLE IF EXISTS wrestling_venues
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS wrestling_venues_venue_id_key
+    ON wrestling_venues (venue_id);
