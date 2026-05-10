@@ -2585,6 +2585,169 @@ async function importWrestlingShowsToDatabase(forceRefresh) {
   }
 }
 
+const WRESTLING_PEOPLE_SHEET_CONFIG = {
+  label: 'Wrestling-People',
+  gidEnv: 'GID_WRESTLING_PEOPLE'
+};
+
+const WRESTLING_PERSON_IMPORT_HEADER_ALIASES = {
+  name: 'name',
+  wrestler: 'name',
+  category: 'category',
+  aliases: 'aliases',
+  alias: 'aliases',
+  teams: 'teams',
+  team: 'teams',
+  notes: 'notes',
+  note: 'notes'
+};
+
+function normalizeWrestlingPersonImportRow(row) {
+  const out = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const normalizedKey = normalizeImportHeaderKey(key);
+    const compactKey = normalizedKey.replace(/_/g, '');
+    const canonicalKey = WRESTLING_PERSON_IMPORT_HEADER_ALIASES[normalizedKey] ||
+      WRESTLING_PERSON_IMPORT_HEADER_ALIASES[compactKey] ||
+      normalizedKey;
+    out[canonicalKey] = value;
+  });
+
+  return out;
+}
+
+function addWrestlingPersonArrayValues(map, values) {
+  values.forEach((value) => {
+    const clean = cleanMusicVenueText(value);
+    const key = normalizeMusicLookupKey(clean);
+    if (key && !map.has(key)) map.set(key, clean);
+  });
+}
+
+function buildWrestlingPersonDbRows(rows) {
+  const groups = new Map();
+  let skippedMissingName = 0;
+
+  rows.forEach((row) => {
+    const name = cleanMusicVenueText(row.name);
+    if (!name) {
+      skippedMissingName += 1;
+      return;
+    }
+
+    const slug = slugifyMusicBandId(name);
+    if (!slug) {
+      skippedMissingName += 1;
+      return;
+    }
+
+    if (!groups.has(slug)) {
+      groups.set(slug, {
+        slug,
+        name,
+        category: '',
+        aliases: new Map(),
+        teams: new Map(),
+        notes: ''
+      });
+    }
+
+    const group = groups.get(slug);
+    if (!group.name || group.name === group.name.toLowerCase()) group.name = name;
+    if (!group.category) group.category = cleanMusicVenueText(row.category);
+    if (!group.notes) group.notes = String(row.notes || '').trim();
+    addWrestlingPersonArrayValues(group.aliases, splitWrestlingSemicolonList(row.aliases));
+    addWrestlingPersonArrayValues(group.teams, splitWrestlingSemicolonList(row.teams));
+  });
+
+  const items = Array.from(groups.values())
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
+    .map((person) => ({
+      slug: person.slug,
+      name: person.name,
+      category: person.category || null,
+      aliases: Array.from(person.aliases.values()),
+      teams: Array.from(person.teams.values()),
+      notes: person.notes || null
+    }));
+
+  return { items, skippedMissingName };
+}
+
+async function upsertWrestlingPersonDbRow(client, item) {
+  await client.query(`
+    INSERT INTO wrestling_people (
+      slug,
+      name,
+      category,
+      aliases,
+      teams,
+      notes
+    )
+    VALUES ($1, $2, $3, $4::text[], $5::text[], $6)
+    ON CONFLICT (slug) DO UPDATE SET
+      name = EXCLUDED.name,
+      category = EXCLUDED.category,
+      aliases = EXCLUDED.aliases,
+      teams = EXCLUDED.teams,
+      notes = EXCLUDED.notes,
+      updated_at = NOW()
+  `, [
+    item.slug,
+    item.name,
+    item.category,
+    item.aliases,
+    item.teams,
+    item.notes
+  ]);
+}
+
+async function importWrestlingPeopleToDatabase(forceRefresh) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    throw new Error('Missing DATABASE_URL environment variable.');
+  }
+  if (!normalizeSheetGid(process.env.GID_WRESTLING_PEOPLE)) {
+    throw new Error('Missing GID_WRESTLING_PEOPLE environment variable.');
+  }
+
+  const payload = await fetchCsvForRoute('/api/wrestling/people/import', WRESTLING_PEOPLE_SHEET_CONFIG, forceRefresh);
+  const rows = payload.rows.map(normalizeWrestlingPersonImportRow);
+  const built = buildWrestlingPersonDbRows(rows);
+  const client = await dbPool.connect();
+  const generated = new Date();
+  const result = {
+    ok: true,
+    route: '/api/wrestling/people/import',
+    source: 'Wrestling-People',
+    table: 'wrestling_people',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    rowsRead: payload.rows.length,
+    imported: built.items.length,
+    upserted: 0,
+    skipped: built.skippedMissingName,
+    skippedMissingName: built.skippedMissingName
+  };
+
+  try {
+    await client.query('BEGIN');
+
+    for (const item of built.items) {
+      await upsertWrestlingPersonDbRow(client, item);
+      result.upserted += 1;
+    }
+
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function buildMusicBandDbApiItem(row) {
   return {
     band: row.band,
@@ -3392,6 +3555,195 @@ async function buildWrestlingShowsDbStatsResponse() {
     byVenue: byVenueResult.rows.map((row) => ({ venue: row.venue, showsTotal: toIntegerCount(row.shows_total) })),
     topParticipants: topParticipantsResult.rows.map((row) => ({ participant: row.participant, appearances: toIntegerCount(row.appearances) })),
     topWinners: topWinnersResult.rows.map((row) => ({ winner: row.winner, wins: toIntegerCount(row.wins) }))
+  };
+}
+
+function buildWrestlingPersonDbApiItem(row) {
+  return {
+    id: toIntegerCount(row.id),
+    slug: row.slug || '',
+    name: row.name || '',
+    category: row.category || '',
+    aliases: Array.isArray(row.aliases) ? row.aliases : [],
+    teams: Array.isArray(row.teams) ? row.teams : [],
+    notes: row.notes || ''
+  };
+}
+
+function getPostgresTextArraySql(columnName) {
+  return `coalesce(${columnName}, '{}'::text[])`;
+}
+
+function buildWrestlingPeopleDbQueryOptions(query) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const search = String(query.search || '').trim();
+  const category = String(query.category || '').trim();
+  const team = String(query.team || '').trim();
+  const sortOptions = {
+    name_asc: {
+      key: 'name_asc',
+      orderBySql: 'name ASC NULLS LAST, id ASC'
+    },
+    name_desc: {
+      key: 'name_desc',
+      orderBySql: 'name DESC NULLS LAST, id DESC'
+    },
+    newest: {
+      key: 'newest',
+      orderBySql: 'created_at DESC NULLS LAST, id DESC'
+    },
+    oldest: {
+      key: 'oldest',
+      orderBySql: 'created_at ASC NULLS LAST, id ASC'
+    }
+  };
+  const requestedSort = String(query.sort || 'name_asc').trim().toLowerCase();
+  const sort = sortOptions[requestedSort] || sortOptions.name_asc;
+
+  if (search) {
+    values.push(`%${search}%`);
+    const idx = values.length;
+    where.push(`(
+      coalesce(name, '') ILIKE $${idx}
+      OR coalesce(category, '') ILIKE $${idx}
+      OR array_to_string(${getPostgresTextArraySql('aliases')}, ' ') ILIKE $${idx}
+      OR array_to_string(${getPostgresTextArraySql('teams')}, ' ') ILIKE $${idx}
+      OR coalesce(notes, '') ILIKE $${idx}
+    )`);
+    filters.search = search;
+  }
+
+  if (category) {
+    values.push(category.toLowerCase());
+    where.push(`lower(trim(coalesce(category, ''))) = $${values.length}`);
+    filters.category = category;
+  }
+
+  if (team) {
+    values.push(team.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM unnest(${getPostgresTextArraySql('teams')}) AS team_item(value)
+      WHERE lower(trim(team_item.value)) = $${values.length}
+    )`);
+    filters.team = team;
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    filters,
+    sort: sort.key,
+    orderBySql: sort.orderBySql
+  };
+}
+
+async function handleWrestlingPeopleDbRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildWrestlingPeopleDbQueryOptions(req.query);
+    const countResult = await dbPool.query(
+      `SELECT count(*)::int AS total FROM wrestling_people ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const totalPages = total > 0 ? Math.ceil(total / limit) : 0;
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `SELECT id, slug, name, category, aliases, teams, notes
+       FROM wrestling_people
+       ${options.whereSql}
+       ORDER BY ${options.orderBySql}
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
+
+    res.json({
+      ok: true,
+      source: 'db',
+      type: 'wrestling_people',
+      route: '/api/wrestling/people',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1 && totalPages > 0
+      },
+      filters: options.filters,
+      sort: options.sort,
+      data: result.rows.map(buildWrestlingPersonDbApiItem)
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      source: 'db',
+      type: 'wrestling_people',
+      route: '/api/wrestling/people',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildWrestlingPeopleDbStatsResponse() {
+  const generated = new Date();
+  const totalsQuery = dbPool.query(`
+    SELECT
+      count(*)::int AS total_people,
+      count(*) FILTER (WHERE coalesce(array_length(aliases, 1), 0) > 0)::int AS with_aliases,
+      count(*) FILTER (WHERE coalesce(array_length(teams, 1), 0) > 0)::int AS with_teams
+    FROM wrestling_people
+  `);
+  const categoriesQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(category), ''), 'Unknown') AS category, count(*)::int AS count
+    FROM wrestling_people
+    GROUP BY 1
+    ORDER BY count DESC, category ASC
+  `);
+  const uniqueTeamsQuery = dbPool.query(`
+    SELECT count(DISTINCT lower(trim(team_item.value)))::int AS unique_teams
+    FROM wrestling_people
+    CROSS JOIN LATERAL unnest(${getPostgresTextArraySql('teams')}) AS team_item(value)
+    WHERE trim(team_item.value) <> ''
+  `);
+  const [totalsResult, categoriesResult, uniqueTeamsResult] = await Promise.all([
+    totalsQuery,
+    categoriesQuery,
+    uniqueTeamsQuery
+  ]);
+  const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+  const uniqueTeams = uniqueTeamsResult.rows && uniqueTeamsResult.rows[0] ? uniqueTeamsResult.rows[0] : {};
+
+  return {
+    ok: true,
+    source: 'db',
+    type: 'wrestling_people',
+    route: '/api/wrestling/people/stats',
+    totalPeople: toIntegerCount(totals.total_people),
+    categories: categoriesResult.rows.map((row) => ({
+      category: row.category,
+      count: toIntegerCount(row.count)
+    })),
+    withAliases: toIntegerCount(totals.with_aliases),
+    withTeams: toIntegerCount(totals.with_teams),
+    uniqueTeams: toIntegerCount(uniqueTeams.unique_teams),
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated)
   };
 }
 
@@ -4285,6 +4637,15 @@ app.get('/admin/import/wrestling/shows', async (req, res) => {
   });
 });
 
+app.get('/api/wrestling/people/import', async (req, res) => {
+  return runLoggedImport(req, res, {
+    area: 'wrestling',
+    route: '/api/wrestling/people/import',
+    source: 'Wrestling-People',
+    importer: importWrestlingPeopleToDatabase
+  });
+});
+
 app.get('/api/status/music', async (req, res) => {
   try {
     res.json(await buildMusicStatusResponse());
@@ -4359,6 +4720,28 @@ app.get('/api/wrestling/shows/stats', async (req, res) => {
       ok: false,
       route: '/api/wrestling/shows/stats',
       source: 'PostgreSQL:wrestling_shows',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/wrestling/people', async (req, res) => {
+  return handleWrestlingPeopleDbRequest(req, res);
+});
+
+app.get('/api/wrestling/people/stats', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    res.json(await buildWrestlingPeopleDbStatsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      source: 'db',
+      type: 'wrestling_people',
+      route: '/api/wrestling/people/stats',
       error: err && err.message ? err.message : String(err)
     });
   }

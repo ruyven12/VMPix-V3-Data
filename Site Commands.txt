@@ -384,3 +384,31 @@ IMPORTANT PROJECT RULES
 - Read-only API routes must not mutate/import data.
 - Import/admin routes should only run when explicitly called.
 - Always run node --check server.js before saying done.
+
+
+==================================================
+WRESTLING-PEOPLE - DB / IMPORT ROUTES
+==================================================
+
+Sheet tab:
+Wrestling-People
+
+Required Render env var:
+GID_WRESTLING_PEOPLE
+
+Import route:
+https://vmpix-data.onrender.com/api/wrestling/people/import?refresh=1
+
+DB route:
+https://vmpix-data.onrender.com/api/wrestling/people
+
+Stats route:
+https://vmpix-data.onrender.com/api/wrestling/people/stats
+
+Supported DB query features:
+- search
+- category
+- team
+- sort=name_asc|name_desc|newest|oldest
+- page
+- limit

@@ -336,3 +336,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS wrestling_shows_show_id_key
 
 CREATE UNIQUE INDEX IF NOT EXISTS wrestling_shows_show_key_key
     ON wrestling_shows (show_key);
+
+CREATE TABLE IF NOT EXISTS wrestling_people (
+    id SERIAL PRIMARY KEY,
+    slug TEXT UNIQUE,
+    name TEXT NOT NULL,
+    category TEXT,
+    aliases TEXT[] DEFAULT '{}'::text[],
+    teams TEXT[] DEFAULT '{}'::text[],
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS slug TEXT;
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS name TEXT;
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS category TEXT;
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS aliases TEXT[] DEFAULT '{}'::text[];
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS teams TEXT[] DEFAULT '{}'::text[];
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS notes TEXT;
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS wrestling_people_slug_key
+    ON wrestling_people (slug);
