@@ -258,3 +258,81 @@ ALTER TABLE IF EXISTS system_import_logs
 
 CREATE INDEX IF NOT EXISTS system_import_logs_area_route_finished_at_idx
     ON system_import_logs (area, route, finished_at DESC);
+
+CREATE TABLE IF NOT EXISTS wrestling_shows (
+    id SERIAL PRIMARY KEY,
+    show_id INTEGER UNIQUE NOT NULL,
+    show_key TEXT UNIQUE NOT NULL,
+    promotion TEXT,
+    show_name TEXT,
+    date TEXT,
+    show_date DATE,
+    venue TEXT,
+    city TEXT,
+    state TEXT,
+    poster TEXT,
+    camera_1 TEXT,
+    camera_2 TEXT,
+    matches JSONB DEFAULT '[]'::jsonb,
+    stats JSONB DEFAULT '{}'::jsonb,
+    raw_sheet JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS show_id INTEGER;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS show_key TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS promotion TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS show_name TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS date TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS show_date DATE;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS venue TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS city TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS state TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS poster TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS camera_1 TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS camera_2 TEXT;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS matches JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS stats JSONB DEFAULT '{}'::jsonb;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS raw_sheet JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS wrestling_shows_show_id_key
+    ON wrestling_shows (show_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS wrestling_shows_show_key_key
+    ON wrestling_shows (show_key);

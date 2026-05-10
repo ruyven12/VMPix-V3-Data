@@ -2245,6 +2245,347 @@ async function importMusicVenuesToDatabase(forceRefresh) {
   }
 }
 
+const WRESTLING_MATCHES_SHEET_CONFIG = {
+  label: 'Wrestling-Matches',
+  gidEnv: ROUTES['/api/wrestling/shows'].gidEnv,
+  defaultGid: ROUTES['/api/wrestling/shows'].defaultGid
+};
+
+const WRESTLING_MATCH_IMPORT_HEADER_ALIASES = {
+  promotion: 'promotion',
+  show_name: 'show_name',
+  showname: 'show_name',
+  date: 'date',
+  show_date: 'date',
+  showdate: 'date',
+  venue: 'venue',
+  city: 'city',
+  state: 'state',
+  poster: 'poster',
+  poster_url: 'poster',
+  posterurl: 'poster',
+  camera_1: 'camera_1',
+  camera1: 'camera_1',
+  camera_2: 'camera_2',
+  camera2: 'camera_2',
+  match_order: 'match_order',
+  matchorder: 'match_order',
+  order: 'match_order',
+  match_url: 'match_url',
+  matchurl: 'match_url',
+  url: 'match_url',
+  match_type: 'match_type',
+  matchtype: 'match_type',
+  stipulation: 'stipulation',
+  title: 'title',
+  side_1: 'side_1',
+  side1: 'side_1',
+  side_2: 'side_2',
+  side2: 'side_2',
+  participants: 'participants',
+  participant: 'participants',
+  winner: 'winner',
+  notes: 'notes'
+};
+
+function normalizeWrestlingMatchImportRow(row) {
+  const out = {};
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const normalizedKey = normalizeImportHeaderKey(key);
+    const compactKey = normalizedKey.replace(/_/g, '');
+    const canonicalKey = WRESTLING_MATCH_IMPORT_HEADER_ALIASES[normalizedKey] ||
+      WRESTLING_MATCH_IMPORT_HEADER_ALIASES[compactKey] ||
+      normalizedKey;
+    out[canonicalKey] = value;
+  });
+
+  return out;
+}
+
+function splitWrestlingSemicolonList(value) {
+  return String(value || '')
+    .split(/\s*;\s*/g)
+    .map((part) => String(part || '').trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function toNullableInteger(value) {
+  const clean = String(value || '').replace(/,/g, '').trim();
+  if (!clean) return null;
+
+  const number = Number(clean);
+  return Number.isFinite(number) ? Math.trunc(number) : null;
+}
+
+function getWrestlingMatchOrderSortValue(match) {
+  return Number.isFinite(match.match_order) ? match.match_order : Number.MAX_SAFE_INTEGER;
+}
+
+function hasWrestlingMatchRowData(row) {
+  return [
+    'match_order',
+    'match_url',
+    'match_type',
+    'stipulation',
+    'title',
+    'side_1',
+    'side_2',
+    'participants',
+    'winner',
+    'notes'
+  ].some((key) => toDbText(row[key]));
+}
+
+function getWrestlingShowGroupKey(row) {
+  const parsedDate = parseMusicShowDate(row.date);
+  const dateKey = parsedDate ? parsedDate.iso : cleanMusicVenueText(row.date).toLowerCase();
+
+  return [
+    normalizeMusicLookupKey(row.promotion),
+    normalizeMusicLookupKey(row.show_name),
+    dateKey
+  ].join('|');
+}
+
+function buildWrestlingShowKey(show) {
+  const parsedDate = parseMusicShowDate(show.date);
+  const dateKey = parsedDate ? parsedDate.iso : cleanMusicVenueText(show.date);
+  return slugifyMusicBandId([show.promotion, show.show_name, dateKey].filter(Boolean).join(' '));
+}
+
+function setWrestlingShowGroupValue(group, key, value) {
+  const clean = cleanMusicVenueText(value);
+  if (clean && !group[key]) group[key] = clean;
+}
+
+function buildWrestlingShowGroups(rows) {
+  const groups = new Map();
+  let skippedEmptyMatch = 0;
+  let skippedMissingShow = 0;
+
+  rows.forEach((row, index) => {
+    if (!hasWrestlingMatchRowData(row)) {
+      skippedEmptyMatch += 1;
+      return;
+    }
+
+    if (!toDbText(row.promotion) || !toDbText(row.show_name) || !toDbText(row.date)) {
+      skippedMissingShow += 1;
+      return;
+    }
+
+    const key = getWrestlingShowGroupKey(row);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        promotion: '',
+        show_name: '',
+        date: '',
+        venue: '',
+        city: '',
+        state: '',
+        poster: '',
+        camera_1: '',
+        camera_2: '',
+        matchRows: [],
+        rawRows: []
+      });
+    }
+
+    const group = groups.get(key);
+    setWrestlingShowGroupValue(group, 'promotion', row.promotion);
+    setWrestlingShowGroupValue(group, 'show_name', row.show_name);
+    setWrestlingShowGroupValue(group, 'date', row.date);
+    setWrestlingShowGroupValue(group, 'venue', row.venue);
+    setWrestlingShowGroupValue(group, 'city', row.city);
+    setWrestlingShowGroupValue(group, 'state', row.state);
+    setWrestlingShowGroupValue(group, 'poster', row.poster);
+    setWrestlingShowGroupValue(group, 'camera_1', row.camera_1);
+    setWrestlingShowGroupValue(group, 'camera_2', row.camera_2);
+    group.matchRows.push({ row, index });
+    group.rawRows.push(compactJsonFields(row));
+  });
+
+  return { groups: Array.from(groups.values()), skippedEmptyMatch, skippedMissingShow };
+}
+
+function buildWrestlingMatchDbItem(entry) {
+  const row = entry.row;
+
+  return {
+    match_order: toNullableInteger(row.match_order),
+    match_url: toDbText(row.match_url) || '',
+    match_type: toDbText(row.match_type) || '',
+    stipulation: toDbText(row.stipulation) || '',
+    title: toDbText(row.title) || '',
+    side_1: splitWrestlingSemicolonList(row.side_1),
+    side_2: splitWrestlingSemicolonList(row.side_2),
+    participants: splitWrestlingSemicolonList(row.participants),
+    winner: toDbText(row.winner) || '',
+    notes: toDbText(row.notes) || ''
+  };
+}
+
+function sortWrestlingShowGroups(groups) {
+  return groups
+    .map((show, index) => {
+      const parsedDate = parseMusicShowDate(show.date);
+      return { show, index, dateTime: parsedDate ? parsedDate.time : null };
+    })
+    .sort((a, b) => {
+      if (a.dateTime == null && b.dateTime == null) return a.index - b.index;
+      if (a.dateTime == null) return 1;
+      if (b.dateTime == null) return -1;
+      return a.dateTime - b.dateTime || a.index - b.index;
+    })
+    .map((entry) => entry.show);
+}
+
+function buildWrestlingShowDbRows(rows) {
+  const grouped = buildWrestlingShowGroups(rows);
+  const shows = sortWrestlingShowGroups(grouped.groups);
+  const items = shows.map((show, index) => {
+    const parsedDate = parseMusicShowDate(show.date);
+    const matches = show.matchRows
+      .map(buildWrestlingMatchDbItem)
+      .sort((a, b) => getWrestlingMatchOrderSortValue(a) - getWrestlingMatchOrderSortValue(b));
+    const participants = new Map();
+    matches.forEach((match) => {
+      match.participants.forEach((participant) => {
+        const key = normalizeMusicLookupKey(participant);
+        if (key && !participants.has(key)) participants.set(key, participant);
+      });
+    });
+
+    return {
+      show_id: index + 1,
+      show_key: buildWrestlingShowKey(show),
+      promotion: toDbText(show.promotion),
+      show_name: toDbText(show.show_name),
+      date: toDbText(show.date),
+      show_date: parsedDate ? parsedDate.iso : null,
+      venue: toDbText(show.venue),
+      city: toDbText(show.city),
+      state: toDbText(show.state),
+      poster: toDbText(show.poster),
+      camera_1: toDbText(show.camera_1),
+      camera_2: toDbText(show.camera_2),
+      matches,
+      stats: {
+        matchCount: matches.length,
+        participantCount: participants.size
+      },
+      raw_sheet: show.rawRows
+    };
+  });
+
+  return {
+    items,
+    skippedEmptyMatch: grouped.skippedEmptyMatch,
+    skippedMissingShow: grouped.skippedMissingShow
+  };
+}
+
+async function upsertWrestlingShowDbRow(client, item) {
+  await client.query(`
+    INSERT INTO wrestling_shows (
+      show_id,
+      show_key,
+      promotion,
+      show_name,
+      date,
+      show_date,
+      venue,
+      city,
+      state,
+      poster,
+      camera_1,
+      camera_2,
+      matches,
+      stats,
+      raw_sheet
+    )
+    VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9, $10,
+      $11, $12, $13::jsonb, $14::jsonb, $15::jsonb
+    )
+    ON CONFLICT (show_id) DO UPDATE SET
+      show_key = EXCLUDED.show_key,
+      promotion = EXCLUDED.promotion,
+      show_name = EXCLUDED.show_name,
+      date = EXCLUDED.date,
+      show_date = EXCLUDED.show_date,
+      venue = EXCLUDED.venue,
+      city = EXCLUDED.city,
+      state = EXCLUDED.state,
+      poster = EXCLUDED.poster,
+      camera_1 = EXCLUDED.camera_1,
+      camera_2 = EXCLUDED.camera_2,
+      matches = EXCLUDED.matches,
+      stats = EXCLUDED.stats,
+      raw_sheet = EXCLUDED.raw_sheet,
+      updated_at = NOW()
+  `, [
+    item.show_id,
+    item.show_key,
+    item.promotion,
+    item.show_name,
+    item.date,
+    item.show_date,
+    item.venue,
+    item.city,
+    item.state,
+    item.poster,
+    item.camera_1,
+    item.camera_2,
+    stringifyDbJson(item.matches),
+    stringifyDbJson(item.stats),
+    stringifyDbJson(item.raw_sheet)
+  ]);
+}
+
+async function importWrestlingShowsToDatabase(forceRefresh) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    throw new Error('Missing DATABASE_URL environment variable.');
+  }
+
+  const payload = await fetchCsvForRoute('/admin/import/wrestling/shows', WRESTLING_MATCHES_SHEET_CONFIG, forceRefresh);
+  const rows = payload.rows.map(normalizeWrestlingMatchImportRow);
+  const built = buildWrestlingShowDbRows(rows);
+  const client = await dbPool.connect();
+  const result = {
+    ok: true,
+    route: '/admin/import/wrestling/shows',
+    source: 'Wrestling-Matches',
+    table: 'wrestling_shows',
+    rowsRead: payload.rows.length,
+    importedRows: built.items.length,
+    upserted: 0,
+    skipped: built.skippedEmptyMatch + built.skippedMissingShow,
+    skippedEmptyMatch: built.skippedEmptyMatch,
+    skippedMissingShow: built.skippedMissingShow,
+    matchesTotal: built.items.reduce((total, item) => total + item.matches.length, 0)
+  };
+
+  try {
+    await client.query('BEGIN');
+
+    for (const item of built.items) {
+      await upsertWrestlingShowDbRow(client, item);
+      result.upserted += 1;
+    }
+
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function buildMusicBandDbApiItem(row) {
   return {
     band: row.band,
@@ -2752,6 +3093,306 @@ async function buildMusicShowsDbStatsResponse() {
     byCity: byCityResult.rows.map((row) => ({ city: row.city, showsTotal: toIntegerCount(row.shows_total) })),
     byVenue: byVenueResult.rows.map((row) => ({ venue: row.venue, showsTotal: toIntegerCount(row.shows_total) })),
     topBands: topBandsResult.rows.map((row) => ({ band: row.band, appearances: toIntegerCount(row.appearances) }))
+  };
+}
+
+function buildWrestlingShowDbApiItem(row) {
+  return {
+    show_id: toIntegerCount(row.show_id),
+    show_key: row.show_key || '',
+    promotion: row.promotion || '',
+    show_name: row.show_name || '',
+    date: row.date || '',
+    venue: row.venue || '',
+    city: row.city || '',
+    state: row.state || '',
+    poster: row.poster || '',
+    camera_1: row.camera_1 || '',
+    camera_2: row.camera_2 || '',
+    matches: Array.isArray(row.matches) ? row.matches : [],
+    stats: row.stats && typeof row.stats === 'object' ? row.stats : {}
+  };
+}
+
+function getWrestlingMatchesArraySql() {
+  return "CASE WHEN jsonb_typeof(matches) = 'array' THEN matches ELSE '[]'::jsonb END";
+}
+
+function getWrestlingParticipantsArraySql(matchAlias) {
+  return `CASE WHEN jsonb_typeof(${matchAlias}->'participants') = 'array' THEN ${matchAlias}->'participants' ELSE '[]'::jsonb END`;
+}
+
+function buildWrestlingShowsDbQueryOptions(query) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const search = String(query.search || '').trim();
+  const promotion = String(query.promotion || '').trim();
+  const state = String(query.state || '').trim();
+  const city = String(query.city || '').trim();
+  const venue = String(query.venue || '').trim();
+  const participant = String(query.participant || '').trim();
+  const winner = String(query.winner || '').trim();
+  const sortFields = {
+    show_id: 'show_id',
+    show_key: 'show_key',
+    promotion: 'promotion',
+    show_name: 'show_name',
+    date: 'show_date',
+    venue: 'venue',
+    city: 'city',
+    state: 'state',
+    created_at: 'created_at',
+    updated_at: 'updated_at'
+  };
+  const requestedSort = String(query.sort || 'date').trim().toLowerCase();
+  const sortField = sortFields[requestedSort] ? requestedSort : 'date';
+  const dir = String(query.dir || 'desc').trim().toLowerCase() === 'asc' ? 'asc' : 'desc';
+  const matchesArraySql = getWrestlingMatchesArraySql();
+
+  if (search) {
+    values.push(`%${search}%`);
+    const idx = values.length;
+    where.push(`(
+      coalesce(promotion, '') ILIKE $${idx}
+      OR coalesce(show_name, '') ILIKE $${idx}
+      OR coalesce(venue, '') ILIKE $${idx}
+      OR coalesce(city, '') ILIKE $${idx}
+      OR coalesce(state, '') ILIKE $${idx}
+      OR coalesce(poster, '') ILIKE $${idx}
+      OR matches::text ILIKE $${idx}
+    )`);
+    filters.search = search;
+  }
+
+  if (promotion) {
+    values.push(promotion.toLowerCase());
+    where.push(`lower(trim(coalesce(promotion, ''))) = $${values.length}`);
+    filters.promotion = promotion;
+  }
+
+  if (state) {
+    values.push(state.toLowerCase());
+    where.push(`lower(trim(coalesce(state, ''))) = $${values.length}`);
+    filters.state = state;
+  }
+
+  if (city) {
+    values.push(city.toLowerCase());
+    where.push(`lower(trim(coalesce(city, ''))) = $${values.length}`);
+    filters.city = city;
+  }
+
+  if (venue) {
+    values.push(venue.toLowerCase());
+    where.push(`lower(trim(coalesce(venue, ''))) = $${values.length}`);
+    filters.venue = venue;
+  }
+
+  if (participant) {
+    values.push(participant.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(${matchesArraySql}) AS match_item
+      CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingParticipantsArraySql('match_item')}) AS participant_item(value)
+      WHERE lower(trim(participant_item.value)) = $${values.length}
+    )`);
+    filters.participant = participant;
+  }
+
+  if (winner) {
+    values.push(winner.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(${matchesArraySql}) AS match_item
+      WHERE lower(trim(coalesce(match_item->>'winner', ''))) = $${values.length}
+    )`);
+    filters.winner = winner;
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    filters,
+    sort: {
+      field: sortField,
+      dir
+    },
+    orderBySql: `${sortFields[sortField]} ${dir.toUpperCase()} NULLS LAST, show_id ${dir.toUpperCase()}`
+  };
+}
+
+async function handleWrestlingShowsDbRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildWrestlingShowsDbQueryOptions(req.query);
+    const countResult = await dbPool.query(
+      `SELECT count(*)::int AS total FROM wrestling_shows ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `SELECT show_id, show_key, promotion, show_name, date, venue, city, state, poster, camera_1, camera_2, matches, stats
+       FROM wrestling_shows
+       ${options.whereSql}
+       ORDER BY ${options.orderBySql}
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
+    const data = result.rows.map(buildWrestlingShowDbApiItem);
+
+    res.json({
+      ok: true,
+      route: '/api/wrestling/shows/db',
+      source: 'PostgreSQL:wrestling_shows',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: data.length,
+      total,
+      page,
+      limit,
+      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      filters: options.filters,
+      sort: options.sort,
+      stats: {
+        showsTotal: total,
+        matchesTotal: data.reduce((sum, show) => sum + (Array.isArray(show.matches) ? show.matches.length : 0), 0)
+      },
+      data
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/wrestling/shows/db',
+      source: 'PostgreSQL:wrestling_shows',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildWrestlingShowsDbStatsResponse() {
+  const generated = new Date();
+  const matchesArraySql = getWrestlingMatchesArraySql();
+  const participantArraySql = getWrestlingParticipantsArraySql('match_item');
+  const totalsQuery = dbPool.query(`
+    WITH show_rows AS (
+      SELECT ${matchesArraySql} AS match_items
+      FROM wrestling_shows
+    )
+    SELECT
+      count(*)::int AS shows_total,
+      coalesce(sum(jsonb_array_length(match_items)), 0)::int AS matches_total
+    FROM show_rows
+  `);
+  const uniqueParticipantsQuery = dbPool.query(`
+    SELECT count(DISTINCT lower(trim(participant_item.value)))::int AS unique_participants
+    FROM wrestling_shows
+    CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
+    CROSS JOIN LATERAL jsonb_array_elements_text(${participantArraySql}) AS participant_item(value)
+    WHERE trim(participant_item.value) <> ''
+  `);
+  const byPromotionQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(promotion), ''), 'Unknown') AS promotion, count(*)::int AS shows_total
+    FROM wrestling_shows
+    GROUP BY 1
+    ORDER BY shows_total DESC, promotion ASC
+  `);
+  const byYearQuery = dbPool.query(`
+    SELECT coalesce(to_char(show_date, 'YYYY'), 'Unknown') AS year, count(*)::int AS shows_total
+    FROM wrestling_shows
+    GROUP BY 1
+    ORDER BY 1 DESC
+  `);
+  const byStateQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(state), ''), 'Unknown') AS state, count(*)::int AS shows_total
+    FROM wrestling_shows
+    GROUP BY 1
+    ORDER BY shows_total DESC, state ASC
+  `);
+  const byCityQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(city), ''), 'Unknown') AS city, count(*)::int AS shows_total
+    FROM wrestling_shows
+    GROUP BY 1
+    ORDER BY shows_total DESC, city ASC
+  `);
+  const byVenueQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(venue), ''), 'Unknown') AS venue, count(*)::int AS shows_total
+    FROM wrestling_shows
+    GROUP BY 1
+    ORDER BY shows_total DESC, venue ASC
+  `);
+  const topParticipantsQuery = dbPool.query(`
+    SELECT participant_item.value AS participant, count(*)::int AS appearances
+    FROM wrestling_shows
+    CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
+    CROSS JOIN LATERAL jsonb_array_elements_text(${participantArraySql}) AS participant_item(value)
+    WHERE trim(participant_item.value) <> ''
+    GROUP BY 1
+    ORDER BY appearances DESC, participant ASC
+    LIMIT 25
+  `);
+  const topWinnersQuery = dbPool.query(`
+    SELECT match_item->>'winner' AS winner, count(*)::int AS wins
+    FROM wrestling_shows
+    CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
+    WHERE trim(coalesce(match_item->>'winner', '')) <> ''
+    GROUP BY 1
+    ORDER BY wins DESC, winner ASC
+    LIMIT 25
+  `);
+  const [
+    totalsResult,
+    uniqueParticipantsResult,
+    byPromotionResult,
+    byYearResult,
+    byStateResult,
+    byCityResult,
+    byVenueResult,
+    topParticipantsResult,
+    topWinnersResult
+  ] = await Promise.all([
+    totalsQuery,
+    uniqueParticipantsQuery,
+    byPromotionQuery,
+    byYearQuery,
+    byStateQuery,
+    byCityQuery,
+    byVenueQuery,
+    topParticipantsQuery,
+    topWinnersQuery
+  ]);
+  const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+  const uniqueParticipants = uniqueParticipantsResult.rows && uniqueParticipantsResult.rows[0] ? uniqueParticipantsResult.rows[0] : {};
+
+  return {
+    ok: true,
+    route: '/api/wrestling/shows/stats',
+    source: 'PostgreSQL:wrestling_shows',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    totals: {
+      showsTotal: toIntegerCount(totals.shows_total),
+      matchesTotal: toIntegerCount(totals.matches_total),
+      uniqueParticipants: toIntegerCount(uniqueParticipants.unique_participants)
+    },
+    byPromotion: byPromotionResult.rows.map((row) => ({ promotion: row.promotion, showsTotal: toIntegerCount(row.shows_total) })),
+    byYear: byYearResult.rows.map((row) => ({ year: row.year, showsTotal: toIntegerCount(row.shows_total) })),
+    byState: byStateResult.rows.map((row) => ({ state: row.state, showsTotal: toIntegerCount(row.shows_total) })),
+    byCity: byCityResult.rows.map((row) => ({ city: row.city, showsTotal: toIntegerCount(row.shows_total) })),
+    byVenue: byVenueResult.rows.map((row) => ({ venue: row.venue, showsTotal: toIntegerCount(row.shows_total) })),
+    topParticipants: topParticipantsResult.rows.map((row) => ({ participant: row.participant, appearances: toIntegerCount(row.appearances) })),
+    topWinners: topWinnersResult.rows.map((row) => ({ winner: row.winner, wins: toIntegerCount(row.wins) }))
   };
 }
 
@@ -3272,14 +3913,15 @@ async function writeSystemImportLog(entry) {
   }
 }
 
-async function runLoggedMusicImport(req, res, config) {
+async function runLoggedImport(req, res, config) {
   const startedAt = new Date();
+  const area = config.area || 'music';
 
   try {
     const forceRefresh = req.query.refresh === '1';
     const result = await config.importer(forceRefresh);
     await writeSystemImportLog({
-      area: 'music',
+      area,
       route: config.route,
       status: 'success',
       rows_read: result && result.rowsRead,
@@ -3291,7 +3933,7 @@ async function runLoggedMusicImport(req, res, config) {
     res.json(result);
   } catch (err) {
     await writeSystemImportLog({
-      area: 'music',
+      area,
       route: config.route,
       status: 'error',
       rows_read: 0,
@@ -3308,6 +3950,10 @@ async function runLoggedMusicImport(req, res, config) {
       error: err && err.message ? err.message : String(err)
     });
   }
+}
+
+async function runLoggedMusicImport(req, res, config) {
+  return runLoggedImport(req, res, { ...config, area: 'music' });
 }
 
 const MUSIC_STATUS_TABLES = ['music_bands', 'music_shows', 'music_people', 'music_venues'];
@@ -3631,6 +4277,15 @@ app.get('/admin/import/music/venues', async (req, res) => {
   });
 });
 
+app.get('/admin/import/wrestling/shows', async (req, res) => {
+  return runLoggedImport(req, res, {
+    area: 'wrestling',
+    route: '/admin/import/wrestling/shows',
+    source: 'Wrestling-Matches',
+    importer: importWrestlingShowsToDatabase
+  });
+});
+
 app.get('/api/status/music', async (req, res) => {
   try {
     res.json(await buildMusicStatusResponse());
@@ -3684,6 +4339,27 @@ app.get('/api/music/shows/stats', async (req, res) => {
       ok: false,
       route: '/api/music/shows/stats',
       source: 'PostgreSQL:music_shows',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/wrestling/shows/db', async (req, res) => {
+  return handleWrestlingShowsDbRequest(req, res);
+});
+
+app.get('/api/wrestling/shows/stats', async (req, res) => {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    res.json(await buildWrestlingShowsDbStatsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/wrestling/shows/stats',
+      source: 'PostgreSQL:wrestling_shows',
       error: err && err.message ? err.message : String(err)
     });
   }
