@@ -2833,6 +2833,88 @@ function createEmptyWrestlingVenueGeo() {
   };
 }
 
+function getValidWrestlingVenueCoordinates(latitude, longitude) {
+  const lat = toNullableNumber(latitude);
+  const lon = toNullableNumber(longitude);
+
+  if (lat == null || lon == null) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+
+  return {
+    lat,
+    lon,
+    latText: String(lat),
+    lonText: String(lon)
+  };
+}
+
+function encodeWrestlingVenueGeohash(latitude, longitude, precision = 6) {
+  const base32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+  const bits = [16, 8, 4, 2, 1];
+  let evenBit = true;
+  let bit = 0;
+  let ch = 0;
+  let geohash = '';
+  let latRange = [-90, 90];
+  let lonRange = [-180, 180];
+
+  while (geohash.length < precision) {
+    if (evenBit) {
+      const mid = (lonRange[0] + lonRange[1]) / 2;
+      if (longitude >= mid) {
+        ch += bits[bit];
+        lonRange[0] = mid;
+      } else {
+        lonRange[1] = mid;
+      }
+    } else {
+      const mid = (latRange[0] + latRange[1]) / 2;
+      if (latitude >= mid) {
+        ch += bits[bit];
+        latRange[0] = mid;
+      } else {
+        latRange[1] = mid;
+      }
+    }
+
+    evenBit = !evenBit;
+
+    if (bit < 4) {
+      bit += 1;
+    } else {
+      geohash += base32[ch];
+      bit = 0;
+      ch = 0;
+    }
+  }
+
+  return geohash;
+}
+
+function buildPhase1WrestlingVenueGeo(latitude, longitude, existingGeo) {
+  const geo = {
+    ...createEmptyWrestlingVenueGeo(),
+    ...(existingGeo && typeof existingGeo === 'object' ? existingGeo : {})
+  };
+  if (!Array.isArray(geo.nearby_airports)) geo.nearby_airports = [];
+
+  const coords = getValidWrestlingVenueCoordinates(latitude, longitude);
+  if (!coords) {
+    geo.google_maps_url = null;
+    geo.apple_maps_url = null;
+    geo.osm_url = null;
+    geo.geohash = null;
+    return geo;
+  }
+
+  geo.google_maps_url = `https://www.google.com/maps?q=${coords.latText},${coords.lonText}`;
+  geo.apple_maps_url = `https://maps.apple.com/?ll=${coords.latText},${coords.lonText}`;
+  geo.osm_url = `https://www.openstreetmap.org/?mlat=${coords.latText}&mlon=${coords.lonText}#map=16/${coords.latText}/${coords.lonText}`;
+  geo.geohash = encodeWrestlingVenueGeohash(coords.lat, coords.lon, 6);
+
+  return geo;
+}
+
 function buildWrestlingVenueFallbackId(row) {
   return slugifyMusicBandId([
     row.venue_name,
@@ -2861,6 +2943,8 @@ function buildWrestlingVenueDbRows(rows) {
     if (!venueId || seen.has(venueId)) return;
     if (generatedVenueId) generatedVenueIds += 1;
     seen.add(venueId);
+    const latitude = toNullableNumber(row.latitude);
+    const longitude = toNullableNumber(row.longitude);
 
     items.push({
       venue_id: venueId,
@@ -2871,10 +2955,10 @@ function buildWrestlingVenueDbRows(rows) {
       region: toDbText(row.region),
       venue_type: toDbText(row.venue_type),
       status: toDbText(row.status),
-      latitude: toNullableNumber(row.latitude),
-      longitude: toNullableNumber(row.longitude),
+      latitude,
+      longitude,
       notes: toDbText(row.notes),
-      geo: createEmptyWrestlingVenueGeo(),
+      geo: buildPhase1WrestlingVenueGeo(latitude, longitude),
       raw_sheet: compactJsonFields(row)
     });
   });
@@ -4182,11 +4266,9 @@ async function buildWrestlingPeopleDbStatsResponse() {
 }
 
 function buildWrestlingVenueDbApiItem(row) {
-  const geo = {
-    ...createEmptyWrestlingVenueGeo(),
-    ...(row.geo && typeof row.geo === 'object' ? row.geo : {})
-  };
-  if (!Array.isArray(geo.nearby_airports)) geo.nearby_airports = [];
+  const latitude = toNullableNumber(row.latitude);
+  const longitude = toNullableNumber(row.longitude);
+  const geo = buildPhase1WrestlingVenueGeo(latitude, longitude, row.geo);
 
   return {
     venue_id: row.venue_id || '',
@@ -4197,8 +4279,8 @@ function buildWrestlingVenueDbApiItem(row) {
     region: row.region || '',
     venue_type: row.venue_type || '',
     status: row.status || '',
-    latitude: toNullableNumber(row.latitude),
-    longitude: toNullableNumber(row.longitude),
+    latitude,
+    longitude,
     notes: row.notes || '',
     geo
   };
