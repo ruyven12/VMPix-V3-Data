@@ -5271,6 +5271,10 @@ app.get('/api/wrestling/people', async (req, res) => {
   return handleWrestlingPeopleDbRequest(req, res);
 });
 
+app.get('/api/wrestling/people/db', async (req, res) => {
+  return handleWrestlingPeopleDbRequest(req, res);
+});
+
 app.get('/api/wrestling/people/stats', async (req, res) => {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
