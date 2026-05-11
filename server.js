@@ -6731,6 +6731,164 @@ async function buildWrestlingDiagnosticsResponse() {
   return response;
 }
 
+const ADMIN_DIAGNOSTIC_TABLES = MUSIC_DIAGNOSTIC_TABLES.concat(WRESTLING_DIAGNOSTIC_TABLES);
+const ADMIN_DIAGNOSTIC_ISSUE_KEY_RE = /(^|_)(missing|duplicate|invalid|unmatched|without|not_in)(_|\b)/i;
+
+function countAdminDiagnosticIssues(value, key = '') {
+  if (value == null) return 0;
+  if (key === 'summary' || key === 'samples' || key === 'warnings' || key === 'tables') return 0;
+
+  if (Array.isArray(value)) {
+    return ADMIN_DIAGNOSTIC_ISSUE_KEY_RE.test(key) ? value.length : 0;
+  }
+
+  if (typeof value === 'number') {
+    return ADMIN_DIAGNOSTIC_ISSUE_KEY_RE.test(key) ? toIntegerCount(value) : 0;
+  }
+
+  if (typeof value === 'object') {
+    return Object.entries(value).reduce((sum, [childKey, childValue]) => {
+      return sum + countAdminDiagnosticIssues(childValue, childKey);
+    }, 0);
+  }
+
+  return 0;
+}
+
+function getAdminDiagnosticWarnings(diagnostic) {
+  const warnings = diagnostic && diagnostic.summary && Array.isArray(diagnostic.summary.warnings)
+    ? diagnostic.summary.warnings
+    : [];
+  return warnings.filter(Boolean).map((warning) => String(warning));
+}
+
+function uniqueAdminWarnings(warnings) {
+  return Array.from(new Set((warnings || []).filter(Boolean).map((warning) => String(warning))));
+}
+
+function getAdminDiagnosticStatus(issueCount, warningCount) {
+  if (issueCount > 0) return 'issues';
+  if (warningCount > 0) return 'warnings';
+  return 'ok';
+}
+
+async function buildAdminDiagnosticsDatabaseSummary(warnings) {
+  const database = {
+    database_connected: false,
+    tables_checked: ADMIN_DIAGNOSTIC_TABLES,
+    missing_tables: [],
+    warning_count: 0
+  };
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable.');
+    database.warning_count = warnings.length;
+    return database;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+    database.database_connected = true;
+  } catch (err) {
+    warnings.push(`Database disconnected: ${err && err.message ? err.message : String(err)}`);
+    database.warning_count = warnings.length;
+    return database;
+  }
+
+  try {
+    const existingTables = await getExistingPublicTables(ADMIN_DIAGNOSTIC_TABLES);
+    database.missing_tables = ADMIN_DIAGNOSTIC_TABLES.filter((tableName) => !existingTables.has(tableName));
+    database.missing_tables.forEach((tableName) => {
+      warnings.push(`Missing table: ${tableName}`);
+    });
+  } catch (err) {
+    warnings.push(`Unable to inspect admin diagnostic tables: ${err && err.message ? err.message : String(err)}`);
+  }
+
+  database.warning_count = warnings.length;
+  return database;
+}
+
+async function buildAdminDiagnosticsResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const response = {
+    ok: true,
+    route: '/api/admin/diagnostics',
+    source: 'postgres',
+    section: 'admin',
+    type: 'diagnostics',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    database: {},
+    summary: {
+      total_music_issues: 0,
+      total_wrestling_issues: 0,
+      total_warnings: 0,
+      music_status: 'ok',
+      wrestling_status: 'ok',
+      overall_status: 'ok'
+    },
+    music: {},
+    wrestling: {},
+    warnings
+  };
+
+  response.database = await buildAdminDiagnosticsDatabaseSummary(warnings);
+
+  try {
+    response.music = await buildMusicDiagnosticsResponse();
+  } catch (err) {
+    const message = `Music diagnostics failed: ${err && err.message ? err.message : String(err)}`;
+    warnings.push(message);
+    response.music = {
+      ok: false,
+      route: '/api/admin/diagnostics/music',
+      source: 'postgres',
+      section: 'music',
+      type: 'diagnostics',
+      error: message
+    };
+  }
+
+  try {
+    response.wrestling = await buildWrestlingDiagnosticsResponse();
+  } catch (err) {
+    const message = `Wrestling diagnostics failed: ${err && err.message ? err.message : String(err)}`;
+    warnings.push(message);
+    response.wrestling = {
+      ok: false,
+      route: '/api/admin/diagnostics/wrestling',
+      source: 'postgres',
+      section: 'wrestling',
+      type: 'diagnostics',
+      error: message
+    };
+  }
+
+  const musicWarnings = getAdminDiagnosticWarnings(response.music);
+  const wrestlingWarnings = getAdminDiagnosticWarnings(response.wrestling);
+  response.warnings = uniqueAdminWarnings(warnings.concat(musicWarnings, wrestlingWarnings));
+
+  const totalMusicIssues = countAdminDiagnosticIssues(response.music);
+  const totalWrestlingIssues = countAdminDiagnosticIssues(response.wrestling);
+  const musicWarningCount = musicWarnings.length;
+  const wrestlingWarningCount = wrestlingWarnings.length;
+  const totalWarnings = response.warnings.length;
+
+  response.summary = {
+    total_music_issues: totalMusicIssues,
+    total_wrestling_issues: totalWrestlingIssues,
+    total_warnings: totalWarnings,
+    music_status: getAdminDiagnosticStatus(totalMusicIssues, musicWarningCount),
+    wrestling_status: getAdminDiagnosticStatus(totalWrestlingIssues, wrestlingWarningCount),
+    overall_status: getAdminDiagnosticStatus(totalMusicIssues + totalWrestlingIssues, totalWarnings)
+  };
+  response.database.warning_count = warnings.length;
+
+  return response;
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -6865,6 +7023,21 @@ app.get('/api/status/music', async (req, res) => {
     res.status(500).json({
       ok: false,
       route: '/api/status/music',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/admin/diagnostics', async (req, res) => {
+  try {
+    res.json(await buildAdminDiagnosticsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/diagnostics',
+      source: 'postgres',
+      section: 'admin',
+      type: 'diagnostics',
       error: err && err.message ? err.message : String(err)
     });
   }
