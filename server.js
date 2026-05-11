@@ -5297,6 +5297,617 @@ async function buildMusicStatusResponse() {
   return response;
 }
 
+const WRESTLING_DIAGNOSTIC_TABLES = ['wrestling_shows', 'wrestling_people', 'wrestling_venues'];
+
+async function getExistingPublicColumns(tableNames) {
+  const result = await dbPool.query(`
+    SELECT table_name, column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = ANY($1::text[])
+  `, [tableNames]);
+
+  const columnsByTable = new Map();
+  result.rows.forEach((row) => {
+    if (!columnsByTable.has(row.table_name)) columnsByTable.set(row.table_name, new Set());
+    columnsByTable.get(row.table_name).add(row.column_name);
+  });
+
+  return columnsByTable;
+}
+
+function hasDiagnosticColumn(columnsByTable, tableName, columnName) {
+  const columns = columnsByTable.get(tableName);
+  return !!columns && columns.has(columnName);
+}
+
+function warnMissingDiagnosticColumns(columnsByTable, tableName, columnNames, warnings) {
+  const missing = columnNames.filter((columnName) => !hasDiagnosticColumn(columnsByTable, tableName, columnName));
+  if (missing.length) warnings.push(`Missing columns on ${tableName}: ${missing.join(', ')}`);
+  return missing.length === 0;
+}
+
+function diagnosticRows(result) {
+  return result && Array.isArray(result.rows) ? result.rows : [];
+}
+
+function firstDiagnosticRow(result) {
+  const rows = diagnosticRows(result);
+  return rows[0] || {};
+}
+
+async function runWrestlingDiagnosticQuery(warnings, label, sql, params = []) {
+  try {
+    return await dbPool.query(sql, params);
+  } catch (err) {
+    warnings.push(`Unable to check ${label}: ${err && err.message ? err.message : String(err)}`);
+    return { rows: [] };
+  }
+}
+
+async function addWrestlingVenueDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('wrestling_venues')) {
+    warnings.push('Missing table: wrestling_venues');
+    return;
+  }
+
+  const venues = response.venues;
+  const samples = {};
+  const totalResult = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling venue totals',
+    `SELECT count(*)::int AS total_venues FROM wrestling_venues`
+  );
+  venues.total_venues = toIntegerCount(firstDiagnosticRow(totalResult).total_venues);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_venues', ['latitude', 'longitude'], warnings)) {
+    const gpsResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling venue GPS',
+      `SELECT
+         count(*) FILTER (WHERE latitude IS NOT NULL AND longitude IS NOT NULL)::int AS venues_with_gps,
+         count(*) FILTER (WHERE latitude IS NULL OR longitude IS NULL)::int AS venues_missing_gps
+       FROM wrestling_venues`
+    );
+    const gps = firstDiagnosticRow(gpsResult);
+    venues.venues_with_gps = toIntegerCount(gps.venues_with_gps);
+    venues.venues_missing_gps = toIntegerCount(gps.venues_missing_gps);
+
+    const missingGpsResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling venue missing GPS samples',
+      `SELECT venue_id, venue_name, city, state
+       FROM wrestling_venues
+       WHERE latitude IS NULL OR longitude IS NULL
+       ORDER BY venue_name ASC, city ASC, state ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_gps = diagnosticRows(missingGpsResult);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_venues', ['venue_name'], warnings)) {
+    const missingNameResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling venues missing name',
+      `SELECT count(*)::int AS venues_missing_name
+       FROM wrestling_venues
+       WHERE trim(coalesce(venue_name, '')) = ''`
+    );
+    venues.venues_missing_name = toIntegerCount(firstDiagnosticRow(missingNameResult).venues_missing_name);
+
+    const missingNameSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling venues missing name samples',
+      `SELECT venue_id, city, state
+       FROM wrestling_venues
+       WHERE trim(coalesce(venue_name, '')) = ''
+       ORDER BY venue_id ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_name = diagnosticRows(missingNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_venues', ['venue_id'], warnings)) {
+    const duplicateVenueIdResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'duplicate wrestling venue IDs',
+      `SELECT count(*)::int AS duplicate_venue_ids
+       FROM (
+         SELECT lower(trim(venue_id)) AS venue_id_key
+         FROM wrestling_venues
+         WHERE trim(coalesce(venue_id, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    venues.duplicate_venue_ids = toIntegerCount(firstDiagnosticRow(duplicateVenueIdResult).duplicate_venue_ids);
+
+    const duplicateVenueIdSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'duplicate wrestling venue ID samples',
+      `SELECT lower(trim(venue_id)) AS venue_id, count(*)::int AS count
+       FROM wrestling_venues
+       WHERE trim(coalesce(venue_id, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, venue_id ASC
+       LIMIT 10`
+    );
+    samples.duplicate_venue_ids = diagnosticRows(duplicateVenueIdSamples);
+  }
+
+  venues.samples = samples;
+}
+
+async function addWrestlingShowDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('wrestling_shows')) {
+    warnings.push('Missing table: wrestling_shows');
+    return;
+  }
+
+  const shows = response.shows;
+  const samples = {};
+  const totalResult = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling show totals',
+    `SELECT count(*)::int AS total_records FROM wrestling_shows`
+  );
+  shows.total_records = toIntegerCount(firstDiagnosticRow(totalResult).total_records);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['show_name'], warnings)) {
+    const missingShowNameResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows missing show name',
+      `SELECT count(*)::int AS records_missing_show_name
+       FROM wrestling_shows
+       WHERE trim(coalesce(show_name, '')) = ''`
+    );
+    shows.records_missing_show_name = toIntegerCount(firstDiagnosticRow(missingShowNameResult).records_missing_show_name);
+
+    const missingShowNameSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows missing show name samples',
+      `SELECT show_id, show_key, date, venue_id
+       FROM wrestling_shows
+       WHERE trim(coalesce(show_name, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.records_missing_show_name = diagnosticRows(missingShowNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['date'], warnings)) {
+    const missingDateResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows missing date',
+      `SELECT count(*)::int AS records_missing_date
+       FROM wrestling_shows
+       WHERE trim(coalesce(date, '')) = ''`
+    );
+    shows.records_missing_date = toIntegerCount(firstDiagnosticRow(missingDateResult).records_missing_date);
+
+    const missingDateSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows missing date samples',
+      `SELECT show_id, show_key, show_name, venue_id
+       FROM wrestling_shows
+       WHERE trim(coalesce(date, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.records_missing_date = diagnosticRows(missingDateSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['venue_id'], warnings)) {
+    const missingVenueIdResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows missing venue ID',
+      `SELECT count(*)::int AS records_missing_venue_id
+       FROM wrestling_shows
+       WHERE trim(coalesce(venue_id, '')) = ''`
+    );
+    shows.records_missing_venue_id = toIntegerCount(firstDiagnosticRow(missingVenueIdResult).records_missing_venue_id);
+
+    const missingVenueIdSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows missing venue ID samples',
+      `SELECT show_id, show_key, show_name, date
+       FROM wrestling_shows
+       WHERE trim(coalesce(venue_id, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.records_missing_venue_id = diagnosticRows(missingVenueIdSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['show_key'], warnings)) {
+    const duplicateShowKeyResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'duplicate wrestling show keys',
+      `SELECT count(*)::int AS duplicate_show_keys
+       FROM (
+         SELECT lower(trim(show_key)) AS show_key_key
+         FROM wrestling_shows
+         WHERE trim(coalesce(show_key, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    shows.duplicate_show_keys = toIntegerCount(firstDiagnosticRow(duplicateShowKeyResult).duplicate_show_keys);
+
+    const duplicateShowKeySamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'duplicate wrestling show key samples',
+      `SELECT lower(trim(show_key)) AS show_key, count(*)::int AS count
+       FROM wrestling_shows
+       WHERE trim(coalesce(show_key, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, show_key ASC
+       LIMIT 10`
+    );
+    samples.duplicate_show_keys = diagnosticRows(duplicateShowKeySamples);
+  }
+
+  if (
+    existingTables.has('wrestling_venues') &&
+    warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['venue_id'], warnings) &&
+    warnMissingDiagnosticColumns(columnsByTable, 'wrestling_venues', ['venue_id'], warnings)
+  ) {
+    const invalidVenueResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows with invalid venue ID',
+      `SELECT count(*)::int AS records_with_invalid_venue_id
+       FROM wrestling_shows ws
+       LEFT JOIN wrestling_venues wv
+         ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+       WHERE trim(coalesce(ws.venue_id, '')) <> ''
+         AND wv.venue_id IS NULL`
+    );
+    shows.records_with_invalid_venue_id = toIntegerCount(firstDiagnosticRow(invalidVenueResult).records_with_invalid_venue_id);
+
+    const invalidVenueSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling shows invalid venue ID samples',
+      `SELECT ws.show_id, ws.show_name, ws.date, ws.venue_id
+       FROM wrestling_shows ws
+       LEFT JOIN wrestling_venues wv
+         ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+       WHERE trim(coalesce(ws.venue_id, '')) <> ''
+         AND wv.venue_id IS NULL
+       ORDER BY ws.show_id ASC
+       LIMIT 10`
+    );
+    samples.records_with_invalid_venue_id = diagnosticRows(invalidVenueSamples);
+  } else if (!existingTables.has('wrestling_venues')) {
+    warnings.push('Unable to validate wrestling show venue IDs because wrestling_venues is missing.');
+  }
+
+  shows.samples = samples;
+}
+
+async function addWrestlingMatchDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('wrestling_shows')) {
+    warnings.push('Missing table for match diagnostics: wrestling_shows');
+    return;
+  }
+  if (!warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['matches'], warnings)) return;
+
+  const matchesArraySql = `CASE WHEN jsonb_typeof(matches) = 'array' THEN matches ELSE '[]'::jsonb END`;
+  const participantArraySql = `CASE WHEN jsonb_typeof(match_item->'participants') = 'array' THEN match_item->'participants' ELSE '[]'::jsonb END`;
+  const matches = response.matches;
+  const samples = {};
+
+  const totalsResult = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling match details',
+    `SELECT
+       count(*)::int AS total_matches,
+       count(*) FILTER (WHERE jsonb_array_length(${participantArraySql}) = 0)::int AS matches_missing_participants,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'winner', '')) = '')::int AS matches_missing_winner,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'match_type', '')) = '')::int AS matches_missing_match_type,
+       count(*) FILTER (
+         WHERE match_item->'match_order' IS NULL
+            OR trim(coalesce(match_item->>'match_order', '')) = ''
+       )::int AS matches_missing_match_order
+     FROM wrestling_shows
+     CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item`
+  );
+  const totals = firstDiagnosticRow(totalsResult);
+  matches.total_matches = toIntegerCount(totals.total_matches);
+  matches.total_records = matches.total_matches;
+  matches.matches_missing_participants = toIntegerCount(totals.matches_missing_participants);
+  matches.matches_missing_winner = toIntegerCount(totals.matches_missing_winner);
+  matches.matches_missing_match_type = toIntegerCount(totals.matches_missing_match_type);
+  matches.matches_missing_match_order = toIntegerCount(totals.matches_missing_match_order);
+
+  const sampleBaseSql = `
+    SELECT
+      ws.show_id,
+      ws.show_name,
+      ws.date,
+      match_item->>'match_order' AS match_order,
+      match_item->>'match_type' AS match_type,
+      match_item->'participants' AS participants,
+      match_item->>'winner' AS winner
+    FROM wrestling_shows ws
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+  `;
+  const missingParticipantSamples = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling match missing participant samples',
+    `${sampleBaseSql}
+     WHERE jsonb_array_length(CASE WHEN jsonb_typeof(match_item->'participants') = 'array' THEN match_item->'participants' ELSE '[]'::jsonb END) = 0
+     ORDER BY ws.show_id ASC
+     LIMIT 10`
+  );
+  samples.matches_missing_participants = diagnosticRows(missingParticipantSamples);
+
+  const missingWinnerSamples = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling match missing winner samples',
+    `${sampleBaseSql}
+     WHERE trim(coalesce(match_item->>'winner', '')) = ''
+     ORDER BY ws.show_id ASC
+     LIMIT 10`
+  );
+  samples.matches_missing_winner = diagnosticRows(missingWinnerSamples);
+
+  const missingMatchTypeSamples = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling match missing type samples',
+    `${sampleBaseSql}
+     WHERE trim(coalesce(match_item->>'match_type', '')) = ''
+     ORDER BY ws.show_id ASC
+     LIMIT 10`
+  );
+  samples.matches_missing_match_type = diagnosticRows(missingMatchTypeSamples);
+
+  const missingMatchOrderSamples = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling match missing order samples',
+    `${sampleBaseSql}
+     WHERE match_item->'match_order' IS NULL
+        OR trim(coalesce(match_item->>'match_order', '')) = ''
+     ORDER BY ws.show_id ASC
+     LIMIT 10`
+  );
+  samples.matches_missing_match_order = diagnosticRows(missingMatchOrderSamples);
+  matches.samples = samples;
+}
+
+async function addWrestlingPeopleDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('wrestling_people')) {
+    warnings.push('Missing table: wrestling_people');
+    return;
+  }
+
+  const people = response.people;
+  const samples = {};
+  const totalResult = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling people totals',
+    `SELECT count(*)::int AS total_people FROM wrestling_people`
+  );
+  people.total_people = toIntegerCount(firstDiagnosticRow(totalResult).total_people);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_people', ['name'], warnings)) {
+    const missingNameResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling people missing name',
+      `SELECT count(*)::int AS people_missing_name
+       FROM wrestling_people
+       WHERE trim(coalesce(name, '')) = ''`
+    );
+    people.people_missing_name = toIntegerCount(firstDiagnosticRow(missingNameResult).people_missing_name);
+
+    const missingNameSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling people missing name samples',
+      `SELECT id, slug, category
+       FROM wrestling_people
+       WHERE trim(coalesce(name, '')) = ''
+       ORDER BY id ASC
+       LIMIT 10`
+    );
+    samples.people_missing_name = diagnosticRows(missingNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_people', ['category'], warnings)) {
+    const missingCategoryResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling people missing category',
+      `SELECT count(*)::int AS people_missing_category
+       FROM wrestling_people
+       WHERE trim(coalesce(category, '')) = ''`
+    );
+    people.people_missing_category = toIntegerCount(firstDiagnosticRow(missingCategoryResult).people_missing_category);
+
+    const missingCategorySamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'wrestling people missing category samples',
+      `SELECT id, slug, name
+       FROM wrestling_people
+       WHERE trim(coalesce(category, '')) = ''
+       ORDER BY id ASC
+       LIMIT 10`
+    );
+    samples.people_missing_category = diagnosticRows(missingCategorySamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'wrestling_people', ['id'], warnings)) {
+    const duplicatePersonIdResult = await runWrestlingDiagnosticQuery(
+      warnings,
+      'duplicate wrestling person IDs',
+      `SELECT count(*)::int AS duplicate_person_ids
+       FROM (
+         SELECT id
+         FROM wrestling_people
+         GROUP BY id
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    people.duplicate_person_ids = toIntegerCount(firstDiagnosticRow(duplicatePersonIdResult).duplicate_person_ids);
+
+    const duplicatePersonIdSamples = await runWrestlingDiagnosticQuery(
+      warnings,
+      'duplicate wrestling person ID samples',
+      `SELECT id, count(*)::int AS count
+       FROM wrestling_people
+       GROUP BY id
+       HAVING count(*) > 1
+       ORDER BY count DESC, id ASC
+       LIMIT 10`
+    );
+    samples.duplicate_person_ids = diagnosticRows(duplicatePersonIdSamples);
+  }
+
+  people.samples = samples;
+}
+
+async function addWrestlingRelationshipDiagnostics(response, existingTables, columnsByTable, warnings) {
+  const relationships = response.relationships;
+  const samples = {};
+
+  if (!existingTables.has('wrestling_shows')) {
+    warnings.push('Missing table for relationship diagnostics: wrestling_shows');
+    return;
+  }
+  if (!existingTables.has('wrestling_venues')) {
+    warnings.push('Missing table for relationship diagnostics: wrestling_venues');
+    return;
+  }
+  if (
+    !warnMissingDiagnosticColumns(columnsByTable, 'wrestling_shows', ['venue_id'], warnings) ||
+    !warnMissingDiagnosticColumns(columnsByTable, 'wrestling_venues', ['venue_id'], warnings)
+  ) {
+    return;
+  }
+
+  const linkingResult = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling venue relationships',
+    `WITH linked AS (
+       SELECT
+         nullif(trim(ws.venue_id), '') AS show_venue_id,
+         wv.venue_id AS matched_venue_id
+       FROM wrestling_shows ws
+       LEFT JOIN wrestling_venues wv
+         ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+     )
+     SELECT
+       count(matched_venue_id)::int AS valid_venue_links,
+       count(*) FILTER (WHERE show_venue_id IS NOT NULL AND matched_venue_id IS NULL)::int AS invalid_venue_links,
+       count(*) FILTER (WHERE show_venue_id IS NULL)::int AS shows_missing_venue_id,
+       coalesce(
+         array_agg(DISTINCT show_venue_id) FILTER (WHERE show_venue_id IS NOT NULL AND matched_venue_id IS NULL),
+         '{}'::text[]
+       ) AS unmatched_venue_ids
+     FROM linked`
+  );
+  const linking = firstDiagnosticRow(linkingResult);
+  const unmatchedVenueIds = Array.isArray(linking.unmatched_venue_ids) ? linking.unmatched_venue_ids : [];
+  relationships.valid_venue_links = toIntegerCount(linking.valid_venue_links);
+  relationships.invalid_venue_links = toIntegerCount(linking.invalid_venue_links);
+  relationships.unmatched_venue_ids = unmatchedVenueIds;
+  relationships.shows_missing_venue_id = toIntegerCount(linking.shows_missing_venue_id);
+  relationships.venue_ids_not_in_venues_table = unmatchedVenueIds;
+
+  const invalidSamples = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling invalid venue relationship samples',
+    `SELECT ws.show_id, ws.show_name, ws.date, ws.venue_id
+     FROM wrestling_shows ws
+     LEFT JOIN wrestling_venues wv
+       ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+     WHERE trim(coalesce(ws.venue_id, '')) <> ''
+       AND wv.venue_id IS NULL
+     ORDER BY ws.show_id ASC
+     LIMIT 10`
+  );
+  samples.invalid_venue_links = diagnosticRows(invalidSamples);
+
+  const missingVenueSamples = await runWrestlingDiagnosticQuery(
+    warnings,
+    'wrestling missing venue relationship samples',
+    `SELECT show_id, show_name, date
+     FROM wrestling_shows
+     WHERE trim(coalesce(venue_id, '')) = ''
+     ORDER BY show_id ASC
+     LIMIT 10`
+  );
+  samples.shows_missing_venue_id = diagnosticRows(missingVenueSamples);
+  relationships.samples = samples;
+}
+
+async function buildWrestlingDiagnosticsResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const response = {
+    ok: true,
+    route: '/api/admin/diagnostics/wrestling',
+    source: 'postgres',
+    section: 'wrestling',
+    type: 'diagnostics',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    summary: {
+      database_connected: false,
+      tables: {
+        wrestling_shows: false,
+        wrestling_people: false,
+        wrestling_venues: false
+      },
+      warning_count: 0,
+      warnings
+    },
+    shows: {},
+    matches: {},
+    people: {},
+    venues: {},
+    relationships: {}
+  };
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable.');
+    response.summary.warning_count = warnings.length;
+    return response;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+    response.summary.database_connected = true;
+  } catch (err) {
+    warnings.push(`Database disconnected: ${err && err.message ? err.message : String(err)}`);
+    response.summary.warning_count = warnings.length;
+    return response;
+  }
+
+  let existingTables;
+  let columnsByTable;
+  try {
+    existingTables = await getExistingPublicTables(WRESTLING_DIAGNOSTIC_TABLES);
+    columnsByTable = await getExistingPublicColumns(WRESTLING_DIAGNOSTIC_TABLES);
+  } catch (err) {
+    warnings.push(`Unable to inspect wrestling tables: ${err && err.message ? err.message : String(err)}`);
+    response.summary.warning_count = warnings.length;
+    return response;
+  }
+
+  WRESTLING_DIAGNOSTIC_TABLES.forEach((tableName) => {
+    response.summary.tables[tableName] = existingTables.has(tableName);
+  });
+
+  await addWrestlingVenueDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addWrestlingShowDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addWrestlingMatchDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addWrestlingPeopleDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addWrestlingRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
+
+  response.summary.warning_count = warnings.length;
+  return response;
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -5431,6 +6042,21 @@ app.get('/api/status/music', async (req, res) => {
     res.status(500).json({
       ok: false,
       route: '/api/status/music',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/admin/diagnostics/wrestling', async (req, res) => {
+  try {
+    res.json(await buildWrestlingDiagnosticsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/diagnostics/wrestling',
+      source: 'postgres',
+      section: 'wrestling',
+      type: 'diagnostics',
       error: err && err.message ? err.message : String(err)
     });
   }
