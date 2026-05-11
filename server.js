@@ -5297,6 +5297,7 @@ async function buildMusicStatusResponse() {
   return response;
 }
 
+const MUSIC_DIAGNOSTIC_TABLES = ['music_bands', 'music_shows', 'music_people', 'music_venues'];
 const WRESTLING_DIAGNOSTIC_TABLES = ['wrestling_shows', 'wrestling_people', 'wrestling_venues'];
 
 async function getExistingPublicColumns(tableNames) {
@@ -5343,6 +5344,828 @@ async function runWrestlingDiagnosticQuery(warnings, label, sql, params = []) {
     warnings.push(`Unable to check ${label}: ${err && err.message ? err.message : String(err)}`);
     return { rows: [] };
   }
+}
+
+async function runMusicDiagnosticQuery(warnings, label, sql, params = []) {
+  try {
+    return await dbPool.query(sql, params);
+  } catch (err) {
+    warnings.push(`Unable to check ${label}: ${err && err.message ? err.message : String(err)}`);
+    return { rows: [] };
+  }
+}
+
+async function addMusicBandDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('music_bands')) {
+    warnings.push('Missing table: music_bands');
+    return;
+  }
+
+  const bands = response.bands;
+  const samples = {};
+  const totalResult = await runMusicDiagnosticQuery(
+    warnings,
+    'music band totals',
+    `SELECT count(*)::int AS total_bands FROM music_bands`
+  );
+  bands.total_bands = toIntegerCount(firstDiagnosticRow(totalResult).total_bands);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_bands', ['band_id'], warnings)) {
+    const missingIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing ID',
+      `SELECT count(*)::int AS bands_missing_id
+       FROM music_bands
+       WHERE trim(coalesce(band_id, '')) = ''`
+    );
+    bands.bands_missing_id = toIntegerCount(firstDiagnosticRow(missingIdResult).bands_missing_id);
+
+    const missingIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing ID samples',
+      `SELECT id, band
+       FROM music_bands
+       WHERE trim(coalesce(band_id, '')) = ''
+       ORDER BY band ASC
+       LIMIT 10`
+    );
+    samples.bands_missing_id = diagnosticRows(missingIdSamples);
+
+    const duplicateIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music band IDs',
+      `SELECT count(*)::int AS duplicate_band_ids
+       FROM (
+         SELECT lower(trim(band_id)) AS band_id_key
+         FROM music_bands
+         WHERE trim(coalesce(band_id, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    bands.duplicate_band_ids = toIntegerCount(firstDiagnosticRow(duplicateIdResult).duplicate_band_ids);
+
+    const duplicateIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music band ID samples',
+      `SELECT lower(trim(band_id)) AS band_id, count(*)::int AS count
+       FROM music_bands
+       WHERE trim(coalesce(band_id, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, band_id ASC
+       LIMIT 10`
+    );
+    samples.duplicate_band_ids = diagnosticRows(duplicateIdSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_bands', ['band'], warnings)) {
+    const missingNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing name',
+      `SELECT count(*)::int AS bands_missing_name
+       FROM music_bands
+       WHERE trim(coalesce(band, '')) = ''`
+    );
+    bands.bands_missing_name = toIntegerCount(firstDiagnosticRow(missingNameResult).bands_missing_name);
+
+    const missingNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing name samples',
+      `SELECT id, band_id
+       FROM music_bands
+       WHERE trim(coalesce(band, '')) = ''
+       ORDER BY id ASC
+       LIMIT 10`
+    );
+    samples.bands_missing_name = diagnosticRows(missingNameSamples);
+
+    const duplicateNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music band names',
+      `SELECT count(*)::int AS duplicate_band_names
+       FROM (
+         SELECT lower(trim(band)) AS band_key
+         FROM music_bands
+         WHERE trim(coalesce(band, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    bands.duplicate_band_names = toIntegerCount(firstDiagnosticRow(duplicateNameResult).duplicate_band_names);
+
+    const duplicateNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music band name samples',
+      `SELECT lower(trim(band)) AS band, count(*)::int AS count
+       FROM music_bands
+       WHERE trim(coalesce(band, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, band ASC
+       LIMIT 10`
+    );
+    samples.duplicate_band_names = diagnosticRows(duplicateNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_bands', ['status'], warnings)) {
+    const missingStatusResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing status',
+      `SELECT count(*)::int AS bands_missing_status
+       FROM music_bands
+       WHERE trim(coalesce(status, '')) = ''`
+    );
+    bands.bands_missing_status = toIntegerCount(firstDiagnosticRow(missingStatusResult).bands_missing_status);
+
+    const missingStatusSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing status samples',
+      `SELECT band_id, band
+       FROM music_bands
+       WHERE trim(coalesce(status, '')) = ''
+       ORDER BY band ASC
+       LIMIT 10`
+    );
+    samples.bands_missing_status = diagnosticRows(missingStatusSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_bands', ['region'], warnings)) {
+    const missingRegionResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing region',
+      `SELECT count(*)::int AS bands_missing_region
+       FROM music_bands
+       WHERE trim(coalesce(region, '')) = ''`
+    );
+    bands.bands_missing_region = toIntegerCount(firstDiagnosticRow(missingRegionResult).bands_missing_region);
+
+    const missingRegionSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands missing region samples',
+      `SELECT band_id, band
+       FROM music_bands
+       WHERE trim(coalesce(region, '')) = ''
+       ORDER BY band ASC
+       LIMIT 10`
+    );
+    samples.bands_missing_region = diagnosticRows(missingRegionSamples);
+  }
+
+  bands.samples = samples;
+}
+
+async function addMusicShowDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('music_shows')) {
+    warnings.push('Missing table: music_shows');
+    return;
+  }
+
+  const shows = response.shows;
+  const samples = {};
+  const totalResult = await runMusicDiagnosticQuery(
+    warnings,
+    'music show totals',
+    `SELECT count(*)::int AS total_shows FROM music_shows`
+  );
+  shows.total_shows = toIntegerCount(firstDiagnosticRow(totalResult).total_shows);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['name'], warnings)) {
+    const missingNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music shows missing show name',
+      `SELECT count(*)::int AS shows_missing_show_name
+       FROM music_shows
+       WHERE trim(coalesce(name, '')) = ''`
+    );
+    shows.shows_missing_show_name = toIntegerCount(firstDiagnosticRow(missingNameResult).shows_missing_show_name);
+
+    const missingNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music shows missing show name samples',
+      `SELECT show_id, date, venue, city, state
+       FROM music_shows
+       WHERE trim(coalesce(name, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.shows_missing_show_name = diagnosticRows(missingNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['date'], warnings)) {
+    const missingDateResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music shows missing date',
+      `SELECT count(*)::int AS shows_missing_date
+       FROM music_shows
+       WHERE trim(coalesce(date, '')) = ''`
+    );
+    shows.shows_missing_date = toIntegerCount(firstDiagnosticRow(missingDateResult).shows_missing_date);
+
+    const missingDateSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music shows missing date samples',
+      `SELECT show_id, name, venue, city, state
+       FROM music_shows
+       WHERE trim(coalesce(date, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.shows_missing_date = diagnosticRows(missingDateSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['venue'], warnings)) {
+    const missingVenueResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music shows missing venue',
+      `SELECT count(*)::int AS shows_missing_venue
+       FROM music_shows
+       WHERE trim(coalesce(venue, '')) = ''`
+    );
+    shows.shows_missing_venue = toIntegerCount(firstDiagnosticRow(missingVenueResult).shows_missing_venue);
+
+    const missingVenueSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music shows missing venue samples',
+      `SELECT show_id, name, date, city, state
+       FROM music_shows
+       WHERE trim(coalesce(venue, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.shows_missing_venue = diagnosticRows(missingVenueSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['show_id'], warnings)) {
+    const duplicateShowKeyResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music show keys',
+      `SELECT count(*)::int AS duplicate_show_keys
+       FROM (
+         SELECT show_id
+         FROM music_shows
+         WHERE show_id IS NOT NULL
+         GROUP BY show_id
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    shows.duplicate_show_keys = toIntegerCount(firstDiagnosticRow(duplicateShowKeyResult).duplicate_show_keys);
+
+    const duplicateShowKeySamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music show key samples',
+      `SELECT show_id, count(*)::int AS count
+       FROM music_shows
+       WHERE show_id IS NOT NULL
+       GROUP BY show_id
+       HAVING count(*) > 1
+       ORDER BY count DESC, show_id ASC
+       LIMIT 10`
+    );
+    samples.duplicate_show_keys = diagnosticRows(duplicateShowKeySamples);
+  }
+
+  shows.samples = samples;
+}
+
+async function addMusicPeopleDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('music_people')) {
+    warnings.push('Missing table: music_people');
+    return;
+  }
+
+  const people = response.people;
+  const samples = {};
+  const totalResult = await runMusicDiagnosticQuery(
+    warnings,
+    'music people totals',
+    `SELECT count(*)::int AS total_people FROM music_people`
+  );
+  people.total_people = toIntegerCount(firstDiagnosticRow(totalResult).total_people);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['person_id'], warnings)) {
+    const missingIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music people missing ID',
+      `SELECT count(*)::int AS people_missing_id
+       FROM music_people
+       WHERE person_id IS NULL`
+    );
+    people.people_missing_id = toIntegerCount(firstDiagnosticRow(missingIdResult).people_missing_id);
+
+    const missingIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music people missing ID samples',
+      `SELECT id, name, category
+       FROM music_people
+       WHERE person_id IS NULL
+       ORDER BY name ASC
+       LIMIT 10`
+    );
+    samples.people_missing_id = diagnosticRows(missingIdSamples);
+
+    const duplicateIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music person IDs',
+      `SELECT count(*)::int AS duplicate_person_ids
+       FROM (
+         SELECT person_id
+         FROM music_people
+         WHERE person_id IS NOT NULL
+         GROUP BY person_id
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    people.duplicate_person_ids = toIntegerCount(firstDiagnosticRow(duplicateIdResult).duplicate_person_ids);
+
+    const duplicateIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music person ID samples',
+      `SELECT person_id, count(*)::int AS count
+       FROM music_people
+       WHERE person_id IS NOT NULL
+       GROUP BY person_id
+       HAVING count(*) > 1
+       ORDER BY count DESC, person_id ASC
+       LIMIT 10`
+    );
+    samples.duplicate_person_ids = diagnosticRows(duplicateIdSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['name'], warnings)) {
+    const missingNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music people missing name',
+      `SELECT count(*)::int AS people_missing_name
+       FROM music_people
+       WHERE trim(coalesce(name, '')) = ''`
+    );
+    people.people_missing_name = toIntegerCount(firstDiagnosticRow(missingNameResult).people_missing_name);
+
+    const missingNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music people missing name samples',
+      `SELECT id, person_id, category
+       FROM music_people
+       WHERE trim(coalesce(name, '')) = ''
+       ORDER BY person_id ASC
+       LIMIT 10`
+    );
+    samples.people_missing_name = diagnosticRows(missingNameSamples);
+
+    const duplicateNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music person names',
+      `SELECT count(*)::int AS duplicate_person_names
+       FROM (
+         SELECT lower(trim(name)) AS name_key
+         FROM music_people
+         WHERE trim(coalesce(name, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    people.duplicate_person_names = toIntegerCount(firstDiagnosticRow(duplicateNameResult).duplicate_person_names);
+
+    const duplicateNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music person name samples',
+      `SELECT lower(trim(name)) AS name, count(*)::int AS count
+       FROM music_people
+       WHERE trim(coalesce(name, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, name ASC
+       LIMIT 10`
+    );
+    samples.duplicate_person_names = diagnosticRows(duplicateNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['category'], warnings)) {
+    const missingCategoryResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music people missing category',
+      `SELECT count(*)::int AS people_missing_category
+       FROM music_people
+       WHERE trim(coalesce(category, '')) = ''`
+    );
+    people.people_missing_category = toIntegerCount(firstDiagnosticRow(missingCategoryResult).people_missing_category);
+
+    const missingCategorySamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music people missing category samples',
+      `SELECT person_id, name
+       FROM music_people
+       WHERE trim(coalesce(category, '')) = ''
+       ORDER BY name ASC
+       LIMIT 10`
+    );
+    samples.people_missing_category = diagnosticRows(missingCategorySamples);
+  }
+
+  people.samples = samples;
+}
+
+async function addMusicVenueDiagnostics(response, existingTables, columnsByTable, warnings) {
+  if (!existingTables.has('music_venues')) {
+    warnings.push('Missing table: music_venues');
+    return;
+  }
+
+  const venues = response.venues;
+  const samples = {};
+  const totalResult = await runMusicDiagnosticQuery(
+    warnings,
+    'music venue totals',
+    `SELECT count(*)::int AS total_venues FROM music_venues`
+  );
+  venues.total_venues = toIntegerCount(firstDiagnosticRow(totalResult).total_venues);
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_id'], warnings)) {
+    const missingIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing ID',
+      `SELECT count(*)::int AS venues_missing_id
+       FROM music_venues
+       WHERE venue_id IS NULL`
+    );
+    venues.venues_missing_id = toIntegerCount(firstDiagnosticRow(missingIdResult).venues_missing_id);
+
+    const missingIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing ID samples',
+      `SELECT id, venue, city, state
+       FROM music_venues
+       WHERE venue_id IS NULL
+       ORDER BY venue ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_id = diagnosticRows(missingIdSamples);
+
+    const duplicateIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music venue IDs',
+      `SELECT count(*)::int AS duplicate_venue_ids
+       FROM (
+         SELECT venue_id
+         FROM music_venues
+         WHERE venue_id IS NOT NULL
+         GROUP BY venue_id
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    venues.duplicate_venue_ids = toIntegerCount(firstDiagnosticRow(duplicateIdResult).duplicate_venue_ids);
+
+    const duplicateIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music venue ID samples',
+      `SELECT venue_id, count(*)::int AS count
+       FROM music_venues
+       WHERE venue_id IS NOT NULL
+       GROUP BY venue_id
+       HAVING count(*) > 1
+       ORDER BY count DESC, venue_id ASC
+       LIMIT 10`
+    );
+    samples.duplicate_venue_ids = diagnosticRows(duplicateIdSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue'], warnings)) {
+    const missingNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing name',
+      `SELECT count(*)::int AS venues_missing_name
+       FROM music_venues
+       WHERE trim(coalesce(venue, '')) = ''`
+    );
+    venues.venues_missing_name = toIntegerCount(firstDiagnosticRow(missingNameResult).venues_missing_name);
+
+    const missingNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing name samples',
+      `SELECT venue_id, city, state
+       FROM music_venues
+       WHERE trim(coalesce(venue, '')) = ''
+       ORDER BY venue_id ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_name = diagnosticRows(missingNameSamples);
+
+    const duplicateNameResult = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music venue names',
+      `SELECT count(*)::int AS duplicate_venue_names
+       FROM (
+         SELECT lower(trim(venue)) AS venue_key
+         FROM music_venues
+         WHERE trim(coalesce(venue, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       ) duplicates`
+    );
+    venues.duplicate_venue_names = toIntegerCount(firstDiagnosticRow(duplicateNameResult).duplicate_venue_names);
+
+    const duplicateNameSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'duplicate music venue name samples',
+      `SELECT lower(trim(venue)) AS venue, count(*)::int AS count
+       FROM music_venues
+       WHERE trim(coalesce(venue, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, venue ASC
+       LIMIT 10`
+    );
+    samples.duplicate_venue_names = diagnosticRows(duplicateNameSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['city'], warnings)) {
+    const missingCityResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing city',
+      `SELECT count(*)::int AS venues_missing_city
+       FROM music_venues
+       WHERE trim(coalesce(city, '')) = ''`
+    );
+    venues.venues_missing_city = toIntegerCount(firstDiagnosticRow(missingCityResult).venues_missing_city);
+
+    const missingCitySamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing city samples',
+      `SELECT venue_id, venue, state
+       FROM music_venues
+       WHERE trim(coalesce(city, '')) = ''
+       ORDER BY venue ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_city = diagnosticRows(missingCitySamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['state'], warnings)) {
+    const missingStateResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing state',
+      `SELECT count(*)::int AS venues_missing_state
+       FROM music_venues
+       WHERE trim(coalesce(state, '')) = ''`
+    );
+    venues.venues_missing_state = toIntegerCount(firstDiagnosticRow(missingStateResult).venues_missing_state);
+
+    const missingStateSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venues missing state samples',
+      `SELECT venue_id, venue, city
+       FROM music_venues
+       WHERE trim(coalesce(state, '')) = ''
+       ORDER BY venue ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_state = diagnosticRows(missingStateSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['gps_lat', 'gps_lng'], warnings)) {
+    const gpsResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue GPS',
+      `SELECT
+         count(*) FILTER (WHERE trim(coalesce(gps_lat, '')) <> '' AND trim(coalesce(gps_lng, '')) <> '')::int AS venues_with_gps,
+         count(*) FILTER (WHERE trim(coalesce(gps_lat, '')) = '' OR trim(coalesce(gps_lng, '')) = '')::int AS venues_missing_gps
+       FROM music_venues`
+    );
+    const gps = firstDiagnosticRow(gpsResult);
+    venues.venues_with_gps = toIntegerCount(gps.venues_with_gps);
+    venues.venues_missing_gps = toIntegerCount(gps.venues_missing_gps);
+
+    const missingGpsSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue missing GPS samples',
+      `SELECT venue_id, venue, city, state
+       FROM music_venues
+       WHERE trim(coalesce(gps_lat, '')) = '' OR trim(coalesce(gps_lng, '')) = ''
+       ORDER BY venue ASC
+       LIMIT 10`
+    );
+    samples.venues_missing_gps = diagnosticRows(missingGpsSamples);
+  }
+
+  venues.samples = samples;
+}
+
+async function addMusicRelationshipDiagnostics(response, existingTables, columnsByTable, warnings) {
+  const relationships = response.relationships;
+  const samples = {};
+
+  if (existingTables.has('music_shows') && warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['venue'], warnings)) {
+    const missingVenueResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music relationship shows missing venue',
+      `SELECT count(*)::int AS shows_missing_venue
+       FROM music_shows
+       WHERE trim(coalesce(venue, '')) = ''`
+    );
+    relationships.shows_missing_venue = toIntegerCount(firstDiagnosticRow(missingVenueResult).shows_missing_venue);
+
+    const missingVenueSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music relationship shows missing venue samples',
+      `SELECT show_id, name, date, city, state
+       FROM music_shows
+       WHERE trim(coalesce(venue, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    samples.shows_missing_venue = diagnosticRows(missingVenueSamples);
+  } else if (!existingTables.has('music_shows')) {
+    warnings.push('Missing table for music relationship diagnostics: music_shows');
+  }
+
+  if (
+    existingTables.has('music_shows') &&
+    existingTables.has('music_venues') &&
+    warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['venue'], warnings) &&
+    warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue'], warnings)
+  ) {
+    const unmatchedVenueResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music unmatched venue names',
+      `WITH show_venues AS (
+         SELECT DISTINCT trim(venue) AS venue
+         FROM music_shows
+         WHERE trim(coalesce(venue, '')) <> ''
+       )
+       SELECT coalesce(array_agg(sv.venue ORDER BY sv.venue), '{}'::text[]) AS unmatched_venue_names
+       FROM show_venues sv
+       LEFT JOIN music_venues mv
+         ON lower(trim(coalesce(mv.venue, ''))) = lower(trim(sv.venue))
+       WHERE mv.venue IS NULL`
+    );
+    const unmatchedVenueNames = firstDiagnosticRow(unmatchedVenueResult).unmatched_venue_names;
+    relationships.unmatched_venue_names = Array.isArray(unmatchedVenueNames) ? unmatchedVenueNames.slice(0, 100) : [];
+
+    const unmatchedVenueSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music unmatched venue samples',
+      `SELECT ms.show_id, ms.name, ms.date, ms.venue, ms.city, ms.state
+       FROM music_shows ms
+       LEFT JOIN music_venues mv
+         ON lower(trim(coalesce(mv.venue, ''))) = lower(trim(coalesce(ms.venue, '')))
+       WHERE trim(coalesce(ms.venue, '')) <> ''
+         AND mv.venue IS NULL
+       ORDER BY ms.show_id ASC
+       LIMIT 10`
+    );
+    samples.unmatched_venue_names = diagnosticRows(unmatchedVenueSamples);
+  } else if (!existingTables.has('music_venues')) {
+    warnings.push('Unable to validate music show venue names because music_venues is missing.');
+  }
+
+  if (
+    existingTables.has('music_bands') &&
+    existingTables.has('music_people') &&
+    warnMissingDiagnosticColumns(columnsByTable, 'music_bands', ['band'], warnings) &&
+    warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['bands'], warnings)
+  ) {
+    const bandsWithoutPeopleResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands without people links',
+      `WITH person_bands AS (
+         SELECT DISTINCT lower(trim(band_item->>'band')) AS band_key
+         FROM music_people
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(bands) = 'array' THEN bands ELSE '[]'::jsonb END) AS band_item
+         WHERE trim(coalesce(band_item->>'band', '')) <> ''
+       )
+       SELECT count(*)::int AS bands_without_people_if_detectable
+       FROM music_bands mb
+       LEFT JOIN person_bands pb
+         ON lower(trim(coalesce(mb.band, ''))) = pb.band_key
+       WHERE trim(coalesce(mb.band, '')) <> ''
+         AND pb.band_key IS NULL`
+    );
+    relationships.bands_without_people_if_detectable = toIntegerCount(firstDiagnosticRow(bandsWithoutPeopleResult).bands_without_people_if_detectable);
+
+    const bandsWithoutPeopleSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music bands without people link samples',
+      `WITH person_bands AS (
+         SELECT DISTINCT lower(trim(band_item->>'band')) AS band_key
+         FROM music_people
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(bands) = 'array' THEN bands ELSE '[]'::jsonb END) AS band_item
+         WHERE trim(coalesce(band_item->>'band', '')) <> ''
+       )
+       SELECT mb.band_id, mb.band
+       FROM music_bands mb
+       LEFT JOIN person_bands pb
+         ON lower(trim(coalesce(mb.band, ''))) = pb.band_key
+       WHERE trim(coalesce(mb.band, '')) <> ''
+         AND pb.band_key IS NULL
+       ORDER BY mb.band ASC
+       LIMIT 10`
+    );
+    samples.bands_without_people_if_detectable = diagnosticRows(bandsWithoutPeopleSamples);
+  } else if (!existingTables.has('music_bands') || !existingTables.has('music_people')) {
+    warnings.push('Unable to detect music bands without people because music_bands or music_people is missing.');
+  }
+
+  if (existingTables.has('music_people') && warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['bands'], warnings)) {
+    const peopleWithoutBandsResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music people without band links',
+      `SELECT count(*)::int AS people_without_band_links_if_detectable
+       FROM music_people
+       WHERE CASE
+         WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
+         ELSE 0
+       END = 0`
+    );
+    relationships.people_without_band_links_if_detectable = toIntegerCount(firstDiagnosticRow(peopleWithoutBandsResult).people_without_band_links_if_detectable);
+
+    const peopleWithoutBandsSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music people without band link samples',
+      `SELECT person_id, name, category
+       FROM music_people
+       WHERE CASE
+         WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
+         ELSE 0
+       END = 0
+       ORDER BY name ASC
+       LIMIT 10`
+    );
+    samples.people_without_band_links_if_detectable = diagnosticRows(peopleWithoutBandsSamples);
+  } else if (!existingTables.has('music_people')) {
+    warnings.push('Unable to detect music people without band links because music_people is missing.');
+  }
+
+  relationships.samples = samples;
+}
+
+async function buildMusicDiagnosticsResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const response = {
+    ok: true,
+    route: '/api/admin/diagnostics/music',
+    source: 'postgres',
+    section: 'music',
+    type: 'diagnostics',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    summary: {
+      database_connected: false,
+      tables: {
+        music_bands: false,
+        music_shows: false,
+        music_people: false,
+        music_venues: false
+      },
+      warning_count: 0,
+      warnings
+    },
+    bands: {},
+    shows: {},
+    people: {},
+    venues: {},
+    relationships: {}
+  };
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable.');
+    response.summary.warning_count = warnings.length;
+    return response;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+    response.summary.database_connected = true;
+  } catch (err) {
+    warnings.push(`Database disconnected: ${err && err.message ? err.message : String(err)}`);
+    response.summary.warning_count = warnings.length;
+    return response;
+  }
+
+  let existingTables;
+  let columnsByTable;
+  try {
+    existingTables = await getExistingPublicTables(MUSIC_DIAGNOSTIC_TABLES);
+    columnsByTable = await getExistingPublicColumns(MUSIC_DIAGNOSTIC_TABLES);
+  } catch (err) {
+    warnings.push(`Unable to inspect music tables: ${err && err.message ? err.message : String(err)}`);
+    response.summary.warning_count = warnings.length;
+    return response;
+  }
+
+  MUSIC_DIAGNOSTIC_TABLES.forEach((tableName) => {
+    response.summary.tables[tableName] = existingTables.has(tableName);
+  });
+
+  await addMusicBandDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addMusicShowDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addMusicPeopleDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addMusicVenueDiagnostics(response, existingTables, columnsByTable, warnings);
+  await addMusicRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
+
+  response.summary.warning_count = warnings.length;
+  return response;
 }
 
 async function addWrestlingVenueDiagnostics(response, existingTables, columnsByTable, warnings) {
@@ -6042,6 +6865,21 @@ app.get('/api/status/music', async (req, res) => {
     res.status(500).json({
       ok: false,
       route: '/api/status/music',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
+app.get('/api/admin/diagnostics/music', async (req, res) => {
+  try {
+    res.json(await buildMusicDiagnosticsResponse());
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/diagnostics/music',
+      source: 'postgres',
+      section: 'music',
+      type: 'diagnostics',
       error: err && err.message ? err.message : String(err)
     });
   }
