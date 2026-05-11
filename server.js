@@ -2827,9 +2827,7 @@ function createEmptyWrestlingVenueGeo() {
     osm_url: null,
     geohash: null,
     elevation: null,
-    venue_image: null,
-    nearby_airports: [],
-    weather_region: null
+    venue_image: null
   };
 }
 
@@ -2892,11 +2890,11 @@ function encodeWrestlingVenueGeohash(latitude, longitude, precision = 6) {
 }
 
 function buildPhase1WrestlingVenueGeo(latitude, longitude, existingGeo) {
-  const geo = {
-    ...createEmptyWrestlingVenueGeo(),
-    ...(existingGeo && typeof existingGeo === 'object' ? existingGeo : {})
-  };
-  if (!Array.isArray(geo.nearby_airports)) geo.nearby_airports = [];
+  const geo = createEmptyWrestlingVenueGeo();
+  const existing = existingGeo && typeof existingGeo === 'object' ? existingGeo : {};
+  Object.keys(geo).forEach((key) => {
+    if (existing[key] != null) geo[key] = existing[key];
+  });
 
   const coords = getValidWrestlingVenueCoordinates(latitude, longitude);
   if (!coords) {
