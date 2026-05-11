@@ -259,6 +259,29 @@ ALTER TABLE IF EXISTS system_import_logs
 CREATE INDEX IF NOT EXISTS system_import_logs_area_route_finished_at_idx
     ON system_import_logs (area, route, finished_at DESC);
 
+CREATE TABLE IF NOT EXISTS import_history (
+    id SERIAL PRIMARY KEY,
+    section TEXT NOT NULL,
+    category TEXT NOT NULL,
+    source TEXT,
+    status TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    duration_ms INTEGER,
+    rows_imported INTEGER DEFAULT 0,
+    rows_skipped INTEGER DEFAULT 0,
+    warnings JSONB DEFAULT '[]'::jsonb,
+    errors JSONB DEFAULT '[]'::jsonb,
+    meta JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS import_history_section_category_started_at_idx
+    ON import_history (section, category, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS import_history_status_started_at_idx
+    ON import_history (status, started_at DESC);
+
 CREATE TABLE IF NOT EXISTS wrestling_shows (
     id SERIAL PRIMARY KEY,
     show_id INTEGER UNIQUE NOT NULL,

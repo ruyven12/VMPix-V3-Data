@@ -4988,7 +4988,433 @@ function getImportLogRowsWritten(result) {
   if (result.upserted != null) return toIntegerCount(result.upserted);
   if (result.importedRows != null) return toIntegerCount(result.importedRows);
   if (result.rowsInserted != null) return toIntegerCount(result.rowsInserted);
+  if (result.imported != null) return toIntegerCount(result.imported);
   return 0;
+}
+
+function getImportHistoryRowsSkipped(result) {
+  if (!result || typeof result !== 'object') return 0;
+  if (result.skipped != null) return toIntegerCount(result.skipped);
+  return 0;
+}
+
+function normalizeImportHistoryArray(value) {
+  if (Array.isArray(value)) return value.filter((item) => item != null).map((item) => String(item));
+  if (value == null || value === '') return [];
+  return [String(value)];
+}
+
+function getImportHistoryWarnings(result) {
+  if (!result || typeof result !== 'object') return [];
+  return normalizeImportHistoryArray(result.warnings || result.warning);
+}
+
+function getImportHistoryErrors(result) {
+  if (!result || typeof result !== 'object') return [];
+  return normalizeImportHistoryArray(result.errors || result.error);
+}
+
+function getImportHistoryCategory(config) {
+  if (config.category) return String(config.category).trim();
+  const routeParts = String(config.route || '').split('/').filter(Boolean);
+  return routeParts[routeParts.length - 1] || 'unknown';
+}
+
+function buildImportHistoryMeta(config, req, result) {
+  const meta = {
+    route: config.route,
+    refresh: !!(req && req.query && req.query.refresh === '1'),
+    table: result && result.table ? result.table : null,
+    source_type: 'google_sheets'
+  };
+
+  if (result && typeof result === 'object') {
+    [
+      'rowsRead',
+      'upserted',
+      'importedRows',
+      'imported',
+      'skipped',
+      'matchesTotal',
+      'bandsTotal',
+      'peopleTotal',
+      'venuesTotal',
+      'duplicatesCombined',
+      'generatedBandIds',
+      'generatedVenueIds'
+    ].forEach((key) => {
+      if (result[key] != null) meta[key] = result[key];
+    });
+  }
+
+  Object.keys(meta).forEach((key) => {
+    if (meta[key] == null) delete meta[key];
+  });
+
+  return meta;
+}
+
+let importHistoryTableEnsured = false;
+
+async function ensureImportHistoryTable() {
+  if (importHistoryTableEnsured) return true;
+  if (!String(process.env.DATABASE_URL || '').trim()) return false;
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS import_history (
+      id SERIAL PRIMARY KEY,
+      section TEXT NOT NULL,
+      category TEXT NOT NULL,
+      source TEXT,
+      status TEXT NOT NULL,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at TIMESTAMPTZ,
+      duration_ms INTEGER,
+      rows_imported INTEGER DEFAULT 0,
+      rows_skipped INTEGER DEFAULT 0,
+      warnings JSONB DEFAULT '[]'::jsonb,
+      errors JSONB DEFAULT '[]'::jsonb,
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS import_history_section_category_started_at_idx
+      ON import_history (section, category, started_at DESC)
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS import_history_status_started_at_idx
+      ON import_history (status, started_at DESC)
+  `);
+
+  importHistoryTableEnsured = true;
+  return true;
+}
+
+async function startImportHistory({ section, category, source, meta }) {
+  try {
+    const ready = await ensureImportHistoryTable();
+    if (!ready) return null;
+
+    const result = await dbPool.query(`
+      INSERT INTO import_history (
+        section,
+        category,
+        source,
+        status,
+        meta
+      )
+      VALUES ($1, $2, $3, $4, $5::jsonb)
+      RETURNING id, started_at
+    `, [
+      section,
+      category,
+      source || null,
+      'running',
+      JSON.stringify(meta && typeof meta === 'object' ? meta : {})
+    ]);
+
+    return result.rows && result.rows[0] ? result.rows[0] : null;
+  } catch (err) {
+    console.warn('Import history start failed:', err && err.message ? err.message : String(err));
+    return null;
+  }
+}
+
+async function finishImportHistory(id, details) {
+  if (!id) return null;
+
+  try {
+    const ready = await ensureImportHistoryTable();
+    if (!ready) return null;
+
+    const result = await dbPool.query(`
+      UPDATE import_history
+      SET
+        status = $2,
+        finished_at = NOW(),
+        duration_ms = GREATEST(0, floor(EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000)::int),
+        rows_imported = $3,
+        rows_skipped = $4,
+        warnings = $5::jsonb,
+        errors = $6::jsonb,
+        meta = coalesce(meta, '{}'::jsonb) || $7::jsonb
+      WHERE id = $1
+      RETURNING id, status, duration_ms, started_at, finished_at
+    `, [
+      id,
+      details.status || 'success',
+      toIntegerCount(details.rowsImported),
+      toIntegerCount(details.rowsSkipped),
+      JSON.stringify(normalizeImportHistoryArray(details.warnings)),
+      JSON.stringify(normalizeImportHistoryArray(details.errors)),
+      JSON.stringify(details.meta && typeof details.meta === 'object' ? details.meta : {})
+    ]);
+
+    return result.rows && result.rows[0] ? {
+      id: result.rows[0].id,
+      status: result.rows[0].status,
+      duration_ms: toIntegerCount(result.rows[0].duration_ms)
+    } : null;
+  } catch (err) {
+    console.warn('Import history finish failed:', err && err.message ? err.message : String(err));
+    return null;
+  }
+}
+
+function getImportSyncStatus(status) {
+  const clean = String(status || '').trim().toLowerCase();
+  if (clean === 'success') return 'healthy';
+  if (clean === 'warning') return 'warning';
+  if (clean === 'failed' || clean === 'error') return 'failed';
+  return 'unknown';
+}
+
+function buildImportHistoryApiItem(row) {
+  return {
+    id: toIntegerCount(row.id),
+    section: row.section || '',
+    category: row.category || '',
+    source: row.source || '',
+    status: row.status || '',
+    sync_health: getImportSyncStatus(row.status),
+    started_at: formatStatusTimestamp(row.started_at),
+    finished_at: formatStatusTimestamp(row.finished_at),
+    duration_ms: row.duration_ms == null ? null : toIntegerCount(row.duration_ms),
+    rows_imported: toIntegerCount(row.rows_imported),
+    rows_skipped: toIntegerCount(row.rows_skipped),
+    warnings: Array.isArray(row.warnings) ? row.warnings : [],
+    errors: Array.isArray(row.errors) ? row.errors : [],
+    meta: row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta) ? row.meta : {},
+    created_at: formatStatusTimestamp(row.created_at)
+  };
+}
+
+function buildImportHistoryQueryOptions(query, fixedSection) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const section = fixedSection || String(query.section || '').trim();
+  const category = String(query.category || '').trim();
+  const status = String(query.status || '').trim();
+
+  if (section) {
+    values.push(section.toLowerCase());
+    where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+    filters.section = section;
+  }
+
+  if (category) {
+    values.push(category.toLowerCase());
+    where.push(`lower(trim(coalesce(category, ''))) = $${values.length}`);
+    filters.category = category;
+  }
+
+  if (status) {
+    values.push(status.toLowerCase());
+    where.push(`lower(trim(coalesce(status, ''))) = $${values.length}`);
+    filters.status = status;
+  }
+
+  return {
+    values,
+    filters,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : ''
+  };
+}
+
+async function handleImportHistoryRequest(req, res, fixedSection) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    await ensureImportHistoryTable();
+
+    const limit = getClampedLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const options = buildImportHistoryQueryOptions(req.query, fixedSection);
+    const countResult = await dbPool.query(
+      `SELECT count(*)::int AS total FROM import_history ${options.whereSql}`,
+      options.values
+    );
+    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const dataValues = options.values.concat([limit, offset]);
+    const limitIdx = dataValues.length - 1;
+    const offsetIdx = dataValues.length;
+    const result = await dbPool.query(
+      `SELECT
+         id,
+         section,
+         category,
+         source,
+         status,
+         started_at,
+         finished_at,
+         duration_ms,
+         rows_imported,
+         rows_skipped,
+         warnings,
+         errors,
+         meta,
+         created_at
+       FROM import_history
+       ${options.whereSql}
+       ORDER BY started_at DESC NULLS LAST, id DESC
+       LIMIT $${limitIdx}
+       OFFSET $${offsetIdx}`,
+      dataValues
+    );
+
+    res.json({
+      ok: true,
+      route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
+      count: result.rows.length,
+      total,
+      page,
+      limit,
+      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      filters: options.filters,
+      items: result.rows.map(buildImportHistoryApiItem)
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildLatestImportHistoryItems(section) {
+  const values = [];
+  const where = [];
+
+  if (section) {
+    values.push(section.toLowerCase());
+    where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const result = await dbPool.query(
+    `SELECT DISTINCT ON (section, category)
+       id,
+       section,
+       category,
+       source,
+       status,
+       started_at,
+       finished_at,
+       duration_ms,
+       rows_imported,
+       rows_skipped,
+       jsonb_array_length(CASE WHEN jsonb_typeof(warnings) = 'array' THEN warnings ELSE '[]'::jsonb END)::int AS warnings_count,
+       jsonb_array_length(CASE WHEN jsonb_typeof(errors) = 'array' THEN errors ELSE '[]'::jsonb END)::int AS errors_count
+     FROM import_history
+     ${whereSql}
+     ORDER BY section, category, started_at DESC NULLS LAST, id DESC`,
+    values
+  );
+
+  return result.rows.map((row) => ({
+    id: toIntegerCount(row.id),
+    section: row.section || '',
+    category: row.category || '',
+    source: row.source || '',
+    status: row.status || '',
+    sync_health: getImportSyncStatus(row.status),
+    started_at: formatStatusTimestamp(row.started_at),
+    finished_at: formatStatusTimestamp(row.finished_at),
+    duration_ms: row.duration_ms == null ? null : toIntegerCount(row.duration_ms),
+    rows_imported: toIntegerCount(row.rows_imported),
+    rows_skipped: toIntegerCount(row.rows_skipped),
+    warnings_count: toIntegerCount(row.warnings_count),
+    errors_count: toIntegerCount(row.errors_count)
+  }));
+}
+
+async function handleLatestImportHistoryRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    await ensureImportHistoryTable();
+    const generated = new Date();
+    res.json({
+      ok: true,
+      route: '/api/admin/import-history/latest',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      items: await buildLatestImportHistoryItems()
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/import-history/latest',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+function createEmptyImportHealth() {
+  return {
+    ok: true,
+    latestImports: [],
+    failingImportsLast24h: 0,
+    warningImportsLast24h: 0,
+    lastSuccessfulImportAt: null,
+    lastFailedImportAt: null
+  };
+}
+
+async function buildImportHealth(section) {
+  const health = createEmptyImportHealth();
+
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) return health;
+
+    const existingTables = await getExistingPublicTables(['import_history']);
+    if (!existingTables.has('import_history')) return health;
+
+    const values = [];
+    const where = [];
+    const sectionFilter = String(section || '').trim();
+    if (sectionFilter) {
+      values.push(sectionFilter.toLowerCase());
+      where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const latestItems = await buildLatestImportHistoryItems(sectionFilter || null);
+    const statusResult = await dbPool.query(
+      `SELECT
+         count(*) FILTER (
+           WHERE lower(trim(coalesce(status, ''))) IN ('failed', 'error')
+             AND started_at >= NOW() - INTERVAL '24 hours'
+         )::int AS failing_imports_last_24h,
+         count(*) FILTER (
+           WHERE lower(trim(coalesce(status, ''))) = 'warning'
+             AND started_at >= NOW() - INTERVAL '24 hours'
+         )::int AS warning_imports_last_24h,
+         max(finished_at) FILTER (WHERE lower(trim(coalesce(status, ''))) = 'success') AS last_successful_import_at,
+         max(finished_at) FILTER (WHERE lower(trim(coalesce(status, ''))) IN ('failed', 'error')) AS last_failed_import_at
+       FROM import_history
+       ${whereSql}`,
+      values
+    );
+    const status = statusResult.rows && statusResult.rows[0] ? statusResult.rows[0] : {};
+
+    health.latestImports = latestItems;
+    health.failingImportsLast24h = toIntegerCount(status.failing_imports_last_24h);
+    health.warningImportsLast24h = toIntegerCount(status.warning_imports_last_24h);
+    health.lastSuccessfulImportAt = formatStatusTimestamp(status.last_successful_import_at) || null;
+    health.lastFailedImportAt = formatStatusTimestamp(status.last_failed_import_at) || null;
+    return health;
+  } catch (err) {
+    console.warn('Import health read failed:', err && err.message ? err.message : String(err));
+    return health;
+  }
 }
 
 async function writeSystemImportLog(entry) {
@@ -5027,22 +5453,59 @@ async function writeSystemImportLog(entry) {
 async function runLoggedImport(req, res, config) {
   const startedAt = new Date();
   const area = config.area || 'music';
+  const category = getImportHistoryCategory(config);
+  const history = await startImportHistory({
+    section: area,
+    category,
+    source: config.source,
+    meta: {
+      route: config.route,
+      refresh: req.query.refresh === '1',
+      source_type: 'google_sheets'
+    }
+  });
 
   try {
     const forceRefresh = req.query.refresh === '1';
     const result = await config.importer(forceRefresh);
+    const historyWarnings = getImportHistoryWarnings(result);
+    const historyErrors = getImportHistoryErrors(result);
+    const historyStatus = historyErrors.length ? 'failed' : (historyWarnings.length ? 'warning' : 'success');
+    const importHistory = await finishImportHistory(history && history.id, {
+      status: historyStatus,
+      rowsImported: getImportLogRowsWritten(result),
+      rowsSkipped: getImportHistoryRowsSkipped(result),
+      warnings: historyWarnings,
+      errors: historyErrors,
+      meta: buildImportHistoryMeta(config, req, result)
+    });
     await writeSystemImportLog({
       area,
       route: config.route,
-      status: 'success',
+      status: historyStatus === 'failed' ? 'error' : historyStatus,
       rows_read: result && result.rowsRead,
       rows_inserted: getImportLogRowsWritten(result),
       rows_updated: 0,
       started_at: startedAt,
       finished_at: new Date()
     });
+    if (importHistory && result && typeof result === 'object') {
+      result.importHistory = importHistory;
+    }
     res.json(result);
   } catch (err) {
+    const importHistory = await finishImportHistory(history && history.id, {
+      status: 'failed',
+      rowsImported: 0,
+      rowsSkipped: 0,
+      warnings: [],
+      errors: [err && err.message ? err.message : String(err)],
+      meta: {
+        route: config.route,
+        refresh: req.query.refresh === '1',
+        source_type: 'google_sheets'
+      }
+    });
     await writeSystemImportLog({
       area,
       route: config.route,
@@ -5054,12 +5517,14 @@ async function runLoggedImport(req, res, config) {
       started_at: startedAt,
       finished_at: new Date()
     });
-    res.status(500).json({
+    const errorResponse = {
       ok: false,
       route: config.route,
       source: config.source,
       error: err && err.message ? err.message : String(err)
-    });
+    };
+    if (importHistory) errorResponse.importHistory = importHistory;
+    res.status(500).json(errorResponse);
   }
 }
 
@@ -6125,7 +6590,8 @@ async function buildMusicDiagnosticsResponse() {
     shows: {},
     people: {},
     venues: {},
-    relationships: {}
+    relationships: {},
+    importHealth: createEmptyImportHealth()
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -6163,6 +6629,7 @@ async function buildMusicDiagnosticsResponse() {
   await addMusicPeopleDiagnostics(response, existingTables, columnsByTable, warnings);
   await addMusicVenueDiagnostics(response, existingTables, columnsByTable, warnings);
   await addMusicRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
+  response.importHealth = await buildImportHealth('music');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -6688,7 +7155,8 @@ async function buildWrestlingDiagnosticsResponse() {
     matches: {},
     people: {},
     venues: {},
-    relationships: {}
+    relationships: {},
+    importHealth: createEmptyImportHealth()
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -6726,6 +7194,7 @@ async function buildWrestlingDiagnosticsResponse() {
   await addWrestlingMatchDiagnostics(response, existingTables, columnsByTable, warnings);
   await addWrestlingPeopleDiagnostics(response, existingTables, columnsByTable, warnings);
   await addWrestlingRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
+  response.importHealth = await buildImportHealth('wrestling');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -6831,10 +7300,12 @@ async function buildAdminDiagnosticsResponse() {
     },
     music: {},
     wrestling: {},
+    importHealth: createEmptyImportHealth(),
     warnings
   };
 
   response.database = await buildAdminDiagnosticsDatabaseSummary(warnings);
+  response.importHealth = await buildImportHealth();
 
   try {
     response.music = await buildMusicDiagnosticsResponse();
@@ -7026,6 +7497,22 @@ app.get('/api/status/music', async (req, res) => {
       error: err && err.message ? err.message : String(err)
     });
   }
+});
+
+app.get('/api/admin/import-history', async (req, res) => {
+  return handleImportHistoryRequest(req, res);
+});
+
+app.get('/api/admin/import-history/music', async (req, res) => {
+  return handleImportHistoryRequest(req, res, 'music');
+});
+
+app.get('/api/admin/import-history/wrestling', async (req, res) => {
+  return handleImportHistoryRequest(req, res, 'wrestling');
+});
+
+app.get('/api/admin/import-history/latest', async (req, res) => {
+  return handleLatestImportHistoryRequest(req, res);
 });
 
 app.get('/api/admin/diagnostics', async (req, res) => {
