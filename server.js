@@ -5714,6 +5714,716 @@ async function buildLockHealth(section) {
   }
 }
 
+const RELATIONSHIP_TABLES = [
+  'music_bands',
+  'music_shows',
+  'music_people',
+  'music_venues',
+  'wrestling_shows',
+  'wrestling_people',
+  'wrestling_venues'
+];
+
+function buildRelationshipItem({ section, type, severity, code, message, entity_id, entity_name, details }) {
+  return {
+    section,
+    type,
+    severity,
+    code,
+    message,
+    entity_id: entity_id == null ? '' : String(entity_id),
+    entity_name: entity_name == null ? '' : String(entity_name),
+    details: details && typeof details === 'object' ? details : {}
+  };
+}
+
+function summarizeRelationshipItems(items) {
+  return (items || []).reduce((summary, item) => {
+    const severity = String(item && item.severity || '').toLowerCase();
+    if (severity === 'error') summary.errors += 1;
+    else if (severity === 'warning') summary.warnings += 1;
+    else summary.info += 1;
+    return summary;
+  }, { errors: 0, warnings: 0, info: 0 });
+}
+
+function getRelationshipOverallHealth(summary, unknown) {
+  if (unknown) return 'unknown';
+  if (toIntegerCount(summary.errors) > 0) return 'failed';
+  if (toIntegerCount(summary.warnings) > 0) return 'warning';
+  return 'healthy';
+}
+
+function getRelationshipLimit(value) {
+  const limit = Number(String(value || '').trim());
+  if (!Number.isInteger(limit)) return 100;
+  return Math.min(100, Math.max(1, limit));
+}
+
+async function runRelationshipQuery(warnings, label, sql, params = []) {
+  try {
+    return await dbPool.query(sql, params);
+  } catch (err) {
+    warnings.push(`Unable to check ${label}: ${err && err.message ? err.message : String(err)}`);
+    return { rows: [] };
+  }
+}
+
+function relationshipHasTable(existingTables, tableName, warnings) {
+  if (existingTables.has(tableName)) return true;
+  warnings.push(`Missing table for relationship checks: ${tableName}`);
+  return false;
+}
+
+function relationshipHasColumns(columnsByTable, tableName, columnNames, warnings) {
+  return warnMissingDiagnosticColumns(columnsByTable, tableName, columnNames, warnings);
+}
+
+function buildRelationshipPeopleLookupSql(tableName, options = {}) {
+  const unions = [
+    `SELECT lower(trim(name)) AS lookup_key FROM ${tableName} WHERE trim(coalesce(name, '')) <> ''`
+  ];
+
+  if (options.aliases) {
+    unions.push(`
+      SELECT lower(trim(alias_item.value)) AS lookup_key
+      FROM ${tableName}
+      CROSS JOIN LATERAL unnest(coalesce(aliases, '{}'::text[])) AS alias_item(value)
+      WHERE trim(alias_item.value) <> ''
+    `);
+  }
+
+  if (options.teams) {
+    unions.push(`
+      SELECT lower(trim(team_item.value)) AS lookup_key
+      FROM ${tableName}
+      CROSS JOIN LATERAL unnest(coalesce(teams, '{}'::text[])) AS team_item(value)
+      WHERE trim(team_item.value) <> ''
+    `);
+  }
+
+  return unions.join(' UNION ');
+}
+
+async function addMusicRelationshipIssues(items, warnings, existingTables, columnsByTable) {
+  if (
+    relationshipHasTable(existingTables, 'music_shows', warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_shows', ['venue_id'], warnings)
+  ) {
+    const missingVenueIdResult = await runRelationshipQuery(
+      warnings,
+      'music shows missing venue_id',
+      `SELECT show_id, name, date, venue
+       FROM music_shows
+       WHERE trim(coalesce(venue_id::text, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingVenueIdResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'shows',
+        severity: 'error',
+        code: 'MISSING_VENUE_ID',
+        message: 'Music show is missing venue_id.',
+        entity_id: row.show_id,
+        entity_name: row.name,
+        details: { date: row.date || '', venue: row.venue || '' }
+      }));
+    });
+  }
+
+  if (
+    existingTables.has('music_shows') &&
+    existingTables.has('music_venues') &&
+    relationshipHasColumns(columnsByTable, 'music_shows', ['venue_id'], warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_venues', ['venue_id'], warnings)
+  ) {
+    const invalidVenueIdResult = await runRelationshipQuery(
+      warnings,
+      'music shows with invalid venue_id',
+      `SELECT ms.show_id, ms.name, ms.date, ms.venue_id, ms.venue
+       FROM music_shows ms
+       LEFT JOIN music_venues mv
+         ON trim(coalesce(ms.venue_id::text, '')) = trim(coalesce(mv.venue_id::text, ''))
+       WHERE trim(coalesce(ms.venue_id::text, '')) <> ''
+         AND mv.venue_id IS NULL
+       ORDER BY ms.show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(invalidVenueIdResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'shows',
+        severity: 'error',
+        code: 'INVALID_VENUE_ID',
+        message: 'Music show references a venue_id that does not exist in music_venues.',
+        entity_id: row.show_id,
+        entity_name: row.name,
+        details: { venue_id: row.venue_id == null ? '' : String(row.venue_id), venue: row.venue || '', date: row.date || '' }
+      }));
+    });
+  }
+
+  if (relationshipHasTable(existingTables, 'music_venues', warnings)) {
+    if (relationshipHasColumns(columnsByTable, 'music_venues', ['venue'], warnings)) {
+      const duplicateVenueResult = await runRelationshipQuery(
+        warnings,
+        'duplicate music venue names',
+        `SELECT lower(trim(venue)) AS name_key, min(venue) AS venue, count(*)::int AS count, array_agg(venue_id::text ORDER BY venue_id) AS venue_ids
+         FROM music_venues
+         WHERE trim(coalesce(venue, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+         ORDER BY count DESC, venue ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(duplicateVenueResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'venues',
+          severity: 'warning',
+          code: 'DUPLICATE_NAME',
+          message: 'Duplicate music venue name detected.',
+          entity_id: Array.isArray(row.venue_ids) ? row.venue_ids[0] : '',
+          entity_name: row.venue,
+          details: { count: toIntegerCount(row.count), venue_ids: Array.isArray(row.venue_ids) ? row.venue_ids : [] }
+        }));
+      });
+    }
+
+    if (relationshipHasColumns(columnsByTable, 'music_venues', ['city', 'state'], warnings)) {
+      const missingLocationResult = await runRelationshipQuery(
+        warnings,
+        'music venues missing city/state',
+        `SELECT venue_id, venue, city, state
+         FROM music_venues
+         WHERE trim(coalesce(city, '')) = ''
+            OR trim(coalesce(state, '')) = ''
+         ORDER BY venue ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingLocationResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'venues',
+          severity: 'warning',
+          code: 'MISSING_CITY_STATE',
+          message: 'Music venue is missing city or state.',
+          entity_id: row.venue_id,
+          entity_name: row.venue,
+          details: { city: row.city || '', state: row.state || '' }
+        }));
+      });
+    }
+
+    if (hasDiagnosticColumn(columnsByTable, 'music_venues', 'geo')) {
+      const missingGeoResult = await runRelationshipQuery(
+        warnings,
+        'music venues incomplete geo',
+        `SELECT venue_id, venue, geo
+         FROM music_venues
+         WHERE jsonb_typeof(geo) = 'object'
+           AND (
+             trim(coalesce(geo->>'geohash', '')) = ''
+             OR trim(coalesce(geo->>'google_maps_url', '')) = ''
+             OR trim(coalesce(geo->>'apple_maps_url', '')) = ''
+             OR trim(coalesce(geo->>'osm_url', '')) = ''
+           )
+         ORDER BY venue ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingGeoResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'venues',
+          severity: 'warning',
+          code: 'INCOMPLETE_GEO',
+          message: 'Music venue geo is missing geohash or map URLs.',
+          entity_id: row.venue_id,
+          entity_name: row.venue,
+          details: { geo: row.geo && typeof row.geo === 'object' ? row.geo : {} }
+        }));
+      });
+    }
+  }
+
+  if (
+    relationshipHasTable(existingTables, 'music_people', warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_people', ['name'], warnings)
+  ) {
+    const duplicatePeopleResult = await runRelationshipQuery(
+      warnings,
+      'duplicate music people names',
+      `SELECT lower(trim(name)) AS name_key, min(name) AS name, count(*)::int AS count, array_agg(person_id::text ORDER BY person_id) AS person_ids
+       FROM music_people
+       WHERE trim(coalesce(name, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, name ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(duplicatePeopleResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'people',
+        severity: 'warning',
+        code: 'DUPLICATE_NAME',
+        message: 'Duplicate music person name detected.',
+        entity_id: Array.isArray(row.person_ids) ? row.person_ids[0] : '',
+        entity_name: row.name,
+        details: { count: toIntegerCount(row.count), person_ids: Array.isArray(row.person_ids) ? row.person_ids : [] }
+      }));
+    });
+  }
+
+  if (
+    existingTables.has('music_shows') &&
+    existingTables.has('music_bands') &&
+    relationshipHasColumns(columnsByTable, 'music_shows', ['bands'], warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_bands', ['band'], warnings)
+  ) {
+    const missingBandResult = await runRelationshipQuery(
+      warnings,
+      'music show band references',
+      `WITH refs AS (
+         SELECT DISTINCT ms.show_id, ms.name, ms.date, band_item->>'band' AS band
+         FROM music_shows ms
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ms.bands) = 'array' THEN ms.bands ELSE '[]'::jsonb END) AS band_item
+         WHERE trim(coalesce(band_item->>'band', '')) <> ''
+       )
+       SELECT refs.show_id, refs.name, refs.date, refs.band
+       FROM refs
+       LEFT JOIN music_bands mb
+         ON lower(trim(coalesce(mb.band, ''))) = lower(trim(refs.band))
+       WHERE mb.band IS NULL
+       ORDER BY refs.show_id ASC, refs.band ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingBandResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'shows',
+        severity: 'error',
+        code: 'MISSING_BAND_REFERENCE',
+        message: 'Music show references a band that does not exist in music_bands.',
+        entity_id: row.show_id,
+        entity_name: row.name,
+        details: { band: row.band || '', date: row.date || '' }
+      }));
+    });
+  }
+}
+
+async function addWrestlingRelationshipIssues(items, warnings, existingTables, columnsByTable) {
+  if (
+    relationshipHasTable(existingTables, 'wrestling_shows', warnings) &&
+    relationshipHasColumns(columnsByTable, 'wrestling_shows', ['venue_id'], warnings)
+  ) {
+    const missingVenueIdResult = await runRelationshipQuery(
+      warnings,
+      'wrestling shows missing venue_id',
+      `SELECT show_id, show_name, date, venue_id
+       FROM wrestling_shows
+       WHERE trim(coalesce(venue_id, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingVenueIdResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'shows',
+        severity: 'error',
+        code: 'MISSING_VENUE_ID',
+        message: 'Wrestling show is missing venue_id.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { date: row.date || '' }
+      }));
+    });
+  }
+
+  if (
+    existingTables.has('wrestling_shows') &&
+    existingTables.has('wrestling_venues') &&
+    relationshipHasColumns(columnsByTable, 'wrestling_shows', ['venue_id'], warnings) &&
+    relationshipHasColumns(columnsByTable, 'wrestling_venues', ['venue_id'], warnings)
+  ) {
+    const invalidVenueIdResult = await runRelationshipQuery(
+      warnings,
+      'wrestling shows with invalid venue_id',
+      `SELECT ws.show_id, ws.show_name, ws.date, ws.venue_id
+       FROM wrestling_shows ws
+       LEFT JOIN wrestling_venues wv
+         ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+       WHERE trim(coalesce(ws.venue_id, '')) <> ''
+         AND wv.venue_id IS NULL
+       ORDER BY ws.show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(invalidVenueIdResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'shows',
+        severity: 'error',
+        code: 'INVALID_VENUE_ID',
+        message: 'Wrestling show references a venue_id that does not exist in wrestling_venues.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { venue_id: row.venue_id || '', date: row.date || '' }
+      }));
+    });
+  }
+
+  if (relationshipHasTable(existingTables, 'wrestling_venues', warnings)) {
+    if (relationshipHasColumns(columnsByTable, 'wrestling_venues', ['venue_name'], warnings)) {
+      const duplicateVenueResult = await runRelationshipQuery(
+        warnings,
+        'duplicate wrestling venue names',
+        `SELECT lower(trim(venue_name)) AS name_key, min(venue_name) AS venue_name, count(*)::int AS count, array_agg(venue_id ORDER BY venue_id) AS venue_ids
+         FROM wrestling_venues
+         WHERE trim(coalesce(venue_name, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+         ORDER BY count DESC, venue_name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(duplicateVenueResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'wrestling',
+          type: 'venues',
+          severity: 'warning',
+          code: 'DUPLICATE_NAME',
+          message: 'Duplicate wrestling venue name detected.',
+          entity_id: Array.isArray(row.venue_ids) ? row.venue_ids[0] : '',
+          entity_name: row.venue_name,
+          details: { count: toIntegerCount(row.count), venue_ids: Array.isArray(row.venue_ids) ? row.venue_ids : [] }
+        }));
+      });
+    }
+
+    if (relationshipHasColumns(columnsByTable, 'wrestling_venues', ['city', 'state'], warnings)) {
+      const missingLocationResult = await runRelationshipQuery(
+        warnings,
+        'wrestling venues missing city/state',
+        `SELECT venue_id, venue_name, city, state
+         FROM wrestling_venues
+         WHERE trim(coalesce(city, '')) = ''
+            OR trim(coalesce(state, '')) = ''
+         ORDER BY venue_name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingLocationResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'wrestling',
+          type: 'venues',
+          severity: 'warning',
+          code: 'MISSING_CITY_STATE',
+          message: 'Wrestling venue is missing city or state.',
+          entity_id: row.venue_id,
+          entity_name: row.venue_name,
+          details: { city: row.city || '', state: row.state || '' }
+        }));
+      });
+    }
+
+    if (relationshipHasColumns(columnsByTable, 'wrestling_venues', ['geo'], warnings)) {
+      const missingGeoResult = await runRelationshipQuery(
+        warnings,
+        'wrestling venues incomplete geo',
+        `SELECT venue_id, venue_name, geo
+         FROM wrestling_venues
+         WHERE jsonb_typeof(geo) = 'object'
+           AND (
+             trim(coalesce(geo->>'geohash', '')) = ''
+             OR trim(coalesce(geo->>'google_maps_url', '')) = ''
+             OR trim(coalesce(geo->>'apple_maps_url', '')) = ''
+             OR trim(coalesce(geo->>'osm_url', '')) = ''
+           )
+         ORDER BY venue_name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingGeoResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'wrestling',
+          type: 'venues',
+          severity: 'warning',
+          code: 'INCOMPLETE_GEO',
+          message: 'Wrestling venue geo is missing geohash or map URLs.',
+          entity_id: row.venue_id,
+          entity_name: row.venue_name,
+          details: { geo: row.geo && typeof row.geo === 'object' ? row.geo : {} }
+        }));
+      });
+    }
+  }
+
+  if (
+    relationshipHasTable(existingTables, 'wrestling_people', warnings) &&
+    relationshipHasColumns(columnsByTable, 'wrestling_people', ['name'], warnings)
+  ) {
+    const duplicatePeopleResult = await runRelationshipQuery(
+      warnings,
+      'duplicate wrestling people names',
+      `SELECT lower(trim(name)) AS name_key, min(name) AS name, count(*)::int AS count, array_agg(id::text ORDER BY id) AS person_ids
+       FROM wrestling_people
+       WHERE trim(coalesce(name, '')) <> ''
+       GROUP BY 1
+       HAVING count(*) > 1
+       ORDER BY count DESC, name ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(duplicatePeopleResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'people',
+        severity: 'warning',
+        code: 'DUPLICATE_NAME',
+        message: 'Duplicate wrestling person name detected.',
+        entity_id: Array.isArray(row.person_ids) ? row.person_ids[0] : '',
+        entity_name: row.name,
+        details: { count: toIntegerCount(row.count), person_ids: Array.isArray(row.person_ids) ? row.person_ids : [] }
+      }));
+    });
+  }
+
+  if (
+    existingTables.has('wrestling_shows') &&
+    existingTables.has('wrestling_people') &&
+    relationshipHasColumns(columnsByTable, 'wrestling_shows', ['matches'], warnings) &&
+    relationshipHasColumns(columnsByTable, 'wrestling_people', ['name'], warnings)
+  ) {
+    const hasAliases = hasDiagnosticColumn(columnsByTable, 'wrestling_people', 'aliases');
+    const hasTeams = hasDiagnosticColumn(columnsByTable, 'wrestling_people', 'teams');
+    const peopleLookupSql = buildRelationshipPeopleLookupSql('wrestling_people', { aliases: hasAliases, teams: hasTeams });
+    const peopleLookupNoTeamsSql = buildRelationshipPeopleLookupSql('wrestling_people', { aliases: hasAliases, teams: false });
+
+    const missingParticipantResult = await runRelationshipQuery(
+      warnings,
+      'wrestling participant references',
+      `WITH people_lookup AS (${peopleLookupSql}),
+       refs AS (
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, participant_item.value AS participant
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_item->'participants') = 'array' THEN match_item->'participants' ELSE '[]'::jsonb END) AS participant_item(value)
+         WHERE trim(participant_item.value) <> ''
+       )
+       SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.participant
+       FROM refs
+       LEFT JOIN people_lookup pl
+         ON pl.lookup_key = lower(trim(refs.participant))
+       WHERE pl.lookup_key IS NULL
+       ORDER BY refs.show_id ASC, refs.match_order ASC, refs.participant ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingParticipantResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'error',
+        code: 'MISSING_PARTICIPANT_REFERENCE',
+        message: 'Wrestling match participant does not exist in wrestling_people.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { participant: row.participant || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const missingWinnerResult = await runRelationshipQuery(
+      warnings,
+      'wrestling winner references',
+      `WITH people_lookup AS (${peopleLookupSql}),
+       refs AS (
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, match_item->>'winner' AS winner
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         WHERE trim(coalesce(match_item->>'winner', '')) <> ''
+           AND lower(trim(match_item->>'winner')) NOT IN ('draw', 'no contest', 'n/a', 'none', 'unknown')
+       )
+       SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.winner
+       FROM refs
+       LEFT JOIN people_lookup pl
+         ON pl.lookup_key = lower(trim(refs.winner))
+       WHERE pl.lookup_key IS NULL
+       ORDER BY refs.show_id ASC, refs.match_order ASC, refs.winner ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingWinnerResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'error',
+        code: 'MISSING_WINNER_REFERENCE',
+        message: 'Wrestling match winner does not exist in wrestling_people.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { winner: row.winner || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const missingRefereeResult = await runRelationshipQuery(
+      warnings,
+      'wrestling referee references',
+      `WITH people_lookup AS (${peopleLookupNoTeamsSql}),
+       refs AS (
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, referee_item.value AS referee
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_item->'referees') = 'array' THEN match_item->'referees' ELSE '[]'::jsonb END) AS referee_item(value)
+         WHERE trim(referee_item.value) <> ''
+       )
+       SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.referee
+       FROM refs
+       LEFT JOIN people_lookup pl
+         ON pl.lookup_key = lower(trim(refs.referee))
+       WHERE pl.lookup_key IS NULL
+       ORDER BY refs.show_id ASC, refs.match_order ASC, refs.referee ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingRefereeResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'error',
+        code: 'MISSING_REFEREE_REFERENCE',
+        message: 'Wrestling match referee does not exist in wrestling_people.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { referee: row.referee || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+  }
+}
+
+async function buildRelationshipReport(section) {
+  const generated = new Date();
+  const warnings = [];
+  const items = [];
+  const requestedSection = String(section || '').trim().toLowerCase();
+  const sections = requestedSection ? [requestedSection] : ['music', 'wrestling'];
+  let unknown = false;
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable.');
+    unknown = true;
+    return { generated, items, warnings, unknown };
+  }
+
+  let existingTables;
+  let columnsByTable;
+  try {
+    await dbPool.query('SELECT 1');
+    existingTables = await getExistingPublicTables(RELATIONSHIP_TABLES);
+    columnsByTable = await getExistingPublicColumns(RELATIONSHIP_TABLES);
+  } catch (err) {
+    warnings.push(`Unable to inspect relationship tables: ${err && err.message ? err.message : String(err)}`);
+    unknown = true;
+    return { generated, items, warnings, unknown };
+  }
+
+  if (sections.includes('music')) {
+    await addMusicRelationshipIssues(items, warnings, existingTables, columnsByTable);
+  }
+
+  if (sections.includes('wrestling')) {
+    await addWrestlingRelationshipIssues(items, warnings, existingTables, columnsByTable);
+  }
+
+  return { generated, items, warnings, unknown };
+}
+
+function filterRelationshipItems(items, query, fixedSection) {
+  const section = String(fixedSection || query.section || '').trim().toLowerCase();
+  const type = String(query.type || '').trim().toLowerCase();
+  const severity = String(query.severity || '').trim().toLowerCase();
+
+  return (items || []).filter((item) => {
+    if (section && item.section !== section) return false;
+    if (type && item.type !== type) return false;
+    if (severity && item.severity !== severity) return false;
+    return true;
+  });
+}
+
+async function buildRelationshipHealth(section) {
+  const report = await buildRelationshipReport(section);
+  const summary = summarizeRelationshipItems(report.items);
+
+  return {
+    ok: true,
+    errors: summary.errors,
+    warnings: summary.warnings,
+    info: summary.info,
+    overallHealth: getRelationshipOverallHealth(summary, report.unknown)
+  };
+}
+
+async function handleRelationshipsRequest(req, res, fixedSection) {
+  try {
+    const report = await buildRelationshipReport(fixedSection || req.query.section);
+    const filtered = filterRelationshipItems(report.items, req.query, fixedSection);
+    const summary = summarizeRelationshipItems(filtered);
+    const limit = getRelationshipLimit(req.query.limit);
+    const page = getPageNumber(req.query.page);
+    const offset = (page - 1) * limit;
+    const pagedItems = filtered.slice(offset, offset + limit);
+
+    res.json({
+      ok: true,
+      route: fixedSection ? `/api/admin/relationships/${fixedSection}` : '/api/admin/relationships',
+      generatedAt: report.generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(report.generated),
+      page,
+      limit,
+      count: pagedItems.length,
+      total: filtered.length,
+      totalPages: filtered.length > 0 ? Math.ceil(filtered.length / limit) : 0,
+      summary,
+      warnings: report.warnings,
+      items: pagedItems
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: fixedSection ? `/api/admin/relationships/${fixedSection}` : '/api/admin/relationships',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function handleRelationshipSummaryRequest(req, res) {
+  try {
+    const musicReport = await buildRelationshipReport('music');
+    const wrestlingReport = await buildRelationshipReport('wrestling');
+    const music = summarizeRelationshipItems(musicReport.items);
+    const wrestling = summarizeRelationshipItems(wrestlingReport.items);
+    const overall = {
+      errors: music.errors + wrestling.errors,
+      warnings: music.warnings + wrestling.warnings,
+      info: music.info + wrestling.info
+    };
+    const generated = new Date();
+
+    res.json({
+      ok: true,
+      route: '/api/admin/relationships/summary',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      music,
+      wrestling,
+      overallHealth: getRelationshipOverallHealth(overall, musicReport.unknown || wrestlingReport.unknown),
+      warnings: uniqueAdminWarnings((musicReport.warnings || []).concat(wrestlingReport.warnings || []))
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/relationships/summary',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
 async function writeSystemImportLog(entry) {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) return;
@@ -6928,7 +7638,14 @@ async function buildMusicDiagnosticsResponse() {
     venues: {},
     relationships: {},
     importHealth: createEmptyImportHealth(),
-    lockHealth: createEmptyLockHealth()
+    lockHealth: createEmptyLockHealth(),
+    relationshipHealth: {
+      ok: true,
+      errors: 0,
+      warnings: 0,
+      info: 0,
+      overallHealth: 'unknown'
+    }
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -6968,6 +7685,7 @@ async function buildMusicDiagnosticsResponse() {
   await addMusicRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
   response.importHealth = await buildImportHealth('music');
   response.lockHealth = await buildLockHealth('music');
+  response.relationshipHealth = await buildRelationshipHealth('music');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -7495,7 +8213,14 @@ async function buildWrestlingDiagnosticsResponse() {
     venues: {},
     relationships: {},
     importHealth: createEmptyImportHealth(),
-    lockHealth: createEmptyLockHealth()
+    lockHealth: createEmptyLockHealth(),
+    relationshipHealth: {
+      ok: true,
+      errors: 0,
+      warnings: 0,
+      info: 0,
+      overallHealth: 'unknown'
+    }
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -7535,6 +8260,7 @@ async function buildWrestlingDiagnosticsResponse() {
   await addWrestlingRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
   response.importHealth = await buildImportHealth('wrestling');
   response.lockHealth = await buildLockHealth('wrestling');
+  response.relationshipHealth = await buildRelationshipHealth('wrestling');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -7642,12 +8368,20 @@ async function buildAdminDiagnosticsResponse() {
     wrestling: {},
     importHealth: createEmptyImportHealth(),
     lockHealth: createEmptyLockHealth(),
+    relationshipHealth: {
+      ok: true,
+      errors: 0,
+      warnings: 0,
+      info: 0,
+      overallHealth: 'unknown'
+    },
     warnings
   };
 
   response.database = await buildAdminDiagnosticsDatabaseSummary(warnings);
   response.importHealth = await buildImportHealth();
   response.lockHealth = await buildLockHealth();
+  response.relationshipHealth = await buildRelationshipHealth();
 
   try {
     response.music = await buildMusicDiagnosticsResponse();
@@ -7867,6 +8601,22 @@ app.get('/api/admin/import-locks/music', async (req, res) => {
 
 app.get('/api/admin/import-locks/wrestling', async (req, res) => {
   return handleImportLocksRequest(req, res, 'wrestling');
+});
+
+app.get('/api/admin/relationships', async (req, res) => {
+  return handleRelationshipsRequest(req, res);
+});
+
+app.get('/api/admin/relationships/summary', async (req, res) => {
+  return handleRelationshipSummaryRequest(req, res);
+});
+
+app.get('/api/admin/relationships/music', async (req, res) => {
+  return handleRelationshipsRequest(req, res, 'music');
+});
+
+app.get('/api/admin/relationships/wrestling', async (req, res) => {
+  return handleRelationshipsRequest(req, res, 'wrestling');
 });
 
 app.get('/api/admin/diagnostics', async (req, res) => {
