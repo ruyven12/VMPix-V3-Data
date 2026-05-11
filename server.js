@@ -5425,6 +5425,7 @@ async function handleImportHistoryRequest(req, res, fixedSection) {
 
     await ensureImportHistoryTable();
 
+    const generated = new Date();
     const limit = getClampedLimit(req.query.limit);
     const page = getPageNumber(req.query.page);
     const offset = (page - 1) * limit;
@@ -5464,6 +5465,9 @@ async function handleImportHistoryRequest(req, res, fixedSection) {
     res.json({
       ok: true,
       route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      section: fixedSection || undefined,
       count: result.rows.length,
       total,
       page,
@@ -6564,6 +6568,59 @@ function createEmptyStatsHealth() {
   };
 }
 
+function getGeneratedAt(date = new Date()) {
+  return {
+    generatedAt: date.toISOString(),
+    generatedTime: formatEasternGeneratedTime(date)
+  };
+}
+
+function buildAdminResponse(payload = {}) {
+  const generated = payload.generated instanceof Date ? payload.generated : new Date();
+  const out = {
+    ok: true,
+    ...getGeneratedAt(generated)
+  };
+  Object.entries(payload || {}).forEach(([key, value]) => {
+    if (key !== 'generated') out[key] = value;
+  });
+  return out;
+}
+
+function buildAdminError(route, err, extra = {}) {
+  const message = err && err.message ? err.message : String(err);
+  return buildAdminResponse({
+    ok: false,
+    route,
+    error: message,
+    message,
+    ...extra
+  });
+}
+
+function normalizeAdminHealth({ diagnostics, importHealth, lockHealth, relationshipHealth, statsHealth, warnings } = {}) {
+  const warningCount = Array.isArray(warnings) ? warnings.length : 0;
+  const diagnosticsSummary = diagnostics && diagnostics.summary ? diagnostics.summary : {};
+  const database = diagnostics && diagnostics.database ? diagnostics.database : {};
+
+  if (database.database_connected === false) return 'unknown';
+  if (relationshipHealth && toIntegerCount(relationshipHealth.errors) > 0) return 'failed';
+  if (toIntegerCount(diagnosticsSummary.total_music_issues) + toIntegerCount(diagnosticsSummary.total_wrestling_issues) > 0) return 'failed';
+  if (importHealth && toIntegerCount(importHealth.failingImportsLast24h) > 0) return 'failed';
+
+  if (relationshipHealth && String(relationshipHealth.overallHealth || '').toLowerCase() === 'failed') return 'failed';
+  if (String(diagnosticsSummary.overall_status || '').toLowerCase() === 'issues') return 'failed';
+
+  if (lockHealth && toIntegerCount(lockHealth.staleLocks) > 0) return 'warning';
+  if (importHealth && toIntegerCount(importHealth.warningImportsLast24h) > 0) return 'warning';
+  if (relationshipHealth && String(relationshipHealth.overallHealth || '').toLowerCase() === 'warning') return 'warning';
+  if (statsHealth && String(statsHealth.overallHealth || '').toLowerCase() === 'unknown') return 'warning';
+  if (String(diagnosticsSummary.overall_status || '').toLowerCase() === 'warnings') return 'warning';
+  if (warningCount > 0) return 'warning';
+
+  return 'healthy';
+}
+
 function buildStatsSnapshotApiItem(row) {
   return {
     id: row.id == null ? null : toIntegerCount(row.id),
@@ -6920,6 +6977,204 @@ async function handleStatsRebuildRequest(req, res, section) {
       error: err && err.message ? err.message : String(err)
     });
   }
+}
+
+async function runAdminOverviewTask(label, task, fallback, warnings) {
+  try {
+    return await task();
+  } catch (err) {
+    warnings.push(`${label} unavailable: ${err && err.message ? err.message : String(err)}`);
+    return fallback;
+  }
+}
+
+async function getAdminOverviewLatestImports(warnings) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Latest imports unavailable: Missing DATABASE_URL environment variable.');
+    return [];
+  }
+
+  const tables = await getExistingPublicTables(['import_history']);
+  if (!tables.has('import_history')) return [];
+  return buildLatestImportHistoryItems();
+}
+
+async function getAdminOverviewActiveLocks(warnings) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Active import locks unavailable: Missing DATABASE_URL environment variable.');
+    return [];
+  }
+
+  const tables = await getExistingPublicTables(['import_locks']);
+  if (!tables.has('import_locks')) return [];
+  const result = await dbPool.query(`
+    SELECT id, section, category, status, locked_at, expires_at, owner, meta, created_at
+    FROM import_locks
+    WHERE status = 'running'
+      AND expires_at > NOW()
+    ORDER BY locked_at DESC, id DESC
+    LIMIT 50
+  `);
+  return result.rows.map(buildImportLockApiItem);
+}
+
+async function getAdminOverviewRelationshipSummary() {
+  const musicReport = await buildRelationshipReport('music');
+  const wrestlingReport = await buildRelationshipReport('wrestling');
+  const music = summarizeRelationshipItems(musicReport.items);
+  const wrestling = summarizeRelationshipItems(wrestlingReport.items);
+  const overall = {
+    errors: music.errors + wrestling.errors,
+    warnings: music.warnings + wrestling.warnings,
+    info: music.info + wrestling.info
+  };
+
+  return {
+    ok: true,
+    music,
+    wrestling,
+    overallHealth: getRelationshipOverallHealth(overall, musicReport.unknown || wrestlingReport.unknown),
+    warnings: uniqueAdminWarnings((musicReport.warnings || []).concat(wrestlingReport.warnings || []))
+  };
+}
+
+async function getAdminOverviewStatsSummary(warnings) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Stats summary unavailable: Missing DATABASE_URL environment variable.');
+    return { ok: true, count: 0, items: [] };
+  }
+
+  const tables = await getExistingPublicTables(['stats_snapshots']);
+  if (!tables.has('stats_snapshots')) return { ok: true, count: 0, items: [] };
+
+  const result = await dbPool.query(`
+    SELECT id, section, category, snapshot_key, data, generated_at, meta, created_at
+    FROM stats_snapshots
+    ORDER BY section ASC, category ASC, snapshot_key ASC
+  `);
+  const items = result.rows.map(buildStatsSnapshotApiItem);
+  return {
+    ok: true,
+    count: items.length,
+    items
+  };
+}
+
+function buildAdminOverviewSectionSummary(sectionDiagnostics) {
+  const summary = sectionDiagnostics && sectionDiagnostics.summary ? sectionDiagnostics.summary : {};
+  const relationshipHealth = sectionDiagnostics && sectionDiagnostics.relationshipHealth ? sectionDiagnostics.relationshipHealth : null;
+  const statsHealth = sectionDiagnostics && sectionDiagnostics.statsHealth ? sectionDiagnostics.statsHealth : null;
+  const importHealth = sectionDiagnostics && sectionDiagnostics.importHealth ? sectionDiagnostics.importHealth : null;
+  const lockHealth = sectionDiagnostics && sectionDiagnostics.lockHealth ? sectionDiagnostics.lockHealth : null;
+  const warningCount = toIntegerCount(summary.warning_count);
+  let health = 'healthy';
+
+  if (summary.database_connected === false) health = 'unknown';
+  else if (relationshipHealth && toIntegerCount(relationshipHealth.errors) > 0) health = 'failed';
+  else if (importHealth && toIntegerCount(importHealth.failingImportsLast24h) > 0) health = 'failed';
+  else if (warningCount > 0 || (lockHealth && toIntegerCount(lockHealth.staleLocks) > 0)) health = 'warning';
+  else if (relationshipHealth && String(relationshipHealth.overallHealth || '').toLowerCase() === 'warning') health = 'warning';
+  else if (statsHealth && String(statsHealth.overallHealth || '').toLowerCase() === 'unknown') health = 'warning';
+
+  return {
+    health,
+    diagnosticsWarnings: warningCount,
+    importHealth: importHealth || createEmptyImportHealth(),
+    lockHealth: lockHealth || createEmptyLockHealth(),
+    relationshipHealth: relationshipHealth || {
+      ok: true,
+      errors: 0,
+      warnings: 0,
+      info: 0,
+      overallHealth: 'unknown'
+    },
+    statsHealth: statsHealth || createEmptyStatsHealth()
+  };
+}
+
+async function buildAdminOverviewResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const diagnostics = await runAdminOverviewTask(
+    'Diagnostics',
+    buildAdminDiagnosticsResponse,
+    {
+      ok: false,
+      route: '/api/admin/diagnostics',
+      source: 'postgres',
+      section: 'admin',
+      type: 'diagnostics',
+      summary: { overall_status: 'unknown' },
+      warnings: []
+    },
+    warnings
+  );
+  const importHealth = diagnostics.importHealth || await runAdminOverviewTask('Import health', () => buildImportHealth(), createEmptyImportHealth(), warnings);
+  const lockHealth = diagnostics.lockHealth || await runAdminOverviewTask('Lock health', () => buildLockHealth(), createEmptyLockHealth(), warnings);
+  const relationshipHealth = diagnostics.relationshipHealth || await runAdminOverviewTask('Relationship health', () => buildRelationshipHealth(), {
+    ok: true,
+    errors: 0,
+    warnings: 0,
+    info: 0,
+    overallHealth: 'unknown'
+  }, warnings);
+  const statsHealth = diagnostics.statsHealth || await runAdminOverviewTask('Stats health', () => buildStatsHealth(), createEmptyStatsHealth(), warnings);
+  const latestImports = await runAdminOverviewTask('Latest imports', () => getAdminOverviewLatestImports(warnings), [], warnings);
+  const activeLocks = await runAdminOverviewTask('Active locks', () => getAdminOverviewActiveLocks(warnings), [], warnings);
+  const relationshipSummary = await runAdminOverviewTask('Relationship summary', getAdminOverviewRelationshipSummary, {
+    ok: true,
+    music: { errors: 0, warnings: 0, info: 0 },
+    wrestling: { errors: 0, warnings: 0, info: 0 },
+    overallHealth: 'unknown',
+    warnings: []
+  }, warnings);
+  const statsSummary = await runAdminOverviewTask('Stats summary', () => getAdminOverviewStatsSummary(warnings), {
+    ok: true,
+    count: 0,
+    items: []
+  }, warnings);
+  const combinedWarnings = uniqueAdminWarnings(
+    warnings
+      .concat(Array.isArray(diagnostics.warnings) ? diagnostics.warnings : [])
+      .concat(Array.isArray(relationshipSummary.warnings) ? relationshipSummary.warnings : [])
+  );
+  const overallHealth = normalizeAdminHealth({
+    diagnostics,
+    importHealth,
+    lockHealth,
+    relationshipHealth,
+    statsHealth,
+    warnings: combinedWarnings
+  });
+
+  return buildAdminResponse({
+    route: '/api/admin/overview',
+    generated,
+    source: 'postgres',
+    section: 'admin',
+    type: 'overview',
+    service: {
+      name: 'VMPix-V3 Data',
+      status: 'online'
+    },
+    summary: {
+      overallHealth,
+      sections: {
+        music: buildAdminOverviewSectionSummary(diagnostics.music),
+        wrestling: buildAdminOverviewSectionSummary(diagnostics.wrestling)
+      }
+    },
+    diagnostics,
+    importHealth,
+    lockHealth,
+    relationshipHealth,
+    statsHealth,
+    latestImports,
+    activeLocks,
+    relationshipSummary,
+    statsSummary,
+    warnings: combinedWarnings
+  });
 }
 
 async function writeSystemImportLog(entry) {
@@ -9137,6 +9392,18 @@ app.get('/api/admin/stats/rebuild/music', async (req, res) => {
 
 app.get('/api/admin/stats/rebuild/wrestling', async (req, res) => {
   return handleStatsRebuildRequest(req, res, 'wrestling');
+});
+
+app.get('/api/admin/overview', async (req, res) => {
+  try {
+    res.json(await buildAdminOverviewResponse());
+  } catch (err) {
+    res.status(500).json(buildAdminError('/api/admin/overview', err, {
+      source: 'postgres',
+      section: 'admin',
+      type: 'overview'
+    }));
+  }
 });
 
 app.get('/api/admin/diagnostics', async (req, res) => {
