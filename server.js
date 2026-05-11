@@ -3543,7 +3543,7 @@ function buildWrestlingShowDbApiItem(row, venueDetailsMap) {
     show_name: row.show_name || '',
     date: row.date || '',
     venue_id: venueId,
-    venue: row.venue || '',
+    venue: venueDetails ? venueDetails.venue_name : '',
     venue_details: venueDetails,
     city: row.city || '',
     state: row.state || '',
@@ -3587,7 +3587,7 @@ function buildWrestlingShowsDbQueryOptions(query) {
     show_name: 'show_name',
     date: 'show_date',
     venue_id: 'venue_id',
-    venue: 'venue',
+    venue: `(SELECT wv.venue_name FROM wrestling_venues wv WHERE lower(trim(coalesce(wv.venue_id, ''))) = lower(trim(coalesce(wrestling_shows.venue_id, ''))) LIMIT 1)`,
     city: 'city',
     state: 'state',
     created_at: 'created_at',
@@ -3606,6 +3606,12 @@ function buildWrestlingShowsDbQueryOptions(query) {
       OR coalesce(show_name, '') ILIKE $${idx}
       OR coalesce(venue_id, '') ILIKE $${idx}
       OR coalesce(venue, '') ILIKE $${idx}
+      OR EXISTS (
+        SELECT 1
+        FROM wrestling_venues wv
+        WHERE lower(trim(coalesce(wv.venue_id, ''))) = lower(trim(coalesce(wrestling_shows.venue_id, '')))
+          AND coalesce(wv.venue_name, '') ILIKE $${idx}
+      )
       OR coalesce(city, '') ILIKE $${idx}
       OR coalesce(state, '') ILIKE $${idx}
       OR coalesce(poster, '') ILIKE $${idx}
@@ -3634,7 +3640,15 @@ function buildWrestlingShowsDbQueryOptions(query) {
 
   if (venue) {
     values.push(venue.toLowerCase());
-    where.push(`lower(trim(coalesce(venue, ''))) = $${values.length}`);
+    where.push(`(
+      lower(trim(coalesce(venue, ''))) = $${values.length}
+      OR EXISTS (
+        SELECT 1
+        FROM wrestling_venues wv
+        WHERE lower(trim(coalesce(wv.venue_id, ''))) = lower(trim(coalesce(wrestling_shows.venue_id, '')))
+          AND lower(trim(coalesce(wv.venue_name, ''))) = $${values.length}
+      )
+    )`);
     filters.venue = venue;
   }
 
@@ -3856,7 +3870,7 @@ async function buildWrestlingShowsDbStatsResponse() {
   const topVenuesByRecordCountQuery = dbPool.query(`
     SELECT
       coalesce(nullif(trim(ws.venue_id), ''), '') AS venue_id,
-      coalesce(nullif(trim(wv.venue_name), ''), nullif(trim(ws.venue), ''), nullif(trim(ws.venue_id), ''), 'Unknown') AS venue,
+      coalesce(nullif(trim(wv.venue_name), ''), 'Unknown') AS venue,
       count(*)::int AS record_count
     FROM wrestling_shows ws
     LEFT JOIN wrestling_venues wv
