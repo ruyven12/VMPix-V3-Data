@@ -2257,6 +2257,8 @@ const WRESTLING_MATCH_IMPORT_HEADER_ALIASES = {
   date: 'date',
   show_date: 'date',
   showdate: 'date',
+  venue_id: 'venue_id',
+  venueid: 'venue_id',
   venue: 'venue',
   city: 'city',
   state: 'state',
@@ -2383,6 +2385,7 @@ function buildWrestlingShowGroups(rows) {
         promotion: '',
         show_name: '',
         date: '',
+        venue_id: '',
         venue: '',
         city: '',
         state: '',
@@ -2398,6 +2401,7 @@ function buildWrestlingShowGroups(rows) {
     setWrestlingShowGroupValue(group, 'promotion', row.promotion);
     setWrestlingShowGroupValue(group, 'show_name', row.show_name);
     setWrestlingShowGroupValue(group, 'date', row.date);
+    setWrestlingShowGroupValue(group, 'venue_id', row.venue_id);
     setWrestlingShowGroupValue(group, 'venue', row.venue);
     setWrestlingShowGroupValue(group, 'city', row.city);
     setWrestlingShowGroupValue(group, 'state', row.state);
@@ -2467,6 +2471,7 @@ function buildWrestlingShowDbRows(rows) {
       show_name: toDbText(show.show_name),
       date: toDbText(show.date),
       show_date: parsedDate ? parsedDate.iso : null,
+      venue_id: toDbText(show.venue_id),
       venue: toDbText(show.venue),
       city: toDbText(show.city),
       state: toDbText(show.state),
@@ -2498,6 +2503,7 @@ async function upsertWrestlingShowDbRow(client, item) {
       show_name,
       date,
       show_date,
+      venue_id,
       venue,
       city,
       state,
@@ -2511,7 +2517,7 @@ async function upsertWrestlingShowDbRow(client, item) {
     VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10,
-      $11, $12, $13::jsonb, $14::jsonb, $15::jsonb
+      $11, $12, $13, $14::jsonb, $15::jsonb, $16::jsonb
     )
     ON CONFLICT (show_id) DO UPDATE SET
       show_key = EXCLUDED.show_key,
@@ -2519,6 +2525,7 @@ async function upsertWrestlingShowDbRow(client, item) {
       show_name = EXCLUDED.show_name,
       date = EXCLUDED.date,
       show_date = EXCLUDED.show_date,
+      venue_id = EXCLUDED.venue_id,
       venue = EXCLUDED.venue,
       city = EXCLUDED.city,
       state = EXCLUDED.state,
@@ -2536,6 +2543,7 @@ async function upsertWrestlingShowDbRow(client, item) {
     item.show_name,
     item.date,
     item.show_date,
+    item.venue_id,
     item.venue,
     item.city,
     item.state,
@@ -3498,14 +3506,45 @@ function buildWrestlingMatchDbApiItem(match) {
   };
 }
 
-function buildWrestlingShowDbApiItem(row) {
+async function getWrestlingVenueDetailsMap(venueIds) {
+  const keys = Array.from(new Set(
+    (venueIds || [])
+      .map(normalizeMusicLookupKey)
+      .filter(Boolean)
+  ));
+  const venues = new Map();
+  if (!keys.length) return venues;
+
+  try {
+    const result = await dbPool.query(`
+      SELECT venue_id, venue_name, city, state, country, region, venue_type, status, latitude, longitude, notes, geo
+      FROM wrestling_venues
+      WHERE lower(trim(coalesce(venue_id, ''))) = ANY($1::text[])
+    `, [keys]);
+
+    result.rows.forEach((row) => {
+      venues.set(normalizeMusicLookupKey(row.venue_id), buildWrestlingVenueDbApiItem(row));
+    });
+  } catch (err) {
+    console.warn('Wrestling venue details lookup skipped:', err && err.message ? err.message : String(err));
+  }
+
+  return venues;
+}
+
+function buildWrestlingShowDbApiItem(row, venueDetailsMap) {
+  const venueId = row.venue_id || '';
+  const venueDetails = venueId ? (venueDetailsMap.get(normalizeMusicLookupKey(venueId)) || null) : null;
+
   return {
     show_id: toIntegerCount(row.show_id),
     show_key: row.show_key || '',
     promotion: row.promotion || '',
     show_name: row.show_name || '',
     date: row.date || '',
+    venue_id: venueId,
     venue: row.venue || '',
+    venue_details: venueDetails,
     city: row.city || '',
     state: row.state || '',
     poster: row.poster || '',
@@ -3537,6 +3576,7 @@ function buildWrestlingShowsDbQueryOptions(query) {
   const state = String(query.state || '').trim();
   const city = String(query.city || '').trim();
   const venue = String(query.venue || '').trim();
+  const venueId = String(query.venue_id || '').trim();
   const participant = String(query.participant || '').trim();
   const winner = String(query.winner || '').trim();
   const referee = String(query.referee || '').trim();
@@ -3546,6 +3586,7 @@ function buildWrestlingShowsDbQueryOptions(query) {
     promotion: 'promotion',
     show_name: 'show_name',
     date: 'show_date',
+    venue_id: 'venue_id',
     venue: 'venue',
     city: 'city',
     state: 'state',
@@ -3563,6 +3604,7 @@ function buildWrestlingShowsDbQueryOptions(query) {
     where.push(`(
       coalesce(promotion, '') ILIKE $${idx}
       OR coalesce(show_name, '') ILIKE $${idx}
+      OR coalesce(venue_id, '') ILIKE $${idx}
       OR coalesce(venue, '') ILIKE $${idx}
       OR coalesce(city, '') ILIKE $${idx}
       OR coalesce(state, '') ILIKE $${idx}
@@ -3594,6 +3636,12 @@ function buildWrestlingShowsDbQueryOptions(query) {
     values.push(venue.toLowerCase());
     where.push(`lower(trim(coalesce(venue, ''))) = $${values.length}`);
     filters.venue = venue;
+  }
+
+  if (venueId) {
+    values.push(venueId.toLowerCase());
+    where.push(`lower(trim(coalesce(venue_id, ''))) = $${values.length}`);
+    filters.venue_id = venueId;
   }
 
   if (participant) {
@@ -3660,7 +3708,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT show_id, show_key, promotion, show_name, date, venue, city, state, poster, camera_1, camera_2, matches, stats
+      `SELECT show_id, show_key, promotion, show_name, date, venue_id, venue, city, state, poster, camera_1, camera_2, matches, stats
        FROM wrestling_shows
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -3668,7 +3716,8 @@ async function handleWrestlingShowsDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const data = result.rows.map(buildWrestlingShowDbApiItem);
+    const venueDetailsMap = await getWrestlingVenueDetailsMap(result.rows.map((row) => row.venue_id));
+    const data = result.rows.map((row) => buildWrestlingShowDbApiItem(row, venueDetailsMap));
 
     res.json({
       ok: true,
@@ -3783,6 +3832,63 @@ async function buildWrestlingShowsDbStatsResponse() {
     ORDER BY wins DESC, winner ASC
     LIMIT 25
   `);
+  const venueLinkingQuery = dbPool.query(`
+    WITH linked AS (
+      SELECT
+        nullif(trim(ws.venue_id), '') AS show_venue_id,
+        wv.venue_id AS matched_venue_id
+      FROM wrestling_shows ws
+      LEFT JOIN wrestling_venues wv
+        ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+    )
+    SELECT
+      count(*)::int AS total_records,
+      count(show_venue_id)::int AS records_with_venue_id,
+      count(*) FILTER (WHERE show_venue_id IS NULL)::int AS records_missing_venue_id,
+      count(matched_venue_id)::int AS valid_venue_links,
+      count(*) FILTER (WHERE show_venue_id IS NOT NULL AND matched_venue_id IS NULL)::int AS invalid_venue_links,
+      coalesce(
+        array_agg(DISTINCT show_venue_id) FILTER (WHERE show_venue_id IS NOT NULL AND matched_venue_id IS NULL),
+        '{}'::text[]
+      ) AS unmatched_venue_ids
+    FROM linked
+  `);
+  const topVenuesByRecordCountQuery = dbPool.query(`
+    SELECT
+      coalesce(nullif(trim(ws.venue_id), ''), '') AS venue_id,
+      coalesce(nullif(trim(wv.venue_name), ''), nullif(trim(ws.venue), ''), nullif(trim(ws.venue_id), ''), 'Unknown') AS venue,
+      count(*)::int AS record_count
+    FROM wrestling_shows ws
+    LEFT JOIN wrestling_venues wv
+      ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+    GROUP BY 1, 2
+    ORDER BY record_count DESC, venue ASC
+    LIMIT 25
+  `);
+  const topVenueIdsQuery = dbPool.query(`
+    SELECT nullif(trim(venue_id), '') AS venue_id, count(*)::int AS record_count
+    FROM wrestling_shows
+    WHERE nullif(trim(venue_id), '') IS NOT NULL
+    GROUP BY 1
+    ORDER BY record_count DESC, venue_id ASC
+    LIMIT 25
+  `);
+  const recordsByVenueStateQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(wv.state), ''), 'Unknown') AS state, count(*)::int AS record_count
+    FROM wrestling_shows ws
+    LEFT JOIN wrestling_venues wv
+      ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+    GROUP BY 1
+    ORDER BY record_count DESC, state ASC
+  `);
+  const recordsByVenueRegionQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(wv.region), ''), 'Unknown') AS region, count(*)::int AS record_count
+    FROM wrestling_shows ws
+    LEFT JOIN wrestling_venues wv
+      ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+    GROUP BY 1
+    ORDER BY record_count DESC, region ASC
+  `);
   const [
     totalsResult,
     uniqueParticipantsResult,
@@ -3794,7 +3900,12 @@ async function buildWrestlingShowsDbStatsResponse() {
     byCityResult,
     byVenueResult,
     topParticipantsResult,
-    topWinnersResult
+    topWinnersResult,
+    venueLinkingResult,
+    topVenuesByRecordCountResult,
+    topVenueIdsResult,
+    recordsByVenueStateResult,
+    recordsByVenueRegionResult
   ] = await Promise.all([
     totalsQuery,
     uniqueParticipantsQuery,
@@ -3806,12 +3917,18 @@ async function buildWrestlingShowsDbStatsResponse() {
     byCityQuery,
     byVenueQuery,
     topParticipantsQuery,
-    topWinnersQuery
+    topWinnersQuery,
+    venueLinkingQuery,
+    topVenuesByRecordCountQuery,
+    topVenueIdsQuery,
+    recordsByVenueStateQuery,
+    recordsByVenueRegionQuery
   ]);
   const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
   const uniqueParticipants = uniqueParticipantsResult.rows && uniqueParticipantsResult.rows[0] ? uniqueParticipantsResult.rows[0] : {};
   const matchesWithReferees = matchesWithRefereesResult.rows && matchesWithRefereesResult.rows[0] ? matchesWithRefereesResult.rows[0] : {};
   const uniqueReferees = uniqueRefereesResult.rows && uniqueRefereesResult.rows[0] ? uniqueRefereesResult.rows[0] : {};
+  const venueLinking = venueLinkingResult.rows && venueLinkingResult.rows[0] ? venueLinkingResult.rows[0] : {};
 
   return {
     ok: true,
@@ -3832,7 +3949,32 @@ async function buildWrestlingShowsDbStatsResponse() {
     byCity: byCityResult.rows.map((row) => ({ city: row.city, showsTotal: toIntegerCount(row.shows_total) })),
     byVenue: byVenueResult.rows.map((row) => ({ venue: row.venue, showsTotal: toIntegerCount(row.shows_total) })),
     topParticipants: topParticipantsResult.rows.map((row) => ({ participant: row.participant, appearances: toIntegerCount(row.appearances) })),
-    topWinners: topWinnersResult.rows.map((row) => ({ winner: row.winner, wins: toIntegerCount(row.wins) }))
+    topWinners: topWinnersResult.rows.map((row) => ({ winner: row.winner, wins: toIntegerCount(row.wins) })),
+    venue_linking: {
+      total_records: toIntegerCount(venueLinking.total_records),
+      records_with_venue_id: toIntegerCount(venueLinking.records_with_venue_id),
+      records_missing_venue_id: toIntegerCount(venueLinking.records_missing_venue_id),
+      valid_venue_links: toIntegerCount(venueLinking.valid_venue_links),
+      invalid_venue_links: toIntegerCount(venueLinking.invalid_venue_links),
+      unmatched_venue_ids: Array.isArray(venueLinking.unmatched_venue_ids) ? venueLinking.unmatched_venue_ids : []
+    },
+    top_venues_by_record_count: topVenuesByRecordCountResult.rows.map((row) => ({
+      venue_id: row.venue_id || '',
+      venue: row.venue,
+      record_count: toIntegerCount(row.record_count)
+    })),
+    top_venue_ids: topVenueIdsResult.rows.map((row) => ({
+      venue_id: row.venue_id || '',
+      record_count: toIntegerCount(row.record_count)
+    })),
+    records_by_venue_state: recordsByVenueStateResult.rows.map((row) => ({
+      state: row.state,
+      record_count: toIntegerCount(row.record_count)
+    })),
+    records_by_venue_region: recordsByVenueRegionResult.rows.map((row) => ({
+      region: row.region,
+      record_count: toIntegerCount(row.record_count)
+    }))
   };
 }
 

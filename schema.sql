@@ -267,6 +267,7 @@ CREATE TABLE IF NOT EXISTS wrestling_shows (
     show_name TEXT,
     date TEXT,
     show_date DATE,
+    venue_id TEXT,
     venue TEXT,
     city TEXT,
     state TEXT,
@@ -297,6 +298,9 @@ ALTER TABLE IF EXISTS wrestling_shows
 
 ALTER TABLE IF EXISTS wrestling_shows
     ADD COLUMN IF NOT EXISTS show_date DATE;
+
+ALTER TABLE IF EXISTS wrestling_shows
+    ADD COLUMN IF NOT EXISTS venue_id TEXT;
 
 ALTER TABLE IF EXISTS wrestling_shows
     ADD COLUMN IF NOT EXISTS venue TEXT;
