@@ -5055,6 +5055,7 @@ function buildImportHistoryMeta(config, req, result) {
 }
 
 let importHistoryTableEnsured = false;
+let importLocksTableEnsured = false;
 
 async function ensureImportHistoryTable() {
   if (importHistoryTableEnsured) return true;
@@ -5089,6 +5090,169 @@ async function ensureImportHistoryTable() {
 
   importHistoryTableEnsured = true;
   return true;
+}
+
+async function ensureImportLocksTable() {
+  if (importLocksTableEnsured) return true;
+  if (!String(process.env.DATABASE_URL || '').trim()) return false;
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS import_locks (
+      id SERIAL PRIMARY KEY,
+      section TEXT NOT NULL,
+      category TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      owner TEXT,
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS import_locks_section_category_status_expires_at_idx
+      ON import_locks (section, category, status, expires_at DESC)
+  `);
+
+  importLocksTableEnsured = true;
+  return true;
+}
+
+function getImportLockOwner() {
+  return String(
+    process.env.RENDER_SERVICE_NAME ||
+    process.env.RENDER_INSTANCE_ID ||
+    process.env.HOSTNAME ||
+    'vmpix-v3-data'
+  ).trim();
+}
+
+function getImportLockTtlMs() {
+  const ttl = Number(process.env.IMPORT_LOCK_TTL_MS);
+  return Number.isFinite(ttl) && ttl > 0 ? Math.max(60_000, Math.trunc(ttl)) : 30 * 60 * 1000;
+}
+
+function buildImportLockApiItem(row) {
+  const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
+  const expired = expiresAt ? expiresAt.getTime() <= Date.now() : false;
+
+  return {
+    id: toIntegerCount(row.id),
+    section: row.section || '',
+    category: row.category || '',
+    status: row.status || '',
+    locked_at: formatStatusTimestamp(row.locked_at),
+    expires_at: formatStatusTimestamp(row.expires_at),
+    owner: row.owner || '',
+    active: String(row.status || '').toLowerCase() === 'running' && !expired,
+    expired,
+    meta: row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta) ? row.meta : {},
+    created_at: formatStatusTimestamp(row.created_at)
+  };
+}
+
+async function acquireImportLock({ section, category, owner, meta }) {
+  let client;
+
+  try {
+    const ready = await ensureImportLocksTable();
+    if (!ready) return { acquired: true, bypassed: true };
+
+    client = await dbPool.connect();
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE import_locks IN EXCLUSIVE MODE');
+
+    await client.query(`
+      UPDATE import_locks
+      SET status = 'expired',
+          meta = coalesce(meta, '{}'::jsonb) || $1::jsonb
+      WHERE status = 'running'
+        AND expires_at <= NOW()
+    `, [JSON.stringify({ expiredAt: new Date().toISOString() })]);
+
+    const activeResult = await client.query(`
+      SELECT id, section, category, status, locked_at, expires_at, owner, meta, created_at
+      FROM import_locks
+      WHERE lower(trim(coalesce(section, ''))) = $1
+        AND lower(trim(coalesce(category, ''))) = $2
+        AND status = 'running'
+        AND expires_at > NOW()
+      ORDER BY locked_at DESC, id DESC
+      LIMIT 1
+    `, [section.toLowerCase(), category.toLowerCase()]);
+
+    if (activeResult.rows && activeResult.rows[0]) {
+      await client.query('ROLLBACK');
+      return {
+        acquired: false,
+        lock: buildImportLockApiItem(activeResult.rows[0])
+      };
+    }
+
+    const ttlMs = getImportLockTtlMs();
+    const result = await client.query(`
+      INSERT INTO import_locks (
+        section,
+        category,
+        status,
+        expires_at,
+        owner,
+        meta
+      )
+      VALUES ($1, $2, 'running', NOW() + ($3::int * INTERVAL '1 millisecond'), $4, $5::jsonb)
+      RETURNING id, section, category, status, locked_at, expires_at, owner, meta, created_at
+    `, [
+      section,
+      category,
+      ttlMs,
+      owner || getImportLockOwner(),
+      JSON.stringify(meta && typeof meta === 'object' ? meta : {})
+    ]);
+    await client.query('COMMIT');
+
+    return {
+      acquired: true,
+      lock: result.rows && result.rows[0] ? buildImportLockApiItem(result.rows[0]) : null
+    };
+  } catch (err) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.warn('Import lock rollback failed:', rollbackErr && rollbackErr.message ? rollbackErr.message : String(rollbackErr));
+      }
+    }
+    console.warn('Import lock acquire failed:', err && err.message ? err.message : String(err));
+    return { acquired: true, bypassed: true };
+  } finally {
+    if (client) client.release();
+  }
+}
+
+async function releaseImportLock(id, status, meta) {
+  if (!id) return null;
+
+  try {
+    const ready = await ensureImportLocksTable();
+    if (!ready) return null;
+
+    const result = await dbPool.query(`
+      UPDATE import_locks
+      SET status = $2,
+          meta = coalesce(meta, '{}'::jsonb) || $3::jsonb
+      WHERE id = $1
+      RETURNING id, section, category, status, locked_at, expires_at, owner, meta, created_at
+    `, [
+      id,
+      status || 'completed',
+      JSON.stringify(meta && typeof meta === 'object' ? meta : {})
+    ]);
+
+    return result.rows && result.rows[0] ? buildImportLockApiItem(result.rows[0]) : null;
+  } catch (err) {
+    console.warn('Import lock release failed:', err && err.message ? err.message : String(err));
+    return null;
+  }
 }
 
 async function startImportHistory({ section, category, source, meta }) {
@@ -5417,6 +5581,139 @@ async function buildImportHealth(section) {
   }
 }
 
+function createEmptyLockHealth() {
+  return {
+    ok: true,
+    activeLocks: 0,
+    staleLocks: 0,
+    items: []
+  };
+}
+
+function buildImportLockQueryOptions(query, fixedSection) {
+  const values = [];
+  const where = [];
+  const filters = {};
+  const section = fixedSection || String(query.section || '').trim();
+  const category = String(query.category || '').trim();
+  const status = String(query.status || '').trim();
+
+  if (section) {
+    values.push(section.toLowerCase());
+    where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+    filters.section = section;
+  }
+
+  if (category) {
+    values.push(category.toLowerCase());
+    where.push(`lower(trim(coalesce(category, ''))) = $${values.length}`);
+    filters.category = category;
+  }
+
+  if (status) {
+    values.push(status.toLowerCase());
+    where.push(`lower(trim(coalesce(status, ''))) = $${values.length}`);
+    filters.status = status;
+  }
+
+  return {
+    values,
+    filters,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : ''
+  };
+}
+
+async function handleImportLocksRequest(req, res, fixedSection) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    await ensureImportLocksTable();
+
+    const generated = new Date();
+    const limit = getClampedLimit(req.query.limit);
+    const options = buildImportLockQueryOptions(req.query, fixedSection);
+    const values = options.values.concat([limit]);
+    const limitIdx = values.length;
+    const result = await dbPool.query(
+      `SELECT id, section, category, status, locked_at, expires_at, owner, meta, created_at
+       FROM import_locks
+       ${options.whereSql}
+       ORDER BY
+         CASE WHEN status = 'running' AND expires_at > NOW() THEN 0 ELSE 1 END,
+         locked_at DESC,
+         id DESC
+       LIMIT $${limitIdx}`,
+      values
+    );
+
+    res.json({
+      ok: true,
+      route: fixedSection ? `/api/admin/import-locks/${fixedSection}` : '/api/admin/import-locks',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: result.rows.length,
+      filters: options.filters,
+      items: result.rows.map(buildImportLockApiItem)
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: fixedSection ? `/api/admin/import-locks/${fixedSection}` : '/api/admin/import-locks',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function buildLockHealth(section) {
+  const health = createEmptyLockHealth();
+
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) return health;
+
+    const existingTables = await getExistingPublicTables(['import_locks']);
+    if (!existingTables.has('import_locks')) return health;
+
+    const values = [];
+    const where = [];
+    const sectionFilter = String(section || '').trim();
+    if (sectionFilter) {
+      values.push(sectionFilter.toLowerCase());
+      where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const countResult = await dbPool.query(
+      `SELECT
+         count(*) FILTER (WHERE status = 'running' AND expires_at > NOW())::int AS active_locks,
+         count(*) FILTER (WHERE status = 'running' AND expires_at <= NOW())::int AS stale_locks
+       FROM import_locks
+       ${whereSql}`,
+      values
+    );
+    const counts = countResult.rows && countResult.rows[0] ? countResult.rows[0] : {};
+    const itemResult = await dbPool.query(
+      `SELECT id, section, category, status, locked_at, expires_at, owner, meta, created_at
+       FROM import_locks
+       ${whereSql}
+       ORDER BY
+         CASE WHEN status = 'running' AND expires_at > NOW() THEN 0 ELSE 1 END,
+         locked_at DESC,
+         id DESC
+       LIMIT 25`,
+      values
+    );
+
+    health.activeLocks = toIntegerCount(counts.active_locks);
+    health.staleLocks = toIntegerCount(counts.stale_locks);
+    health.items = itemResult.rows.map(buildImportLockApiItem);
+    return health;
+  } catch (err) {
+    console.warn('Import lock health read failed:', err && err.message ? err.message : String(err));
+    return health;
+  }
+}
+
 async function writeSystemImportLog(entry) {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) return;
@@ -5454,6 +5751,30 @@ async function runLoggedImport(req, res, config) {
   const startedAt = new Date();
   const area = config.area || 'music';
   const category = getImportHistoryCategory(config);
+  const lockAttempt = await acquireImportLock({
+    section: area,
+    category,
+    owner: getImportLockOwner(),
+    meta: {
+      route: config.route,
+      refresh: req.query.refresh === '1',
+      source: config.source || '',
+      startedAt: startedAt.toISOString()
+    }
+  });
+
+  if (lockAttempt && lockAttempt.acquired === false) {
+    return res.status(409).json({
+      ok: false,
+      locked: true,
+      message: 'Import already running',
+      section: area,
+      category,
+      lock: lockAttempt.lock || null
+    });
+  }
+
+  const importLock = lockAttempt && lockAttempt.lock ? lockAttempt.lock : null;
   const history = await startImportHistory({
     section: area,
     category,
@@ -5479,6 +5800,11 @@ async function runLoggedImport(req, res, config) {
       errors: historyErrors,
       meta: buildImportHistoryMeta(config, req, result)
     });
+    const importLockRelease = await releaseImportLock(importLock && importLock.id, historyStatus === 'failed' ? 'failed' : 'completed', {
+      completedAt: new Date().toISOString(),
+      status: historyStatus,
+      importHistoryId: importHistory && importHistory.id ? importHistory.id : null
+    });
     await writeSystemImportLog({
       area,
       route: config.route,
@@ -5491,6 +5817,9 @@ async function runLoggedImport(req, res, config) {
     });
     if (importHistory && result && typeof result === 'object') {
       result.importHistory = importHistory;
+    }
+    if (importLockRelease && result && typeof result === 'object') {
+      result.importLock = importLockRelease;
     }
     res.json(result);
   } catch (err) {
@@ -5505,6 +5834,12 @@ async function runLoggedImport(req, res, config) {
         refresh: req.query.refresh === '1',
         source_type: 'google_sheets'
       }
+    });
+    const importLockRelease = await releaseImportLock(importLock && importLock.id, 'failed', {
+      completedAt: new Date().toISOString(),
+      status: 'failed',
+      error: err && err.message ? err.message : String(err),
+      importHistoryId: importHistory && importHistory.id ? importHistory.id : null
     });
     await writeSystemImportLog({
       area,
@@ -5524,6 +5859,7 @@ async function runLoggedImport(req, res, config) {
       error: err && err.message ? err.message : String(err)
     };
     if (importHistory) errorResponse.importHistory = importHistory;
+    if (importLockRelease) errorResponse.importLock = importLockRelease;
     res.status(500).json(errorResponse);
   }
 }
@@ -6591,7 +6927,8 @@ async function buildMusicDiagnosticsResponse() {
     people: {},
     venues: {},
     relationships: {},
-    importHealth: createEmptyImportHealth()
+    importHealth: createEmptyImportHealth(),
+    lockHealth: createEmptyLockHealth()
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -6630,6 +6967,7 @@ async function buildMusicDiagnosticsResponse() {
   await addMusicVenueDiagnostics(response, existingTables, columnsByTable, warnings);
   await addMusicRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
   response.importHealth = await buildImportHealth('music');
+  response.lockHealth = await buildLockHealth('music');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -7156,7 +7494,8 @@ async function buildWrestlingDiagnosticsResponse() {
     people: {},
     venues: {},
     relationships: {},
-    importHealth: createEmptyImportHealth()
+    importHealth: createEmptyImportHealth(),
+    lockHealth: createEmptyLockHealth()
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -7195,6 +7534,7 @@ async function buildWrestlingDiagnosticsResponse() {
   await addWrestlingPeopleDiagnostics(response, existingTables, columnsByTable, warnings);
   await addWrestlingRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
   response.importHealth = await buildImportHealth('wrestling');
+  response.lockHealth = await buildLockHealth('wrestling');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -7301,11 +7641,13 @@ async function buildAdminDiagnosticsResponse() {
     music: {},
     wrestling: {},
     importHealth: createEmptyImportHealth(),
+    lockHealth: createEmptyLockHealth(),
     warnings
   };
 
   response.database = await buildAdminDiagnosticsDatabaseSummary(warnings);
   response.importHealth = await buildImportHealth();
+  response.lockHealth = await buildLockHealth();
 
   try {
     response.music = await buildMusicDiagnosticsResponse();
@@ -7513,6 +7855,18 @@ app.get('/api/admin/import-history/wrestling', async (req, res) => {
 
 app.get('/api/admin/import-history/latest', async (req, res) => {
   return handleLatestImportHistoryRequest(req, res);
+});
+
+app.get('/api/admin/import-locks', async (req, res) => {
+  return handleImportLocksRequest(req, res);
+});
+
+app.get('/api/admin/import-locks/music', async (req, res) => {
+  return handleImportLocksRequest(req, res, 'music');
+});
+
+app.get('/api/admin/import-locks/wrestling', async (req, res) => {
+  return handleImportLocksRequest(req, res, 'wrestling');
 });
 
 app.get('/api/admin/diagnostics', async (req, res) => {

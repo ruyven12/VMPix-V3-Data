@@ -282,6 +282,21 @@ CREATE INDEX IF NOT EXISTS import_history_section_category_started_at_idx
 CREATE INDEX IF NOT EXISTS import_history_status_started_at_idx
     ON import_history (status, started_at DESC);
 
+CREATE TABLE IF NOT EXISTS import_locks (
+    id SERIAL PRIMARY KEY,
+    section TEXT NOT NULL,
+    category TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    owner TEXT,
+    meta JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS import_locks_section_category_status_expires_at_idx
+    ON import_locks (section, category, status, expires_at DESC);
+
 CREATE TABLE IF NOT EXISTS wrestling_shows (
     id SERIAL PRIMARY KEY,
     show_id INTEGER UNIQUE NOT NULL,
