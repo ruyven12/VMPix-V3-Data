@@ -297,6 +297,23 @@ CREATE TABLE IF NOT EXISTS import_locks (
 CREATE INDEX IF NOT EXISTS import_locks_section_category_status_expires_at_idx
     ON import_locks (section, category, status, expires_at DESC);
 
+CREATE TABLE IF NOT EXISTS stats_snapshots (
+    id SERIAL PRIMARY KEY,
+    section TEXT NOT NULL,
+    category TEXT NOT NULL,
+    snapshot_key TEXT NOT NULL,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    meta JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS stats_snapshots_section_category_snapshot_key_idx
+    ON stats_snapshots (section, category, snapshot_key);
+
+CREATE INDEX IF NOT EXISTS stats_snapshots_section_generated_at_idx
+    ON stats_snapshots (section, generated_at DESC);
+
 CREATE TABLE IF NOT EXISTS wrestling_shows (
     id SERIAL PRIMARY KEY,
     show_id INTEGER UNIQUE NOT NULL,

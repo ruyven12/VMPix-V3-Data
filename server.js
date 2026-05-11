@@ -5056,6 +5056,7 @@ function buildImportHistoryMeta(config, req, result) {
 
 let importHistoryTableEnsured = false;
 let importLocksTableEnsured = false;
+let statsSnapshotsTableEnsured = false;
 
 async function ensureImportHistoryTable() {
   if (importHistoryTableEnsured) return true;
@@ -5115,6 +5116,35 @@ async function ensureImportLocksTable() {
   `);
 
   importLocksTableEnsured = true;
+  return true;
+}
+
+async function ensureStatsSnapshotsTable() {
+  if (statsSnapshotsTableEnsured) return true;
+  if (!String(process.env.DATABASE_URL || '').trim()) return false;
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS stats_snapshots (
+      id SERIAL PRIMARY KEY,
+      section TEXT NOT NULL,
+      category TEXT NOT NULL,
+      snapshot_key TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbPool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS stats_snapshots_section_category_snapshot_key_idx
+      ON stats_snapshots (section, category, snapshot_key)
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS stats_snapshots_section_generated_at_idx
+      ON stats_snapshots (section, generated_at DESC)
+  `);
+
+  statsSnapshotsTableEnsured = true;
   return true;
 }
 
@@ -6424,6 +6454,474 @@ async function handleRelationshipSummaryRequest(req, res) {
   }
 }
 
+const STATS_SNAPSHOT_CATEGORIES = {
+  music: ['bands', 'shows', 'people', 'venues'],
+  wrestling: ['shows', 'people', 'venues', 'matches']
+};
+
+const STATS_SNAPSHOT_TABLES = [
+  'music_bands',
+  'music_shows',
+  'music_people',
+  'music_venues',
+  'wrestling_shows',
+  'wrestling_people',
+  'wrestling_venues',
+  'import_history'
+];
+
+const STATS_SNAPSHOT_CONFIG = {
+  music: {
+    bands: {
+      table: 'music_bands',
+      importantFields: [
+        { key: 'band_id', columns: ['band_id'], condition: `trim(coalesce(band_id, '')) = ''` },
+        { key: 'name', columns: ['band'], condition: `trim(coalesce(band, '')) = ''` },
+        { key: 'status', columns: ['status'], condition: `trim(coalesce(status, '')) = ''` },
+        { key: 'region', columns: ['region'], condition: `trim(coalesce(region, '')) = ''` }
+      ]
+    },
+    shows: {
+      table: 'music_shows',
+      importantFields: [
+        { key: 'show_name', columns: ['name'], condition: `trim(coalesce(name, '')) = ''` },
+        { key: 'date', columns: ['date'], condition: `trim(coalesce(date, '')) = ''` },
+        { key: 'venue', columns: ['venue'], condition: `trim(coalesce(venue, '')) = ''` },
+        { key: 'poster', columns: ['poster'], condition: `trim(coalesce(poster, '')) = ''` }
+      ]
+    },
+    people: {
+      table: 'music_people',
+      importantFields: [
+        { key: 'person_id', columns: ['person_id'], condition: `person_id IS NULL` },
+        { key: 'name', columns: ['name'], condition: `trim(coalesce(name, '')) = ''` },
+        { key: 'category', columns: ['category'], condition: `trim(coalesce(category, '')) = ''` },
+        {
+          key: 'bands',
+          columns: ['bands'],
+          condition: `CASE WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands) ELSE 0 END = 0`
+        }
+      ]
+    },
+    venues: {
+      table: 'music_venues',
+      importantFields: [
+        { key: 'venue_id', columns: ['venue_id'], condition: `venue_id IS NULL` },
+        { key: 'name', columns: ['venue'], condition: `trim(coalesce(venue, '')) = ''` },
+        { key: 'city', columns: ['city'], condition: `trim(coalesce(city, '')) = ''` },
+        { key: 'state', columns: ['state'], condition: `trim(coalesce(state, '')) = ''` },
+        { key: 'gps', columns: ['gps_lat', 'gps_lng'], condition: `trim(coalesce(gps_lat, '')) = '' OR trim(coalesce(gps_lng, '')) = ''` }
+      ]
+    }
+  },
+  wrestling: {
+    shows: {
+      table: 'wrestling_shows',
+      importantFields: [
+        { key: 'show_name', columns: ['show_name'], condition: `trim(coalesce(show_name, '')) = ''` },
+        { key: 'date', columns: ['date'], condition: `trim(coalesce(date, '')) = ''` },
+        { key: 'venue_id', columns: ['venue_id'], condition: `trim(coalesce(venue_id, '')) = ''` },
+        { key: 'poster', columns: ['poster'], condition: `trim(coalesce(poster, '')) = ''` }
+      ]
+    },
+    people: {
+      table: 'wrestling_people',
+      importantFields: [
+        { key: 'name', columns: ['name'], condition: `trim(coalesce(name, '')) = ''` },
+        { key: 'category', columns: ['category'], condition: `trim(coalesce(category, '')) = ''` },
+        { key: 'teams', columns: ['teams'], condition: `coalesce(array_length(teams, 1), 0) = 0` }
+      ]
+    },
+    venues: {
+      table: 'wrestling_venues',
+      importantFields: [
+        { key: 'venue_id', columns: ['venue_id'], condition: `trim(coalesce(venue_id, '')) = ''` },
+        { key: 'name', columns: ['venue_name'], condition: `trim(coalesce(venue_name, '')) = ''` },
+        { key: 'city', columns: ['city'], condition: `trim(coalesce(city, '')) = ''` },
+        { key: 'state', columns: ['state'], condition: `trim(coalesce(state, '')) = ''` },
+        { key: 'gps', columns: ['latitude', 'longitude'], condition: `latitude IS NULL OR longitude IS NULL` },
+        {
+          key: 'geo',
+          columns: ['geo'],
+          condition: `jsonb_typeof(geo) = 'object' AND (
+            trim(coalesce(geo->>'geohash', '')) = ''
+            OR trim(coalesce(geo->>'google_maps_url', '')) = ''
+            OR trim(coalesce(geo->>'apple_maps_url', '')) = ''
+            OR trim(coalesce(geo->>'osm_url', '')) = ''
+          )`
+        }
+      ]
+    }
+  }
+};
+
+function createEmptyStatsHealth() {
+  return {
+    ok: true,
+    snapshots: 0,
+    lastRebuiltAt: null,
+    overallHealth: 'unknown'
+  };
+}
+
+function buildStatsSnapshotApiItem(row) {
+  return {
+    id: row.id == null ? null : toIntegerCount(row.id),
+    section: row.section || '',
+    category: row.category || '',
+    snapshot_key: row.snapshot_key || '',
+    data: row.data && typeof row.data === 'object' && !Array.isArray(row.data) ? row.data : {},
+    generated_at: formatStatusTimestamp(row.generated_at),
+    meta: row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta) ? row.meta : {},
+    created_at: formatStatusTimestamp(row.created_at)
+  };
+}
+
+async function runStatsSnapshotQuery(warnings, label, sql, params = []) {
+  try {
+    return await dbPool.query(sql, params);
+  } catch (err) {
+    warnings.push(`Unable to build stats snapshot for ${label}: ${err && err.message ? err.message : String(err)}`);
+    return { rows: [] };
+  }
+}
+
+async function getStatsLatestImportTimestamp(section, category) {
+  try {
+    const existingTables = await getExistingPublicTables(['import_history']);
+    if (!existingTables.has('import_history')) return null;
+
+    const importCategory = section === 'wrestling' && category === 'matches' ? 'shows' : category;
+    const result = await dbPool.query(`
+      SELECT max(finished_at) AS latest_imported_at
+      FROM import_history
+      WHERE lower(trim(coalesce(section, ''))) = $1
+        AND lower(trim(coalesce(category, ''))) = $2
+    `, [section, importCategory]);
+    const row = result.rows && result.rows[0] ? result.rows[0] : {};
+    return formatStatusTimestamp(row.latest_imported_at) || null;
+  } catch (err) {
+    console.warn('Stats latest import lookup failed:', err && err.message ? err.message : String(err));
+    return null;
+  }
+}
+
+function statsHasColumns(columnsByTable, tableName, columns) {
+  return (columns || []).every((columnName) => hasDiagnosticColumn(columnsByTable, tableName, columnName));
+}
+
+async function buildTableStatsSnapshotData({ section, category, config, generated, existingTables, columnsByTable }) {
+  const warnings = [];
+  const data = {
+    section,
+    category,
+    available: false,
+    total: 0,
+    missing: {},
+    latestUpdatedAt: null,
+    latestImportedAt: null,
+    generatedAt: generated.toISOString()
+  };
+
+  if (!config || !config.table) {
+    warnings.push(`Missing stats snapshot config for ${section}/${category}.`);
+    data.warnings = warnings;
+    return data;
+  }
+
+  const tableName = config.table;
+  if (!existingTables.has(tableName)) {
+    warnings.push(`Missing table: ${tableName}`);
+    data.warnings = warnings;
+    return data;
+  }
+
+  data.available = true;
+  const totalResult = await runStatsSnapshotQuery(
+    warnings,
+    `${section}/${category} total`,
+    `SELECT count(*)::int AS total FROM ${tableName}`
+  );
+  data.total = toIntegerCount(firstDiagnosticRow(totalResult).total);
+
+  if (hasDiagnosticColumn(columnsByTable, tableName, 'updated_at')) {
+    const latestUpdatedResult = await runStatsSnapshotQuery(
+      warnings,
+      `${section}/${category} latest updated`,
+      `SELECT max(updated_at) AS latest_updated_at FROM ${tableName}`
+    );
+    data.latestUpdatedAt = formatStatusTimestamp(firstDiagnosticRow(latestUpdatedResult).latest_updated_at) || null;
+  }
+
+  for (const check of config.importantFields || []) {
+    if (!statsHasColumns(columnsByTable, tableName, check.columns)) {
+      warnings.push(`Skipped ${section}/${category} missing.${check.key}; missing columns on ${tableName}: ${check.columns.join(', ')}`);
+      continue;
+    }
+
+    const result = await runStatsSnapshotQuery(
+      warnings,
+      `${section}/${category} missing ${check.key}`,
+      `SELECT count(*)::int AS count FROM ${tableName} WHERE ${check.condition}`
+    );
+    data.missing[check.key] = toIntegerCount(firstDiagnosticRow(result).count);
+  }
+
+  data.latestImportedAt = await getStatsLatestImportTimestamp(section, category);
+  if (warnings.length) data.warnings = warnings;
+  return data;
+}
+
+async function buildWrestlingMatchesStatsSnapshotData({ generated, existingTables, columnsByTable }) {
+  const warnings = [];
+  const section = 'wrestling';
+  const category = 'matches';
+  const data = {
+    section,
+    category,
+    available: false,
+    total: 0,
+    missing: {},
+    latestUpdatedAt: null,
+    latestImportedAt: null,
+    generatedAt: generated.toISOString()
+  };
+
+  if (!existingTables.has('wrestling_shows')) {
+    warnings.push('Missing table: wrestling_shows');
+    data.warnings = warnings;
+    return data;
+  }
+  if (!hasDiagnosticColumn(columnsByTable, 'wrestling_shows', 'matches')) {
+    warnings.push('Missing columns on wrestling_shows: matches');
+    data.warnings = warnings;
+    return data;
+  }
+
+  data.available = true;
+  const matchesArraySql = `CASE WHEN jsonb_typeof(matches) = 'array' THEN matches ELSE '[]'::jsonb END`;
+  const participantArraySql = `CASE WHEN jsonb_typeof(match_item->'participants') = 'array' THEN match_item->'participants' ELSE '[]'::jsonb END`;
+  const totalsResult = await runStatsSnapshotQuery(
+    warnings,
+    'wrestling/matches totals',
+    `SELECT
+       count(*)::int AS total,
+       count(*) FILTER (WHERE jsonb_array_length(${participantArraySql}) = 0)::int AS missing_participants,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'winner', '')) = '')::int AS missing_winner,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'match_type', '')) = '')::int AS missing_match_type,
+       count(*) FILTER (
+         WHERE match_item->'match_order' IS NULL
+            OR trim(coalesce(match_item->>'match_order', '')) = ''
+       )::int AS missing_match_order
+     FROM wrestling_shows
+     CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item`
+  );
+  const totals = firstDiagnosticRow(totalsResult);
+  data.total = toIntegerCount(totals.total);
+  data.missing = {
+    participants: toIntegerCount(totals.missing_participants),
+    winner: toIntegerCount(totals.missing_winner),
+    match_type: toIntegerCount(totals.missing_match_type),
+    match_order: toIntegerCount(totals.missing_match_order)
+  };
+
+  if (hasDiagnosticColumn(columnsByTable, 'wrestling_shows', 'updated_at')) {
+    const latestUpdatedResult = await runStatsSnapshotQuery(
+      warnings,
+      'wrestling/matches latest updated',
+      `SELECT max(updated_at) AS latest_updated_at FROM wrestling_shows`
+    );
+    data.latestUpdatedAt = formatStatusTimestamp(firstDiagnosticRow(latestUpdatedResult).latest_updated_at) || null;
+  }
+
+  data.latestImportedAt = await getStatsLatestImportTimestamp(section, category);
+  if (warnings.length) data.warnings = warnings;
+  return data;
+}
+
+async function buildStatsSnapshotData({ section, category, generated, existingTables, columnsByTable }) {
+  if (section === 'wrestling' && category === 'matches') {
+    return buildWrestlingMatchesStatsSnapshotData({ generated, existingTables, columnsByTable });
+  }
+
+  const config = STATS_SNAPSHOT_CONFIG[section] && STATS_SNAPSHOT_CONFIG[section][category];
+  return buildTableStatsSnapshotData({ section, category, config, generated, existingTables, columnsByTable });
+}
+
+async function rebuildStatsSnapshot({ section, category }) {
+  const cleanSection = String(section || '').trim().toLowerCase();
+  const cleanCategory = String(category || '').trim().toLowerCase();
+  const categories = STATS_SNAPSHOT_CATEGORIES[cleanSection] || [];
+  if (!categories.includes(cleanCategory)) {
+    throw new Error(`Unsupported stats snapshot: ${cleanSection}/${cleanCategory}`);
+  }
+
+  const ready = await ensureStatsSnapshotsTable();
+  if (!ready) throw new Error('Missing DATABASE_URL environment variable.');
+
+  const generated = new Date();
+  const existingTables = await getExistingPublicTables(STATS_SNAPSHOT_TABLES);
+  const columnsByTable = await getExistingPublicColumns(STATS_SNAPSHOT_TABLES);
+  const data = await buildStatsSnapshotData({
+    section: cleanSection,
+    category: cleanCategory,
+    generated,
+    existingTables,
+    columnsByTable
+  });
+  const meta = {
+    rebuiltBy: 'admin',
+    phase: '1',
+    available: !!data.available,
+    warningCount: Array.isArray(data.warnings) ? data.warnings.length : 0
+  };
+
+  const result = await dbPool.query(`
+    INSERT INTO stats_snapshots (
+      section,
+      category,
+      snapshot_key,
+      data,
+      generated_at,
+      meta
+    )
+    VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb)
+    ON CONFLICT (section, category, snapshot_key) DO UPDATE SET
+      data = EXCLUDED.data,
+      generated_at = EXCLUDED.generated_at,
+      meta = EXCLUDED.meta
+    RETURNING id, section, category, snapshot_key, data, generated_at, meta, created_at
+  `, [
+    cleanSection,
+    cleanCategory,
+    'summary',
+    JSON.stringify(data),
+    generated,
+    JSON.stringify(meta)
+  ]);
+
+  return buildStatsSnapshotApiItem(firstDiagnosticRow(result));
+}
+
+async function rebuildSectionStats(section) {
+  const cleanSection = String(section || '').trim().toLowerCase();
+  const categories = STATS_SNAPSHOT_CATEGORIES[cleanSection] || [];
+  const items = [];
+
+  for (const category of categories) {
+    items.push(await rebuildStatsSnapshot({ section: cleanSection, category }));
+  }
+
+  return items;
+}
+
+async function getLatestStatsSnapshots({ section } = {}) {
+  const ready = await ensureStatsSnapshotsTable();
+  if (!ready) throw new Error('Missing DATABASE_URL environment variable.');
+
+  const values = [];
+  const where = [];
+  const cleanSection = String(section || '').trim().toLowerCase();
+  if (cleanSection) {
+    values.push(cleanSection);
+    where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const result = await dbPool.query(`
+    SELECT id, section, category, snapshot_key, data, generated_at, meta, created_at
+    FROM stats_snapshots
+    ${whereSql}
+    ORDER BY section ASC, category ASC, snapshot_key ASC
+  `, values);
+
+  return result.rows.map(buildStatsSnapshotApiItem);
+}
+
+async function buildStatsHealth(section) {
+  const health = createEmptyStatsHealth();
+
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) return health;
+
+    const existingTables = await getExistingPublicTables(['stats_snapshots']);
+    if (!existingTables.has('stats_snapshots')) return health;
+
+    const values = [];
+    const where = [];
+    const cleanSection = String(section || '').trim().toLowerCase();
+    if (cleanSection) {
+      values.push(cleanSection);
+      where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const result = await dbPool.query(`
+      SELECT count(*)::int AS snapshots, max(generated_at) AS last_rebuilt_at
+      FROM stats_snapshots
+      ${whereSql}
+    `, values);
+    const row = firstDiagnosticRow(result);
+    health.snapshots = toIntegerCount(row.snapshots);
+    health.lastRebuiltAt = formatStatusTimestamp(row.last_rebuilt_at) || null;
+    health.overallHealth = health.snapshots > 0 ? 'healthy' : 'unknown';
+    return health;
+  } catch (err) {
+    console.warn('Stats health read failed:', err && err.message ? err.message : String(err));
+    return health;
+  }
+}
+
+async function handleStatsSummaryRequest(req, res) {
+  try {
+    const generated = new Date();
+    const section = String(req.query.section || '').trim().toLowerCase();
+    const items = await getLatestStatsSnapshots({ section });
+
+    res.json({
+      ok: true,
+      route: '/api/admin/stats/summary',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      count: items.length,
+      items
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/stats/summary',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function handleStatsRebuildRequest(req, res, section) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+
+    const generated = new Date();
+    const cleanSection = String(section || '').trim().toLowerCase();
+    const items = cleanSection
+      ? await rebuildSectionStats(cleanSection)
+      : (await Promise.all(Object.keys(STATS_SNAPSHOT_CATEGORIES).map(rebuildSectionStats))).flat();
+
+    res.json({
+      ok: true,
+      route: cleanSection ? `/api/admin/stats/rebuild/${cleanSection}` : '/api/admin/stats/rebuild',
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
+      rebuilt: items.length,
+      items
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: section ? `/api/admin/stats/rebuild/${section}` : '/api/admin/stats/rebuild',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
 async function writeSystemImportLog(entry) {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) return;
@@ -7645,7 +8143,8 @@ async function buildMusicDiagnosticsResponse() {
       warnings: 0,
       info: 0,
       overallHealth: 'unknown'
-    }
+    },
+    statsHealth: createEmptyStatsHealth()
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -7686,6 +8185,7 @@ async function buildMusicDiagnosticsResponse() {
   response.importHealth = await buildImportHealth('music');
   response.lockHealth = await buildLockHealth('music');
   response.relationshipHealth = await buildRelationshipHealth('music');
+  response.statsHealth = await buildStatsHealth('music');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -8220,7 +8720,8 @@ async function buildWrestlingDiagnosticsResponse() {
       warnings: 0,
       info: 0,
       overallHealth: 'unknown'
-    }
+    },
+    statsHealth: createEmptyStatsHealth()
   };
 
   if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -8261,6 +8762,7 @@ async function buildWrestlingDiagnosticsResponse() {
   response.importHealth = await buildImportHealth('wrestling');
   response.lockHealth = await buildLockHealth('wrestling');
   response.relationshipHealth = await buildRelationshipHealth('wrestling');
+  response.statsHealth = await buildStatsHealth('wrestling');
 
   response.summary.warning_count = warnings.length;
   return response;
@@ -8375,6 +8877,7 @@ async function buildAdminDiagnosticsResponse() {
       info: 0,
       overallHealth: 'unknown'
     },
+    statsHealth: createEmptyStatsHealth(),
     warnings
   };
 
@@ -8382,6 +8885,7 @@ async function buildAdminDiagnosticsResponse() {
   response.importHealth = await buildImportHealth();
   response.lockHealth = await buildLockHealth();
   response.relationshipHealth = await buildRelationshipHealth();
+  response.statsHealth = await buildStatsHealth();
 
   try {
     response.music = await buildMusicDiagnosticsResponse();
@@ -8617,6 +9121,22 @@ app.get('/api/admin/relationships/music', async (req, res) => {
 
 app.get('/api/admin/relationships/wrestling', async (req, res) => {
   return handleRelationshipsRequest(req, res, 'wrestling');
+});
+
+app.get('/api/admin/stats/summary', async (req, res) => {
+  return handleStatsSummaryRequest(req, res);
+});
+
+app.get('/api/admin/stats/rebuild', async (req, res) => {
+  return handleStatsRebuildRequest(req, res);
+});
+
+app.get('/api/admin/stats/rebuild/music', async (req, res) => {
+  return handleStatsRebuildRequest(req, res, 'music');
+});
+
+app.get('/api/admin/stats/rebuild/wrestling', async (req, res) => {
+  return handleStatsRebuildRequest(req, res, 'wrestling');
 });
 
 app.get('/api/admin/diagnostics', async (req, res) => {
