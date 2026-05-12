@@ -2433,6 +2433,37 @@ function splitWrestlingSemicolonList(value) {
     .filter(Boolean);
 }
 
+function shouldSplitWrestlingWinnerCommaParts(parts) {
+  return parts.length > 2 || parts.every((part) => {
+    const clean = String(part || '').trim();
+    return /\s/.test(clean) || /^[A-Z0-9.'-]+$/.test(clean);
+  });
+}
+
+function splitWrestlingWinnerList(value) {
+  if (Array.isArray(value)) return uniqueWrestlingPeopleList(value);
+
+  const clean = String(value || '').trim().replace(/\s+/g, ' ');
+  if (!clean) return [];
+
+  const hasSemicolon = clean.includes(';');
+  const hasAnd = /\s+and\s+/i.test(clean);
+  const normalized = clean.replace(/\s+and\s+/gi, ';');
+
+  if (hasSemicolon || hasAnd) {
+    return uniqueWrestlingPeopleList(normalized.split(/[;,]/g));
+  }
+
+  if (clean.includes(',')) {
+    const commaParts = clean.split(',').map((part) => String(part || '').trim()).filter(Boolean);
+    if (shouldSplitWrestlingWinnerCommaParts(commaParts)) {
+      return uniqueWrestlingPeopleList(commaParts);
+    }
+  }
+
+  return uniqueWrestlingPeopleList([clean]);
+}
+
 function uniqueWrestlingPeopleList(values) {
   const seen = new Set();
   const out = [];
@@ -2559,6 +2590,7 @@ function buildWrestlingMatchDbItem(entry) {
   const participants = splitWrestlingSemicolonList(row.participants);
   const referees = splitWrestlingSemicolonList(row.referees);
   const extraPeople = splitWrestlingSemicolonList(row.extra_people);
+  const winners = splitWrestlingWinnerList(row.winner);
 
   return {
     match_order: toNullableInteger(row.match_order),
@@ -2570,7 +2602,7 @@ function buildWrestlingMatchDbItem(entry) {
     side_2: splitWrestlingSemicolonList(row.side_2),
     participants,
     extra_people: extraPeople,
-    winner: toDbText(row.winner) || '',
+    winner: winners,
     referees,
     tagged_people: uniqueWrestlingPeopleList(participants.concat(referees, extraPeople)),
     notes: toDbText(row.notes) || ''
@@ -3721,9 +3753,10 @@ async function buildMusicShowsDbStatsResponse() {
 }
 
 function buildWrestlingMatchDbApiItem(match) {
-  if (!match || typeof match !== 'object') return { participants: [], extra_people: [], referees: [], tagged_people: [] };
+  if (!match || typeof match !== 'object') return { participants: [], extra_people: [], winner: [], referees: [], tagged_people: [] };
   const participants = Array.isArray(match.participants) ? match.participants : [];
   const extraPeople = Array.isArray(match.extra_people) ? match.extra_people : [];
+  const winners = splitWrestlingWinnerList(match.winner);
   const referees = Array.isArray(match.referees) ? match.referees : [];
 
   return {
@@ -3732,6 +3765,7 @@ function buildWrestlingMatchDbApiItem(match) {
     side_2: Array.isArray(match.side_2) ? match.side_2 : [],
     participants,
     extra_people: extraPeople,
+    winner: winners,
     referees,
     tagged_people: Array.isArray(match.tagged_people)
       ? match.tagged_people
@@ -3794,6 +3828,14 @@ function getWrestlingMatchesArraySql() {
 
 function getWrestlingParticipantsArraySql(matchAlias) {
   return `CASE WHEN jsonb_typeof(${matchAlias}->'participants') = 'array' THEN ${matchAlias}->'participants' ELSE '[]'::jsonb END`;
+}
+
+function getWrestlingWinnerArraySql(matchAlias) {
+  return `CASE
+    WHEN jsonb_typeof(${matchAlias}->'winner') = 'array' THEN ${matchAlias}->'winner'
+    WHEN trim(coalesce(${matchAlias}->>'winner', '')) <> '' THEN to_jsonb(regexp_split_to_array(regexp_replace(${matchAlias}->>'winner', '\\s+and\\s+', ';', 'gi'), '\\s*;\\s*|\\s*,\\s*'))
+    ELSE '[]'::jsonb
+  END`;
 }
 
 function getWrestlingRefereesArraySql(matchAlias) {
@@ -3921,7 +3963,8 @@ function buildWrestlingShowsDbQueryOptions(query) {
     where.push(`EXISTS (
       SELECT 1
       FROM jsonb_array_elements(${matchesArraySql}) AS match_item
-      WHERE lower(trim(coalesce(match_item->>'winner', ''))) = $${values.length}
+      CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingWinnerArraySql('match_item')}) AS winner_item(value)
+      WHERE lower(trim(winner_item.value)) = $${values.length}
     )`);
     filters.winner = winner;
   }
@@ -4035,6 +4078,7 @@ async function buildWrestlingShowsDbStatsResponse() {
   const generated = new Date();
   const matchesArraySql = getWrestlingMatchesArraySql();
   const participantArraySql = getWrestlingParticipantsArraySql('match_item');
+  const winnerArraySql = getWrestlingWinnerArraySql('match_item');
   const refereeArraySql = getWrestlingRefereesArraySql('match_item');
   const extraPeopleArraySql = getWrestlingExtraPeopleArraySql('match_item');
   const taggedPeopleArraySql = getWrestlingAllTaggedPeopleArraySql('match_item');
@@ -4129,10 +4173,11 @@ async function buildWrestlingShowsDbStatsResponse() {
     LIMIT 25
   `);
   const topWinnersQuery = dbPool.query(`
-    SELECT match_item->>'winner' AS winner, count(*)::int AS wins
+    SELECT winner_item.value AS winner, count(*)::int AS wins
     FROM wrestling_shows
     CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
-    WHERE trim(coalesce(match_item->>'winner', '')) <> ''
+    CROSS JOIN LATERAL jsonb_array_elements_text(${winnerArraySql}) AS winner_item(value)
+    WHERE trim(winner_item.value) <> ''
     GROUP BY 1
     ORDER BY wins DESC, winner ASC
     LIMIT 25
@@ -6490,11 +6535,12 @@ async function addWrestlingRelationshipIssues(items, warnings, existingTables, c
       'wrestling winner references',
       `WITH people_lookup AS (${peopleLookupSql}),
        refs AS (
-         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, match_item->>'winner' AS winner
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, winner_item.value AS winner
          FROM wrestling_shows ws
          CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
-         WHERE trim(coalesce(match_item->>'winner', '')) <> ''
-           AND lower(trim(match_item->>'winner')) NOT IN ('draw', 'no contest', 'n/a', 'none', 'unknown')
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingWinnerArraySql('match_item')}) AS winner_item(value)
+         WHERE trim(winner_item.value) <> ''
+           AND lower(trim(winner_item.value)) NOT IN ('draw', 'no contest', 'n/a', 'none', 'unknown')
        )
        SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.winner
        FROM refs
@@ -6979,13 +7025,14 @@ async function buildWrestlingMatchesStatsSnapshotData({ generated, existingTable
   data.available = true;
   const matchesArraySql = `CASE WHEN jsonb_typeof(matches) = 'array' THEN matches ELSE '[]'::jsonb END`;
   const participantArraySql = `CASE WHEN jsonb_typeof(match_item->'participants') = 'array' THEN match_item->'participants' ELSE '[]'::jsonb END`;
+  const winnerArraySql = getWrestlingWinnerArraySql('match_item');
   const totalsResult = await runStatsSnapshotQuery(
     warnings,
     'wrestling/matches totals',
     `SELECT
        count(*)::int AS total,
        count(*) FILTER (WHERE jsonb_array_length(${participantArraySql}) = 0)::int AS missing_participants,
-       count(*) FILTER (WHERE trim(coalesce(match_item->>'winner', '')) = '')::int AS missing_winner,
+       count(*) FILTER (WHERE jsonb_array_length(${winnerArraySql}) = 0)::int AS missing_winner,
        count(*) FILTER (WHERE trim(coalesce(match_item->>'match_type', '')) = '')::int AS missing_match_type,
        count(*) FILTER (
          WHERE match_item->'match_order' IS NULL
@@ -8919,6 +8966,7 @@ async function addWrestlingMatchDiagnostics(response, existingTables, columnsByT
 
   const matchesArraySql = `CASE WHEN jsonb_typeof(matches) = 'array' THEN matches ELSE '[]'::jsonb END`;
   const participantArraySql = `CASE WHEN jsonb_typeof(match_item->'participants') = 'array' THEN match_item->'participants' ELSE '[]'::jsonb END`;
+  const winnerArraySql = getWrestlingWinnerArraySql('match_item');
   const matches = response.matches;
   const samples = {};
 
@@ -8928,7 +8976,7 @@ async function addWrestlingMatchDiagnostics(response, existingTables, columnsByT
     `SELECT
        count(*)::int AS total_matches,
        count(*) FILTER (WHERE jsonb_array_length(${participantArraySql}) = 0)::int AS matches_missing_participants,
-       count(*) FILTER (WHERE trim(coalesce(match_item->>'winner', '')) = '')::int AS matches_missing_winner,
+       count(*) FILTER (WHERE jsonb_array_length(${winnerArraySql}) = 0)::int AS matches_missing_winner,
        count(*) FILTER (WHERE trim(coalesce(match_item->>'match_type', '')) = '')::int AS matches_missing_match_type,
        count(*) FILTER (
          WHERE match_item->'match_order' IS NULL
@@ -8953,7 +9001,11 @@ async function addWrestlingMatchDiagnostics(response, existingTables, columnsByT
       match_item->>'match_order' AS match_order,
       match_item->>'match_type' AS match_type,
       match_item->'participants' AS participants,
-      match_item->>'winner' AS winner
+      (
+        SELECT array_to_string(array_agg(winner_item.value), '; ')
+        FROM jsonb_array_elements_text(${winnerArraySql}) AS winner_item(value)
+        WHERE trim(winner_item.value) <> ''
+      ) AS winner
     FROM wrestling_shows ws
     CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
   `;
@@ -8971,7 +9023,7 @@ async function addWrestlingMatchDiagnostics(response, existingTables, columnsByT
     warnings,
     'wrestling match missing winner samples',
     `${sampleBaseSql}
-     WHERE trim(coalesce(match_item->>'winner', '')) = ''
+     WHERE jsonb_array_length(${winnerArraySql}) = 0
      ORDER BY ws.show_id ASC
      LIMIT 10`
   );
