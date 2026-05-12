@@ -2082,21 +2082,27 @@ async function importMusicPeopleToDatabase(forceRefresh) {
 }
 
 const MUSIC_VENUE_IMPORT_HEADER_ALIASES = {
+  venue_id: 'venue_key',
+  venueid: 'venue_key',
   venue: 'venue',
   name: 'venue',
+  venue_name: 'venue',
+  venuename: 'venue',
   city: 'city',
   state: 'state',
-  gps_lat: 'gps_lat',
-  gpslat: 'gps_lat',
-  latitude: 'gps_lat',
-  lat: 'gps_lat',
-  gps_lng: 'gps_lng',
-  gpslng: 'gps_lng',
-  gps_lon: 'gps_lng',
-  gpslon: 'gps_lng',
-  longitude: 'gps_lng',
-  lng: 'gps_lng',
-  lon: 'gps_lng',
+  country: 'country',
+  region: 'region',
+  gps_lat: 'latitude',
+  gpslat: 'latitude',
+  latitude: 'latitude',
+  lat: 'latitude',
+  gps_lng: 'longitude',
+  gpslng: 'longitude',
+  gps_lon: 'longitude',
+  gpslon: 'longitude',
+  longitude: 'longitude',
+  lng: 'longitude',
+  lon: 'longitude',
   logo: 'logo',
   logo_url: 'logo',
   logourl: 'logo',
@@ -2125,6 +2131,9 @@ function cleanMusicVenueText(value) {
 }
 
 function getMusicVenueGroupKey(row) {
+  const venueKey = cleanMusicVenueText(row.venue_key);
+  if (venueKey) return normalizeMusicLookupKey(venueKey);
+
   return [
     normalizeMusicLookupKey(row.venue),
     normalizeMusicLookupKey(row.city),
@@ -2152,10 +2161,13 @@ function buildMusicVenueDbGroups(rows) {
     if (!groups.has(key)) {
       groups.set(key, {
         venue: '',
+        venue_key: '',
         city: '',
         state: '',
-        gps_lat: '',
-        gps_lng: '',
+        country: '',
+        region: '',
+        latitude: '',
+        longitude: '',
         logo: '',
         description: '',
         notes: '',
@@ -2165,11 +2177,14 @@ function buildMusicVenueDbGroups(rows) {
     }
 
     const group = groups.get(key);
+    setMusicVenueGroupValue(group, 'venue_key', row.venue_key);
     setMusicVenueGroupValue(group, 'venue', row.venue);
     setMusicVenueGroupValue(group, 'city', row.city);
     setMusicVenueGroupValue(group, 'state', row.state);
-    setMusicVenueGroupValue(group, 'gps_lat', row.gps_lat);
-    setMusicVenueGroupValue(group, 'gps_lng', row.gps_lng);
+    setMusicVenueGroupValue(group, 'country', row.country);
+    setMusicVenueGroupValue(group, 'region', row.region);
+    setMusicVenueGroupValue(group, 'latitude', row.latitude);
+    setMusicVenueGroupValue(group, 'longitude', row.longitude);
     setMusicVenueGroupValue(group, 'logo', row.logo);
     setMusicVenueGroupValue(group, 'description', row.description);
     setMusicVenueGroupValue(group, 'notes', row.notes);
@@ -2225,7 +2240,17 @@ function getMusicVenueShowCount(venue, showCounts) {
   return showCounts.venueOnly.get(venueKey) || 0;
 }
 
-function buildMusicVenueDbRows(rows, showCounts) {
+function buildMusicVenueFallbackKey(venue) {
+  const slug = slugifyMusicBandId([
+    venue.venue,
+    venue.city,
+    venue.state,
+    venue.country
+  ].filter(Boolean).join(' '));
+  return slug ? `mv_${slug.replace(/-/g, '_')}` : '';
+}
+
+function buildMusicVenueDbRows(rows, showCounts, legacyVenueIdStart = 0) {
   const grouped = buildMusicVenueDbGroups(rows);
   const venues = grouped.groups.sort((a, b) => {
     return a.venue.localeCompare(b.venue, undefined, { numeric: true, sensitivity: 'base' }) ||
@@ -2234,21 +2259,32 @@ function buildMusicVenueDbRows(rows, showCounts) {
   });
   const items = venues.map((venue, index) => {
     const showCount = getMusicVenueShowCount(venue, showCounts);
+    const latitude = toNullableNumber(venue.latitude);
+    const longitude = toNullableNumber(venue.longitude);
+    const venueKey = cleanMusicVenueText(venue.venue_key) || buildMusicVenueFallbackKey(venue);
+    const latitudeText = latitude == null ? '' : String(latitude);
+    const longitudeText = longitude == null ? '' : String(longitude);
 
     return {
-      venue_id: index + 1,
+      venue_id: legacyVenueIdStart + index + 1,
+      venue_key: venueKey,
       venue: venue.venue,
       city: venue.city || null,
       state: venue.state || null,
-      gps_lat: venue.gps_lat || null,
-      gps_lng: venue.gps_lng || null,
+      country: venue.country || null,
+      region: venue.region || null,
+      gps_lat: latitudeText || null,
+      gps_lng: longitudeText || null,
       logo: venue.logo || null,
+      latitude,
+      longitude,
       description: venue.description || null,
       notes: venue.notes || null,
       status: venue.status || null,
+      geo: buildPhase1WrestlingVenueGeo(latitude, longitude),
       location: {
-        gps_lat: venue.gps_lat || '',
-        gps_lng: venue.gps_lng || ''
+        gps_lat: latitudeText,
+        gps_lng: longitudeText
       },
       media: {
         logo: venue.logo || ''
@@ -2263,39 +2299,87 @@ function buildMusicVenueDbRows(rows, showCounts) {
   return { items, skippedMissingVenue: grouped.skippedMissingVenue };
 }
 
+async function getMusicVenueLegacyIdStart(client) {
+  try {
+    const result = await client.query('SELECT coalesce(max(venue_id), 0)::int AS max_venue_id FROM music_venues');
+    const row = result.rows && result.rows[0] ? result.rows[0] : {};
+    return toIntegerCount(row.max_venue_id);
+  } catch (err) {
+    console.warn('Music-Venues legacy id lookup skipped:', err && err.message ? err.message : String(err));
+    return 0;
+  }
+}
+
+async function attachMusicVenueKeyToLegacyRow(client, item) {
+  if (!item.venue_key) return;
+
+  await client.query(`
+    UPDATE music_venues
+    SET venue_key = $1
+    WHERE venue_key IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM music_venues existing
+        WHERE existing.venue_key = $1
+      )
+      AND lower(trim(coalesce(venue, ''))) = $2
+      AND lower(trim(coalesce(city, ''))) = $3
+      AND lower(trim(coalesce(state, ''))) = $4
+  `, [
+    item.venue_key,
+    normalizeMusicLookupKey(item.venue),
+    normalizeMusicLookupKey(item.city),
+    normalizeMusicLookupKey(item.state)
+  ]);
+}
+
 async function upsertMusicVenueDbRow(client, item) {
+  await attachMusicVenueKeyToLegacyRow(client, item);
+
   await client.query(`
     INSERT INTO music_venues (
       venue_id,
+      venue_key,
       venue,
       city,
       state,
+      country,
+      region,
       gps_lat,
       gps_lng,
       logo,
+      latitude,
+      longitude,
       description,
       notes,
       status,
+      geo,
       location,
       media,
       stats,
       raw_sheet
     )
     VALUES (
-      $1, $2, $3, $4, $5, $6, $7,
-      $8, $9, $10, $11::jsonb, $12::jsonb,
-      $13::jsonb, $14::jsonb
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9, $10,
+      $11, $12, $13, $14, $15,
+      $16::jsonb, $17::jsonb, $18::jsonb, $19::jsonb, $20::jsonb
     )
-    ON CONFLICT (venue_id) DO UPDATE SET
+    ON CONFLICT (venue_key) DO UPDATE SET
       venue = EXCLUDED.venue,
       city = EXCLUDED.city,
       state = EXCLUDED.state,
+      country = EXCLUDED.country,
+      region = EXCLUDED.region,
       gps_lat = EXCLUDED.gps_lat,
       gps_lng = EXCLUDED.gps_lng,
       logo = EXCLUDED.logo,
+      latitude = EXCLUDED.latitude,
+      longitude = EXCLUDED.longitude,
       description = EXCLUDED.description,
       notes = EXCLUDED.notes,
       status = EXCLUDED.status,
+      geo = EXCLUDED.geo,
       location = EXCLUDED.location,
       media = EXCLUDED.media,
       stats = EXCLUDED.stats,
@@ -2303,15 +2387,21 @@ async function upsertMusicVenueDbRow(client, item) {
       updated_at = NOW()
   `, [
     item.venue_id,
+    item.venue_key,
     item.venue,
     item.city,
     item.state,
+    item.country,
+    item.region,
     item.gps_lat,
     item.gps_lng,
     item.logo,
+    item.latitude,
+    item.longitude,
     item.description,
     item.notes,
     item.status,
+    stringifyDbJson(item.geo),
     stringifyDbJson(item.location),
     stringifyDbJson(item.media),
     stringifyDbJson(item.stats),
@@ -2330,7 +2420,8 @@ async function importMusicVenuesToDatabase(forceRefresh) {
 
   try {
     const showCounts = await getMusicVenueShowCountMaps(client);
-    const built = buildMusicVenueDbRows(rows, showCounts);
+    const legacyVenueIdStart = await getMusicVenueLegacyIdStart(client);
+    const built = buildMusicVenueDbRows(rows, showCounts, legacyVenueIdStart);
     const result = {
       ok: true,
       route: '/admin/import/music/venues',
@@ -5023,26 +5114,33 @@ async function buildMusicPeopleDbStatsResponse() {
 }
 
 function buildMusicVenueDbApiItem(row) {
-  const location = row.location && typeof row.location === 'object' ? row.location : {};
-  const media = row.media && typeof row.media === 'object' ? row.media : {};
+  const latitude = row.latitude == null ? toNullableNumber(row.gps_lat) : toNullableNumber(row.latitude);
+  const longitude = row.longitude == null ? toNullableNumber(row.gps_lng) : toNullableNumber(row.longitude);
+  const geo = buildPhase1WrestlingVenueGeo(latitude, longitude, row.geo);
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   stats.showCount = toIntegerCount(stats.showCount);
 
   return {
-    venue_id: row.venue_id,
+    venue_id: row.venue_key || (row.venue_id == null ? '' : String(row.venue_id)),
     venue: row.venue || '',
     city: row.city || '',
     state: row.state || '',
+    country: row.country || '',
+    region: row.region || '',
+    logo: row.logo || '',
+    latitude,
+    longitude,
+    status: row.status || '',
+    notes: row.notes || '',
+    geo,
+    description: row.description || '',
     location: {
-      gps_lat: String(location.gps_lat || row.gps_lat || ''),
-      gps_lng: String(location.gps_lng || row.gps_lng || '')
+      gps_lat: latitude == null ? '' : String(latitude),
+      gps_lng: longitude == null ? '' : String(longitude)
     },
     media: {
-      logo: String(media.logo || row.logo || '')
+      logo: row.logo || ''
     },
-    description: row.description || '',
-    notes: row.notes || '',
-    status: row.status || '',
     stats
   };
 }
@@ -5054,12 +5152,17 @@ function buildMusicVenuesDbQueryOptions(query) {
   const search = String(query.search || '').trim();
   const city = String(query.city || '').trim();
   const state = String(query.state || '').trim();
+  const country = String(query.country || '').trim();
+  const region = String(query.region || '').trim();
   const status = String(query.status || '').trim();
   const sortFields = {
-    venue_id: 'venue_id',
+    venue_id: 'coalesce(venue_key, venue_id::text)',
+    venue_key: 'venue_key',
     venue: 'venue',
     city: 'city',
     state: 'state',
+    country: 'country',
+    region: 'region',
     status: 'status',
     created_at: 'created_at',
     updated_at: 'updated_at'
@@ -5073,12 +5176,16 @@ function buildMusicVenuesDbQueryOptions(query) {
     const idx = values.length;
     where.push(`(
       venue ILIKE $${idx}
+      OR coalesce(venue_key, '') ILIKE $${idx}
       OR coalesce(city, '') ILIKE $${idx}
       OR coalesce(state, '') ILIKE $${idx}
+      OR coalesce(country, '') ILIKE $${idx}
+      OR coalesce(region, '') ILIKE $${idx}
       OR coalesce(status, '') ILIKE $${idx}
       OR coalesce(description, '') ILIKE $${idx}
       OR coalesce(notes, '') ILIKE $${idx}
       OR coalesce(logo, '') ILIKE $${idx}
+      OR geo::text ILIKE $${idx}
       OR location::text ILIKE $${idx}
       OR media::text ILIKE $${idx}
       OR stats::text ILIKE $${idx}
@@ -5097,6 +5204,18 @@ function buildMusicVenuesDbQueryOptions(query) {
     values.push(state.toLowerCase());
     where.push(`lower(trim(coalesce(state, ''))) = $${values.length}`);
     filters.state = state;
+  }
+
+  if (country) {
+    values.push(country.toLowerCase());
+    where.push(`lower(trim(coalesce(country, ''))) = $${values.length}`);
+    filters.country = country;
+  }
+
+  if (region) {
+    values.push(region.toLowerCase());
+    where.push(`lower(trim(coalesce(region, ''))) = $${values.length}`);
+    filters.region = region;
   }
 
   if (status) {
@@ -5137,7 +5256,7 @@ async function handleMusicVenuesDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT venue_id, venue, city, state, gps_lat, gps_lng, logo, description, notes, status, location, media, stats
+      `SELECT venue_id, venue_key, venue, city, state, country, region, gps_lat, gps_lng, logo, latitude, longitude, description, notes, status, geo, location, media, stats
        FROM music_venues
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -5187,12 +5306,12 @@ async function buildMusicVenuesDbStatsResponse() {
     SELECT
       count(*)::int AS total_venues,
       count(*) FILTER (
-        WHERE trim(coalesce(gps_lat, '')) <> ''
-          AND trim(coalesce(gps_lng, '')) <> ''
+        WHERE (latitude IS NOT NULL OR trim(coalesce(gps_lat, '')) <> '')
+          AND (longitude IS NOT NULL OR trim(coalesce(gps_lng, '')) <> '')
       )::int AS venues_with_gps,
       count(*) FILTER (
-        WHERE trim(coalesce(gps_lat, '')) = ''
-          OR trim(coalesce(gps_lng, '')) = ''
+        WHERE (latitude IS NULL AND trim(coalesce(gps_lat, '')) = '')
+          OR (longitude IS NULL AND trim(coalesce(gps_lng, '')) = '')
       )::int AS venues_missing_gps,
       count(*) FILTER (WHERE trim(coalesce(logo, '')) <> '')::int AS venues_with_logo,
       count(*) FILTER (WHERE trim(coalesce(logo, '')) = '')::int AS venues_missing_logo
@@ -5219,11 +5338,18 @@ async function buildMusicVenuesDbStatsResponse() {
     GROUP BY 1
     ORDER BY venue_count DESC, status ASC
   `);
-  const [totalsResult, byStateResult, byCityResult, byStatusResult] = await Promise.all([
+  const byRegionQuery = dbPool.query(`
+    SELECT coalesce(nullif(trim(region), ''), 'Unknown') AS region, count(*)::int AS venue_count
+    FROM music_venues
+    GROUP BY 1
+    ORDER BY venue_count DESC, region ASC
+  `);
+  const [totalsResult, byStateResult, byCityResult, byStatusResult, byRegionResult] = await Promise.all([
     totalsQuery,
     byStateQuery,
     byCityQuery,
-    byStatusQuery
+    byStatusQuery,
+    byRegionQuery
   ]);
   const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
 
@@ -5245,7 +5371,8 @@ async function buildMusicVenuesDbStatsResponse() {
     },
     venuesByState: byStateResult.rows.map((row) => ({ state: row.state, venueCount: toIntegerCount(row.venue_count) })),
     venuesByCity: byCityResult.rows.map((row) => ({ city: row.city, state: row.state, venueCount: toIntegerCount(row.venue_count) })),
-    venuesByStatus: byStatusResult.rows.map((row) => ({ status: row.status, venueCount: toIntegerCount(row.venue_count) }))
+    venuesByStatus: byStatusResult.rows.map((row) => ({ status: row.status, venueCount: toIntegerCount(row.venue_count) })),
+    venuesByRegion: byRegionResult.rows.map((row) => ({ region: row.region, venueCount: toIntegerCount(row.venue_count) }))
   };
 }
 

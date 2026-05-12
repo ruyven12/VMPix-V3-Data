@@ -144,15 +144,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS music_people_person_id_key
 CREATE TABLE IF NOT EXISTS music_venues (
     id SERIAL PRIMARY KEY,
     venue_id INTEGER UNIQUE NOT NULL,
+    venue_key TEXT UNIQUE,
     venue TEXT NOT NULL,
     city TEXT,
     state TEXT,
+    country TEXT,
+    region TEXT,
     gps_lat TEXT,
     gps_lng TEXT,
     logo TEXT,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
     description TEXT,
     notes TEXT,
     status TEXT,
+    geo JSONB DEFAULT '{}'::jsonb,
     location JSONB DEFAULT '{}'::jsonb,
     media JSONB DEFAULT '{}'::jsonb,
     stats JSONB DEFAULT '{}'::jsonb,
@@ -165,6 +171,9 @@ ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS venue_id INTEGER;
 
 ALTER TABLE IF EXISTS music_venues
+    ADD COLUMN IF NOT EXISTS venue_key TEXT;
+
+ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS venue TEXT;
 
 ALTER TABLE IF EXISTS music_venues
@@ -172,6 +181,12 @@ ALTER TABLE IF EXISTS music_venues
 
 ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS state TEXT;
+
+ALTER TABLE IF EXISTS music_venues
+    ADD COLUMN IF NOT EXISTS country TEXT;
+
+ALTER TABLE IF EXISTS music_venues
+    ADD COLUMN IF NOT EXISTS region TEXT;
 
 ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS gps_lat TEXT;
@@ -183,6 +198,12 @@ ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS logo TEXT;
 
 ALTER TABLE IF EXISTS music_venues
+    ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+
+ALTER TABLE IF EXISTS music_venues
+    ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+
+ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS description TEXT;
 
 ALTER TABLE IF EXISTS music_venues
@@ -190,6 +211,9 @@ ALTER TABLE IF EXISTS music_venues
 
 ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS status TEXT;
+
+ALTER TABLE IF EXISTS music_venues
+    ADD COLUMN IF NOT EXISTS geo JSONB DEFAULT '{}'::jsonb;
 
 ALTER TABLE IF EXISTS music_venues
     ADD COLUMN IF NOT EXISTS location JSONB DEFAULT '{}'::jsonb;
@@ -211,6 +235,9 @@ ALTER TABLE IF EXISTS music_venues
 
 CREATE UNIQUE INDEX IF NOT EXISTS music_venues_venue_id_key
     ON music_venues (venue_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS music_venues_venue_key_key
+    ON music_venues (venue_key);
 
 CREATE TABLE IF NOT EXISTS system_import_logs (
     id SERIAL PRIMARY KEY,
