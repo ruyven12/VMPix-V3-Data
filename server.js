@@ -3649,10 +3649,10 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     show_id: toIntegerCount(row.show_id),
     name: row.name || '',
     venue_id: venueId,
-    venue: row.venue || '',
+    venue: venueDetails ? venueDetails.venue : (row.venue || ''),
     venue_details: venueDetails,
-    city: row.city || '',
-    state: row.state || '',
+    city: row.city || (venueDetails ? venueDetails.city : ''),
+    state: row.state || (venueDetails ? venueDetails.state : ''),
     date: row.date || '',
     poster: row.poster || '',
     notes: row.notes || '',
@@ -3678,7 +3678,7 @@ function buildMusicShowsDbQueryOptions(query) {
     name: 'name',
     date: 'show_date',
     venue_id: 'venue_id',
-    venue: 'venue',
+    venue: `coalesce((SELECT mv.venue FROM music_venues mv WHERE lower(trim(coalesce(mv.venue_key, ''))) = lower(trim(coalesce(music_shows.venue_id, ''))) LIMIT 1), venue)`,
     city: 'city',
     state: 'state',
     created_at: 'created_at',
@@ -3696,6 +3696,12 @@ function buildMusicShowsDbQueryOptions(query) {
       coalesce(name, '') ILIKE $${idx}
       OR coalesce(venue_id, '') ILIKE $${idx}
       OR coalesce(venue, '') ILIKE $${idx}
+      OR EXISTS (
+        SELECT 1
+        FROM music_venues mv
+        WHERE lower(trim(coalesce(mv.venue_key, ''))) = lower(trim(coalesce(music_shows.venue_id, '')))
+          AND coalesce(mv.venue, '') ILIKE $${idx}
+      )
       OR coalesce(city, '') ILIKE $${idx}
       OR coalesce(state, '') ILIKE $${idx}
       OR coalesce(notes, '') ILIKE $${idx}
@@ -3725,7 +3731,15 @@ function buildMusicShowsDbQueryOptions(query) {
 
   if (venue) {
     values.push(venue.toLowerCase());
-    where.push(`lower(trim(coalesce(venue, ''))) = $${values.length}`);
+    where.push(`(
+      lower(trim(coalesce(venue, ''))) = $${values.length}
+      OR EXISTS (
+        SELECT 1
+        FROM music_venues mv
+        WHERE lower(trim(coalesce(mv.venue_key, ''))) = lower(trim(coalesce(music_shows.venue_id, '')))
+          AND lower(trim(coalesce(mv.venue, ''))) = $${values.length}
+      )
+    )`);
     filters.venue = venue;
   }
 
@@ -3845,8 +3859,10 @@ async function buildMusicShowsDbStatsResponse() {
     ORDER BY shows_total DESC, city ASC
   `);
   const byVenueQuery = dbPool.query(`
-    SELECT coalesce(nullif(trim(venue), ''), 'Unknown') AS venue, count(*)::int AS shows_total
-    FROM music_shows
+    SELECT coalesce(nullif(trim(mv.venue), ''), nullif(trim(ms.venue), ''), 'Unknown') AS venue, count(*)::int AS shows_total
+    FROM music_shows ms
+    LEFT JOIN music_venues mv
+      ON lower(trim(coalesce(mv.venue_key, ''))) = lower(trim(coalesce(ms.venue_id, '')))
     GROUP BY 1
     ORDER BY shows_total DESC, venue ASC
   `);
