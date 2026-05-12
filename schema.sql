@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS music_shows (
     id SERIAL PRIMARY KEY,
     show_id INTEGER UNIQUE NOT NULL,
     name TEXT,
+    venue_id TEXT,
     venue TEXT,
     city TEXT,
     state TEXT,
@@ -60,6 +61,9 @@ ALTER TABLE IF EXISTS music_shows
 
 ALTER TABLE IF EXISTS music_shows
     ADD COLUMN IF NOT EXISTS name TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS venue_id TEXT;
 
 ALTER TABLE IF EXISTS music_shows
     ADD COLUMN IF NOT EXISTS venue TEXT;

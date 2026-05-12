@@ -1633,6 +1633,8 @@ const MUSIC_SHOW_IMPORT_HEADER_ALIASES = {
   name: 'name',
   show_name: 'name',
   showname: 'name',
+  venue_id: 'venue_id',
+  venueid: 'venue_id',
   venue: 'venue',
   city: 'city',
   state: 'state',
@@ -1715,7 +1717,7 @@ function parseMusicShowDate(value) {
 }
 
 function hasMusicShowImportData(row) {
-  if (['name', 'venue', 'city', 'state', 'date', 'poster', 'notes', 'camera_1', 'camera_2'].some((key) => toDbText(row[key]))) {
+  if (['name', 'venue_id', 'venue', 'city', 'state', 'date', 'poster', 'notes', 'camera_1', 'camera_2'].some((key) => toDbText(row[key]))) {
     return true;
   }
 
@@ -1760,6 +1762,7 @@ function buildMusicShowDbRow(row, showId, bandCounts) {
   return {
     show_id: showId,
     name: toDbText(row.name),
+    venue_id: toDbText(row.venue_id),
     venue: toDbText(row.venue),
     city: toDbText(row.city),
     state: toDbText(row.state),
@@ -1782,6 +1785,7 @@ async function upsertMusicShowDbRow(client, item) {
     INSERT INTO music_shows (
       show_id,
       name,
+      venue_id,
       venue,
       city,
       state,
@@ -1798,10 +1802,11 @@ async function upsertMusicShowDbRow(client, item) {
     VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10,
-      $11, $12::jsonb, $13::jsonb, $14::jsonb
+      $11, $12, $13::jsonb, $14::jsonb, $15::jsonb
     )
     ON CONFLICT (show_id) DO UPDATE SET
       name = EXCLUDED.name,
+      venue_id = EXCLUDED.venue_id,
       venue = EXCLUDED.venue,
       city = EXCLUDED.city,
       state = EXCLUDED.state,
@@ -1818,6 +1823,7 @@ async function upsertMusicShowDbRow(client, item) {
   `, [
     item.show_id,
     item.name,
+    item.venue_id,
     item.venue,
     item.city,
     item.state,
@@ -3609,11 +3615,42 @@ async function buildMusicBandsDbStatsResponse(forceRefresh) {
   };
 }
 
-function buildMusicShowDbApiItem(row) {
+async function getMusicVenueDetailsMap(venueIds) {
+  const keys = Array.from(new Set(
+    (venueIds || [])
+      .map(normalizeMusicLookupKey)
+      .filter(Boolean)
+  ));
+  const venues = new Map();
+  if (!keys.length) return venues;
+
+  try {
+    const result = await dbPool.query(`
+      SELECT venue_id, venue_key, venue, city, state, country, region, gps_lat, gps_lng, logo, latitude, longitude, description, notes, status, geo, location, media, stats
+      FROM music_venues
+      WHERE lower(trim(coalesce(venue_key, ''))) = ANY($1::text[])
+    `, [keys]);
+
+    result.rows.forEach((row) => {
+      venues.set(normalizeMusicLookupKey(row.venue_key), buildMusicVenueDbApiItem(row));
+    });
+  } catch (err) {
+    console.warn('Music venue details lookup skipped:', err && err.message ? err.message : String(err));
+  }
+
+  return venues;
+}
+
+function buildMusicShowDbApiItem(row, venueDetailsMap) {
+  const venueId = row.venue_id || '';
+  const venueDetails = venueId ? (venueDetailsMap.get(normalizeMusicLookupKey(venueId)) || null) : null;
+
   return {
     show_id: toIntegerCount(row.show_id),
     name: row.name || '',
+    venue_id: venueId,
     venue: row.venue || '',
+    venue_details: venueDetails,
     city: row.city || '',
     state: row.state || '',
     date: row.date || '',
@@ -3633,12 +3670,14 @@ function buildMusicShowsDbQueryOptions(query) {
   const search = String(query.search || '').trim();
   const state = String(query.state || '').trim();
   const city = String(query.city || '').trim();
+  const venueId = String(query.venue_id || '').trim();
   const venue = String(query.venue || '').trim();
   const band = String(query.band || '').trim();
   const sortFields = {
     show_id: 'show_id',
     name: 'name',
     date: 'show_date',
+    venue_id: 'venue_id',
     venue: 'venue',
     city: 'city',
     state: 'state',
@@ -3655,6 +3694,7 @@ function buildMusicShowsDbQueryOptions(query) {
     const idx = values.length;
     where.push(`(
       coalesce(name, '') ILIKE $${idx}
+      OR coalesce(venue_id, '') ILIKE $${idx}
       OR coalesce(venue, '') ILIKE $${idx}
       OR coalesce(city, '') ILIKE $${idx}
       OR coalesce(state, '') ILIKE $${idx}
@@ -3675,6 +3715,12 @@ function buildMusicShowsDbQueryOptions(query) {
     values.push(city.toLowerCase());
     where.push(`lower(trim(coalesce(city, ''))) = $${values.length}`);
     filters.city = city;
+  }
+
+  if (venueId) {
+    values.push(venueId.toLowerCase());
+    where.push(`lower(trim(coalesce(venue_id, ''))) = $${values.length}`);
+    filters.venue_id = venueId;
   }
 
   if (venue) {
@@ -3725,7 +3771,7 @@ async function handleMusicShowsDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT show_id, name, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats
+      `SELECT show_id, name, venue_id, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats
        FROM music_shows
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -3733,7 +3779,8 @@ async function handleMusicShowsDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const data = result.rows.map(buildMusicShowDbApiItem);
+    const venueDetailsMap = await getMusicVenueDetailsMap(result.rows.map((row) => row.venue_id));
+    const data = result.rows.map((row) => buildMusicShowDbApiItem(row, venueDetailsMap));
 
     res.json({
       ok: true,
