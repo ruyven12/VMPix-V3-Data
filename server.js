@@ -2285,6 +2285,10 @@ const WRESTLING_MATCH_IMPORT_HEADER_ALIASES = {
   side2: 'side_2',
   participants: 'participants',
   participant: 'participants',
+  extra_people: 'extra_people',
+  extrapeople: 'extra_people',
+  extra_person: 'extra_people',
+  extraperson: 'extra_people',
   winner: 'winner',
   referees: 'referees',
   referee: 'referees',
@@ -2313,6 +2317,24 @@ function splitWrestlingSemicolonList(value) {
     .filter(Boolean);
 }
 
+function uniqueWrestlingPeopleList(values) {
+  const seen = new Set();
+  const out = [];
+
+  (values || []).forEach((value) => {
+    const clean = String(value || '').trim().replace(/\s+/g, ' ');
+    if (!clean) return;
+
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+
+    seen.add(key);
+    out.push(clean);
+  });
+
+  return out;
+}
+
 function toNullableInteger(value) {
   const clean = String(value || '').replace(/,/g, '').trim();
   if (!clean) return null;
@@ -2335,6 +2357,7 @@ function hasWrestlingMatchRowData(row) {
     'side_1',
     'side_2',
     'participants',
+    'extra_people',
     'winner',
     'referees',
     'notes'
@@ -2417,6 +2440,9 @@ function buildWrestlingShowGroups(rows) {
 
 function buildWrestlingMatchDbItem(entry) {
   const row = entry.row;
+  const participants = splitWrestlingSemicolonList(row.participants);
+  const referees = splitWrestlingSemicolonList(row.referees);
+  const extraPeople = splitWrestlingSemicolonList(row.extra_people);
 
   return {
     match_order: toNullableInteger(row.match_order),
@@ -2426,9 +2452,11 @@ function buildWrestlingMatchDbItem(entry) {
     title: toDbText(row.title) || '',
     side_1: splitWrestlingSemicolonList(row.side_1),
     side_2: splitWrestlingSemicolonList(row.side_2),
-    participants: splitWrestlingSemicolonList(row.participants),
+    participants,
+    extra_people: extraPeople,
     winner: toDbText(row.winner) || '',
-    referees: splitWrestlingSemicolonList(row.referees),
+    referees,
+    tagged_people: uniqueWrestlingPeopleList(participants.concat(referees, extraPeople)),
     notes: toDbText(row.notes) || ''
   };
 }
@@ -3577,14 +3605,21 @@ async function buildMusicShowsDbStatsResponse() {
 }
 
 function buildWrestlingMatchDbApiItem(match) {
-  if (!match || typeof match !== 'object') return { referees: [] };
+  if (!match || typeof match !== 'object') return { participants: [], extra_people: [], referees: [], tagged_people: [] };
+  const participants = Array.isArray(match.participants) ? match.participants : [];
+  const extraPeople = Array.isArray(match.extra_people) ? match.extra_people : [];
+  const referees = Array.isArray(match.referees) ? match.referees : [];
 
   return {
     ...match,
     side_1: Array.isArray(match.side_1) ? match.side_1 : [],
     side_2: Array.isArray(match.side_2) ? match.side_2 : [],
-    participants: Array.isArray(match.participants) ? match.participants : [],
-    referees: Array.isArray(match.referees) ? match.referees : []
+    participants,
+    extra_people: extraPeople,
+    referees,
+    tagged_people: Array.isArray(match.tagged_people)
+      ? match.tagged_people
+      : uniqueWrestlingPeopleList(participants.concat(referees, extraPeople))
   };
 }
 
@@ -3649,6 +3684,18 @@ function getWrestlingRefereesArraySql(matchAlias) {
   return `CASE WHEN jsonb_typeof(${matchAlias}->'referees') = 'array' THEN ${matchAlias}->'referees' ELSE '[]'::jsonb END`;
 }
 
+function getWrestlingExtraPeopleArraySql(matchAlias) {
+  return `CASE WHEN jsonb_typeof(${matchAlias}->'extra_people') = 'array' THEN ${matchAlias}->'extra_people' ELSE '[]'::jsonb END`;
+}
+
+function getWrestlingTaggedPeopleArraySql(matchAlias) {
+  return `CASE WHEN jsonb_typeof(${matchAlias}->'tagged_people') = 'array' THEN ${matchAlias}->'tagged_people' ELSE '[]'::jsonb END`;
+}
+
+function getWrestlingAllTaggedPeopleArraySql(matchAlias) {
+  return `(${getWrestlingTaggedPeopleArraySql(matchAlias)} || ${getWrestlingParticipantsArraySql(matchAlias)} || ${getWrestlingRefereesArraySql(matchAlias)} || ${getWrestlingExtraPeopleArraySql(matchAlias)})`;
+}
+
 function buildWrestlingShowsDbQueryOptions(query) {
   const values = [];
   const where = [];
@@ -3662,6 +3709,8 @@ function buildWrestlingShowsDbQueryOptions(query) {
   const participant = String(query.participant || '').trim();
   const winner = String(query.winner || '').trim();
   const referee = String(query.referee || '').trim();
+  const person = String(query.person || '').trim();
+  const taggedPerson = String(query.tagged_person || '').trim();
   const sortFields = {
     show_id: 'show_id',
     show_key: 'show_key',
@@ -3772,6 +3821,28 @@ function buildWrestlingShowsDbQueryOptions(query) {
     filters.referee = referee;
   }
 
+  if (person) {
+    values.push(person.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(${matchesArraySql}) AS match_item
+      CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingAllTaggedPeopleArraySql('match_item')}) AS person_item(value)
+      WHERE lower(trim(person_item.value)) = $${values.length}
+    )`);
+    filters.person = person;
+  }
+
+  if (taggedPerson) {
+    values.push(taggedPerson.toLowerCase());
+    where.push(`EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(${matchesArraySql}) AS match_item
+      CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingAllTaggedPeopleArraySql('match_item')}) AS tagged_person_item(value)
+      WHERE lower(trim(tagged_person_item.value)) = $${values.length}
+    )`);
+    filters.tagged_person = taggedPerson;
+  }
+
   return {
     values,
     whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '',
@@ -3849,6 +3920,8 @@ async function buildWrestlingShowsDbStatsResponse() {
   const matchesArraySql = getWrestlingMatchesArraySql();
   const participantArraySql = getWrestlingParticipantsArraySql('match_item');
   const refereeArraySql = getWrestlingRefereesArraySql('match_item');
+  const extraPeopleArraySql = getWrestlingExtraPeopleArraySql('match_item');
+  const taggedPeopleArraySql = getWrestlingAllTaggedPeopleArraySql('match_item');
   const totalsQuery = dbPool.query(`
     WITH show_rows AS (
       SELECT ${matchesArraySql} AS match_items
@@ -3878,6 +3951,26 @@ async function buildWrestlingShowsDbStatsResponse() {
     CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
     CROSS JOIN LATERAL jsonb_array_elements_text(${refereeArraySql}) AS referee_item(value)
     WHERE trim(referee_item.value) <> ''
+  `);
+  const matchesWithExtraPeopleQuery = dbPool.query(`
+    SELECT count(*)::int AS matches_with_extra_people
+    FROM wrestling_shows
+    CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
+    WHERE jsonb_array_length(${extraPeopleArraySql}) > 0
+  `);
+  const uniqueExtraPeopleQuery = dbPool.query(`
+    SELECT count(DISTINCT lower(trim(extra_people_item.value)))::int AS unique_extra_people
+    FROM wrestling_shows
+    CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
+    CROSS JOIN LATERAL jsonb_array_elements_text(${extraPeopleArraySql}) AS extra_people_item(value)
+    WHERE trim(extra_people_item.value) <> ''
+  `);
+  const uniqueTaggedPeopleQuery = dbPool.query(`
+    SELECT count(DISTINCT lower(trim(tagged_people_item.value)))::int AS unique_tagged_people
+    FROM wrestling_shows
+    CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item
+    CROSS JOIN LATERAL jsonb_array_elements_text(${taggedPeopleArraySql}) AS tagged_people_item(value)
+    WHERE trim(tagged_people_item.value) <> ''
   `);
   const byPromotionQuery = dbPool.query(`
     SELECT coalesce(nullif(trim(promotion), ''), 'Unknown') AS promotion, count(*)::int AS shows_total
@@ -3990,6 +4083,9 @@ async function buildWrestlingShowsDbStatsResponse() {
     uniqueParticipantsResult,
     matchesWithRefereesResult,
     uniqueRefereesResult,
+    matchesWithExtraPeopleResult,
+    uniqueExtraPeopleResult,
+    uniqueTaggedPeopleResult,
     byPromotionResult,
     byYearResult,
     byStateResult,
@@ -4007,6 +4103,9 @@ async function buildWrestlingShowsDbStatsResponse() {
     uniqueParticipantsQuery,
     matchesWithRefereesQuery,
     uniqueRefereesQuery,
+    matchesWithExtraPeopleQuery,
+    uniqueExtraPeopleQuery,
+    uniqueTaggedPeopleQuery,
     byPromotionQuery,
     byYearQuery,
     byStateQuery,
@@ -4024,6 +4123,9 @@ async function buildWrestlingShowsDbStatsResponse() {
   const uniqueParticipants = uniqueParticipantsResult.rows && uniqueParticipantsResult.rows[0] ? uniqueParticipantsResult.rows[0] : {};
   const matchesWithReferees = matchesWithRefereesResult.rows && matchesWithRefereesResult.rows[0] ? matchesWithRefereesResult.rows[0] : {};
   const uniqueReferees = uniqueRefereesResult.rows && uniqueRefereesResult.rows[0] ? uniqueRefereesResult.rows[0] : {};
+  const matchesWithExtraPeople = matchesWithExtraPeopleResult.rows && matchesWithExtraPeopleResult.rows[0] ? matchesWithExtraPeopleResult.rows[0] : {};
+  const uniqueExtraPeople = uniqueExtraPeopleResult.rows && uniqueExtraPeopleResult.rows[0] ? uniqueExtraPeopleResult.rows[0] : {};
+  const uniqueTaggedPeople = uniqueTaggedPeopleResult.rows && uniqueTaggedPeopleResult.rows[0] ? uniqueTaggedPeopleResult.rows[0] : {};
   const venueLinking = venueLinkingResult.rows && venueLinkingResult.rows[0] ? venueLinkingResult.rows[0] : {};
 
   return {
@@ -4037,7 +4139,10 @@ async function buildWrestlingShowsDbStatsResponse() {
       matchesTotal: toIntegerCount(totals.matches_total),
       uniqueParticipants: toIntegerCount(uniqueParticipants.unique_participants),
       matchesWithReferees: toIntegerCount(matchesWithReferees.matches_with_referees),
-      uniqueReferees: toIntegerCount(uniqueReferees.unique_referees)
+      matchesWithExtraPeople: toIntegerCount(matchesWithExtraPeople.matches_with_extra_people),
+      uniqueReferees: toIntegerCount(uniqueReferees.unique_referees),
+      uniqueExtraPeople: toIntegerCount(uniqueExtraPeople.unique_extra_people),
+      uniqueTaggedPeople: toIntegerCount(uniqueTaggedPeople.unique_tagged_people)
     },
     byPromotion: byPromotionResult.rows.map((row) => ({ promotion: row.promotion, showsTotal: toIntegerCount(row.shows_total) })),
     byYear: byYearResult.rows.map((row) => ({ year: row.year, showsTotal: toIntegerCount(row.shows_total) })),
