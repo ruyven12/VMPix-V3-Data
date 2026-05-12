@@ -60,6 +60,121 @@ const ROUTES = {
   '/api/stats': { label: 'Stats', gidEnv: 'GID_STATS' }
 };
 
+// Admin/control route inventory for the future password-protected admin shell.
+// Keep these route names stable; add new admin routes here when they become control-plane endpoints.
+const ADMIN_ROUTE_INVENTORY = Object.freeze({
+  apiAdmin: Object.freeze([
+    '/api/admin/overview',
+    '/api/admin/diagnostics',
+    '/api/admin/diagnostics/music',
+    '/api/admin/diagnostics/wrestling',
+    '/api/admin/import-history',
+    '/api/admin/import-history/music',
+    '/api/admin/import-history/wrestling',
+    '/api/admin/import-history/latest',
+    '/api/admin/import-locks',
+    '/api/admin/import-locks/music',
+    '/api/admin/import-locks/wrestling',
+    '/api/admin/relationships',
+    '/api/admin/relationships/summary',
+    '/api/admin/relationships/music',
+    '/api/admin/relationships/wrestling',
+    '/api/admin/stats/summary',
+    '/api/admin/stats/rebuild',
+    '/api/admin/stats/rebuild/music',
+    '/api/admin/stats/rebuild/wrestling'
+  ]),
+  imports: Object.freeze([
+    '/admin/import/music/bands',
+    '/admin/import/music/shows',
+    '/admin/import/music/people',
+    '/admin/import/music/venues',
+    '/admin/import/wrestling/shows',
+    '/admin/import/wrestling/people',
+    '/admin/import/wrestling/venues'
+  ]),
+  legacyImportAliases: Object.freeze([
+    '/api/wrestling/people/import'
+  ]),
+  protectedPrefixes: Object.freeze([
+    '/api/admin/*',
+    '/admin/import/*'
+  ])
+});
+
+function getAdminRouteInventory() {
+  return {
+    apiAdmin: Array.from(ADMIN_ROUTE_INVENTORY.apiAdmin),
+    imports: Array.from(ADMIN_ROUTE_INVENTORY.imports),
+    legacyImportAliases: Array.from(ADMIN_ROUTE_INVENTORY.legacyImportAliases),
+    protectedPrefixes: Array.from(ADMIN_ROUTE_INVENTORY.protectedPrefixes)
+  };
+}
+
+function getConfiguredAdminSecrets() {
+  return [
+    String(process.env.ADMIN_TOKEN || '').trim(),
+    String(process.env.ADMIN_PASSWORD || '').trim()
+  ].filter(Boolean);
+}
+
+function getAdminProtectionStatus() {
+  const enabled = getConfiguredAdminSecrets().length > 0;
+  const inventory = getAdminRouteInventory();
+
+  return {
+    enabled,
+    mode: enabled ? 'token' : 'not_configured',
+    protectedPrefixes: inventory.protectedPrefixes,
+    protectedRoutes: inventory.apiAdmin.concat(inventory.imports, inventory.legacyImportAliases),
+    acceptedTokenSources: [
+      'x-admin-token',
+      'Authorization: Bearer <token>',
+      'admin_token query parameter'
+    ]
+  };
+}
+
+function getRequestAdminTokens(req) {
+  const tokens = [];
+  const headerToken = String(req.get('x-admin-token') || '').trim();
+  const authHeader = String(req.get('authorization') || '').trim();
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  const queryToken = String((req.query && req.query.admin_token) || '').trim();
+
+  if (headerToken) tokens.push(headerToken);
+  if (bearerMatch && bearerMatch[1]) tokens.push(String(bearerMatch[1]).trim());
+  if (queryToken) tokens.push(queryToken);
+
+  return tokens.filter(Boolean);
+}
+
+let adminProtectionWarningLogged = false;
+
+function requireAdminAccess(req, res, next) {
+  const configuredSecrets = getConfiguredAdminSecrets();
+
+  if (!configuredSecrets.length) {
+    if (!adminProtectionWarningLogged) {
+      console.warn('Admin protection is not active. Set ADMIN_TOKEN or ADMIN_PASSWORD to protect admin/control routes.');
+      adminProtectionWarningLogged = true;
+    }
+    return next();
+  }
+
+  const requestTokens = getRequestAdminTokens(req);
+  const allowed = requestTokens.some((token) => configuredSecrets.includes(token));
+  if (allowed) return next();
+
+  return res.status(401).json({
+    ok: false,
+    route: req.originalUrl ? String(req.originalUrl).split('?')[0] : req.path,
+    error: 'Admin access required.',
+    message: 'Missing or invalid admin token.',
+    adminProtection: getAdminProtectionStatus()
+  });
+}
+
 async function applyDatabaseSchema() {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
@@ -94,13 +209,14 @@ function allowCors(req, res, next) {
   }
 
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, X-Requested-With, X-Admin-Token');
 
   if (req.method === 'OPTIONS') return res.status(204).send('');
   return next();
 }
 
 app.use(allowCors);
+app.use(['/api/admin', '/admin/import', '/api/wrestling/people/import'], requireAdminAccess);
 
 function parseCsvLine(line) {
   const out = [];
@@ -7270,6 +7386,7 @@ async function buildAdminOverviewResponse() {
       }
     },
     diagnostics,
+    adminProtection: getAdminProtectionStatus(),
     importHealth,
     lockHealth,
     relationshipHealth,
@@ -8495,6 +8612,7 @@ async function buildMusicDiagnosticsResponse() {
     people: {},
     venues: {},
     relationships: {},
+    adminProtection: getAdminProtectionStatus(),
     importHealth: createEmptyImportHealth(),
     lockHealth: createEmptyLockHealth(),
     relationshipHealth: {
@@ -9072,6 +9190,7 @@ async function buildWrestlingDiagnosticsResponse() {
     people: {},
     venues: {},
     relationships: {},
+    adminProtection: getAdminProtectionStatus(),
     importHealth: createEmptyImportHealth(),
     lockHealth: createEmptyLockHealth(),
     relationshipHealth: {
@@ -9228,6 +9347,7 @@ async function buildAdminDiagnosticsResponse() {
     },
     music: {},
     wrestling: {},
+    adminProtection: getAdminProtectionStatus(),
     importHealth: createEmptyImportHealth(),
     lockHealth: createEmptyLockHealth(),
     relationshipHealth: {
