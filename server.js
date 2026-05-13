@@ -264,7 +264,8 @@ function requireRefreshAdminAccess(req, res, next) {
 async function applyDatabaseSchema() {
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
-      throw new Error('Missing DATABASE_URL environment variable.');
+      console.warn('PostgreSQL schema apply skipped: DATABASE_URL is not configured.');
+      return;
     }
 
     const schemaPath = path.join(__dirname, 'schema.sql');
@@ -280,15 +281,26 @@ async function applyDatabaseSchema() {
   }
 }
 
+function isControlPlaneRequest(req) {
+  if (!req || !req.path) return false;
+  if (req.path.startsWith('/api/admin')) return true;
+  if (req.path.startsWith('/admin/import')) return true;
+  if (req.path === '/api/wrestling/people/import') return true;
+  return !!(req.query && req.query.refresh === '1' && Object.prototype.hasOwnProperty.call(ROUTES, req.path));
+}
+
 function allowCors(req, res, next) {
   const origin = req.headers.origin || '';
   const allowList = String(process.env.CORS_ALLOW_ORIGINS || '')
     .split(/[,;]+/)
     .map((s) => s.trim())
     .filter(Boolean);
+  const controlPlaneRequest = isControlPlaneRequest(req);
 
   if (origin && allowList.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else if (origin && controlPlaneRequest && allowList.length) {
     res.setHeader('Vary', 'Origin');
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -299,6 +311,24 @@ function allowCors(req, res, next) {
 
   if (req.method === 'OPTIONS') return res.status(204).send('');
   return next();
+}
+
+function getStartupEnvironmentWarnings() {
+  const warnings = [];
+  if (!String(process.env.DATABASE_URL || '').trim()) warnings.push('DATABASE_URL is not configured; PostgreSQL routes and schema apply will be unavailable.');
+  if (!SHEET_ID) warnings.push('GOOGLE_SHEET_ID is not configured; Google Sheets routes/imports will fail.');
+  if (shouldRequireAdminProtection() && !getConfiguredAdminSecrets().length) {
+    warnings.push('ADMIN_TOKEN or ADMIN_PASSWORD is required in Render/production; admin/control routes will return 503 until configured.');
+  }
+  if (!String(process.env.CORS_ALLOW_ORIGINS || '').trim()) {
+    warnings.push('CORS_ALLOW_ORIGINS is blank; public non-credentialed routes will allow any origin.');
+  }
+  return warnings;
+}
+
+function logStartupEnvironmentWarnings() {
+  const warnings = getStartupEnvironmentWarnings();
+  warnings.forEach((warning) => console.warn(`Startup warning: ${warning}`));
 }
 
 app.use(allowCors);
@@ -1506,6 +1536,7 @@ function normalizeMusicBandImportRow(row) {
 }
 
 function logMusicBandImportDebug(payload, rows) {
+  if (!isTruthyEnv(process.env.IMPORT_DEBUG)) return;
   console.log('Music-Bands import detected headers:', payload.normalizedHeaders || []);
   console.log('Music-Bands import first parsed row keys:', rows[0] ? Object.keys(rows[0]) : []);
 }
@@ -11570,6 +11601,7 @@ app.use((req, res) => {
 });
 
 async function startServer() {
+  logStartupEnvironmentWarnings();
   await applyDatabaseSchema();
   app.listen(PORT, () => {
     console.log(`VMPix V3 Data API listening on ${PORT}`);
