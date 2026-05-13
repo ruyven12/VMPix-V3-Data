@@ -170,6 +170,7 @@ function getAdminProtectionStatus() {
     acceptedTokenSources: [
       'x-admin-token',
       'Authorization: Bearer <token>',
+      'token query parameter',
       'admin_token query parameter'
     ]
   };
@@ -180,7 +181,8 @@ function getRequestAdminTokens(req) {
   const headerToken = String(req.get('x-admin-token') || '').trim();
   const authHeader = String(req.get('authorization') || '').trim();
   const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
-  const queryToken = String((req.query && req.query.admin_token) || '').trim();
+  // Query-token auth is only for manual browser testing; do not save it in public bookmarks.
+  const queryToken = String((req.query && (req.query.token || req.query.admin_token)) || '').trim();
 
   if (headerToken) tokens.push(headerToken);
   if (bearerMatch && bearerMatch[1]) tokens.push(String(bearerMatch[1]).trim());
