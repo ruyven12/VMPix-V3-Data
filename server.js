@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 
 function loadLocalEnv() {
@@ -102,9 +103,13 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
   legacyImportAliases: Object.freeze([
     '/api/wrestling/people/import'
   ]),
+  refreshRoutes: Object.freeze(
+    Object.keys(ROUTES).map((routePath) => `${routePath}?refresh=1`)
+  ),
   protectedPrefixes: Object.freeze([
     '/api/admin/*',
-    '/admin/import/*'
+    '/admin/import/*',
+    'public data routes with ?refresh=1'
   ])
 });
 
@@ -113,6 +118,7 @@ function getAdminRouteInventory() {
     apiAdmin: Array.from(ADMIN_ROUTE_INVENTORY.apiAdmin),
     imports: Array.from(ADMIN_ROUTE_INVENTORY.imports),
     legacyImportAliases: Array.from(ADMIN_ROUTE_INVENTORY.legacyImportAliases),
+    refreshRoutes: Array.from(ADMIN_ROUTE_INVENTORY.refreshRoutes),
     protectedPrefixes: Array.from(ADMIN_ROUTE_INVENTORY.protectedPrefixes)
   };
 }
@@ -124,15 +130,43 @@ function getConfiguredAdminSecrets() {
   ].filter(Boolean);
 }
 
+function isTruthyEnv(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function isRenderRuntime() {
+  return [
+    process.env.RENDER,
+    process.env.RENDER_SERVICE_ID,
+    process.env.RENDER_SERVICE_NAME,
+    process.env.RENDER_EXTERNAL_URL,
+    process.env.RENDER_INSTANCE_ID
+  ].some((value) => String(value || '').trim());
+}
+
+function isProductionRuntime() {
+  return String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+}
+
+function shouldRequireAdminProtection() {
+  if (isTruthyEnv(process.env.ADMIN_REQUIRE_TOKEN)) return true;
+  if (isTruthyEnv(process.env.ADMIN_AUTH_BYPASS) && !isRenderRuntime() && !isProductionRuntime()) return false;
+  return isRenderRuntime() || isProductionRuntime();
+}
+
 function getAdminProtectionStatus() {
-  const enabled = getConfiguredAdminSecrets().length > 0;
+  const configured = getConfiguredAdminSecrets().length > 0;
+  const required = shouldRequireAdminProtection();
   const inventory = getAdminRouteInventory();
 
   return {
-    enabled,
-    mode: enabled ? 'token' : 'not_configured',
+    enabled: configured || required,
+    configured,
+    required,
+    mode: configured ? 'token' : (required ? 'missing_secret' : 'development_bypass'),
+    requiredEnv: 'ADMIN_TOKEN or ADMIN_PASSWORD',
     protectedPrefixes: inventory.protectedPrefixes,
-    protectedRoutes: inventory.apiAdmin.concat(inventory.imports, inventory.legacyImportAliases),
+    protectedRoutes: inventory.apiAdmin.concat(inventory.imports, inventory.legacyImportAliases, inventory.refreshRoutes),
     acceptedTokenSources: [
       'x-admin-token',
       'Authorization: Bearer <token>',
@@ -157,28 +191,74 @@ function getRequestAdminTokens(req) {
 
 let adminProtectionWarningLogged = false;
 
+function adminTokenMatches(token, secrets) {
+  const tokenBuffer = Buffer.from(String(token || ''), 'utf8');
+  return secrets.some((secret) => {
+    const secretBuffer = Buffer.from(String(secret || ''), 'utf8');
+    return tokenBuffer.length === secretBuffer.length && crypto.timingSafeEqual(tokenBuffer, secretBuffer);
+  });
+}
+
+function buildAdminAccessError(req, error, message) {
+  const generated = new Date();
+  return {
+    ok: false,
+    route: req.originalUrl ? String(req.originalUrl).split('?')[0] : req.path,
+    error,
+    message,
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    adminProtection: getAdminProtectionStatus()
+  };
+}
+
 function requireAdminAccess(req, res, next) {
   const configuredSecrets = getConfiguredAdminSecrets();
+  const protectionStatus = getAdminProtectionStatus();
 
   if (!configuredSecrets.length) {
-    if (!adminProtectionWarningLogged) {
-      console.warn('Admin protection is not active. Set ADMIN_TOKEN or ADMIN_PASSWORD to protect admin/control routes.');
-      adminProtectionWarningLogged = true;
+    if (!protectionStatus.required) {
+      if (!adminProtectionWarningLogged) {
+        console.warn('Admin protection development bypass active. Set ADMIN_TOKEN or ADMIN_PASSWORD before exposing admin/control routes.');
+        adminProtectionWarningLogged = true;
+      }
+      return next();
     }
-    return next();
+
+    return res.status(503).json(buildAdminAccessError(
+      req,
+      'Admin protection is not configured.',
+      'Set ADMIN_TOKEN or ADMIN_PASSWORD to enable admin/control routes.'
+    ));
   }
 
   const requestTokens = getRequestAdminTokens(req);
-  const allowed = requestTokens.some((token) => configuredSecrets.includes(token));
-  if (allowed) return next();
+  if (!requestTokens.length) {
+    return res.status(401).json(buildAdminAccessError(
+      req,
+      'Admin access required.',
+      'Missing admin token.'
+    ));
+  }
 
-  return res.status(401).json({
-    ok: false,
-    route: req.originalUrl ? String(req.originalUrl).split('?')[0] : req.path,
-    error: 'Admin access required.',
-    message: 'Missing or invalid admin token.',
-    adminProtection: getAdminProtectionStatus()
-  });
+  if (adminTokenMatches(requestTokens[0], configuredSecrets) || requestTokens.slice(1).some((token) => adminTokenMatches(token, configuredSecrets))) {
+    return next();
+  }
+
+  return res.status(401).json(buildAdminAccessError(
+    req,
+    'Admin access required.',
+    'Invalid admin token.'
+  ));
+}
+
+function requireRefreshAdminAccess(req, res, next) {
+  const isProtectedRefresh = req.query &&
+    req.query.refresh === '1' &&
+    Object.prototype.hasOwnProperty.call(ROUTES, req.path);
+
+  if (!isProtectedRefresh) return next();
+  return requireAdminAccess(req, res, next);
 }
 
 async function applyDatabaseSchema() {
@@ -223,6 +303,7 @@ function allowCors(req, res, next) {
 
 app.use(allowCors);
 app.use(['/api/admin', '/admin/import', '/api/wrestling/people/import'], requireAdminAccess);
+app.use(requireRefreshAdminAccess);
 
 function parseCsvLine(line) {
   const out = [];
@@ -6480,6 +6561,7 @@ async function buildAdminStatusResponse() {
       activeLocks: lockHealth.activeLocks,
       staleLocks: lockHealth.staleLocks
     },
+    adminProtection: getAdminProtectionStatus(),
     importHealth,
     lockHealth,
     importStatus,
