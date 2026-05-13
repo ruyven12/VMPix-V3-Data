@@ -299,13 +299,41 @@ CREATE TABLE IF NOT EXISTS import_history (
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at TIMESTAMPTZ,
     duration_ms INTEGER,
+    import_type TEXT,
+    source_identifier TEXT,
+    rows_fetched INTEGER DEFAULT 0,
     rows_imported INTEGER DEFAULT 0,
+    rows_inserted INTEGER DEFAULT 0,
+    rows_updated INTEGER DEFAULT 0,
     rows_skipped INTEGER DEFAULT 0,
+    total_rows_after_import INTEGER,
+    error_message TEXT,
     warnings JSONB DEFAULT '[]'::jsonb,
     errors JSONB DEFAULT '[]'::jsonb,
     meta JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS import_type TEXT;
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS source_identifier TEXT;
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS rows_fetched INTEGER DEFAULT 0;
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS rows_inserted INTEGER DEFAULT 0;
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS rows_updated INTEGER DEFAULT 0;
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS total_rows_after_import INTEGER;
+
+ALTER TABLE IF EXISTS import_history
+    ADD COLUMN IF NOT EXISTS error_message TEXT;
 
 CREATE INDEX IF NOT EXISTS import_history_section_category_started_at_idx
     ON import_history (section, category, started_at DESC);

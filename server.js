@@ -65,9 +65,15 @@ const ROUTES = {
 const ADMIN_ROUTE_INVENTORY = Object.freeze({
   apiAdmin: Object.freeze([
     '/api/admin/overview',
+    '/api/admin/status',
+    '/api/admin/status/imports',
     '/api/admin/diagnostics',
+    '/api/admin/diagnostics/imports',
     '/api/admin/diagnostics/music',
     '/api/admin/diagnostics/wrestling',
+    '/api/admin/diagnostics/relationships',
+    '/api/admin/diagnostics/music/relationships',
+    '/api/admin/diagnostics/wrestling/relationships',
     '/api/admin/import-history',
     '/api/admin/import-history/music',
     '/api/admin/import-history/wrestling',
@@ -5448,10 +5454,30 @@ function getImportLogRowsWritten(result) {
   return 0;
 }
 
+function getImportHistoryRowsFetched(result) {
+  if (!result || typeof result !== 'object') return 0;
+  if (result.rowsFetched != null) return toIntegerCount(result.rowsFetched);
+  if (result.rowsRead != null) return toIntegerCount(result.rowsRead);
+  if (result.fetchedRows != null) return toIntegerCount(result.fetchedRows);
+  return 0;
+}
+
+function getNullableImportCount(result, keys) {
+  if (!result || typeof result !== 'object') return null;
+  for (const key of keys) {
+    if (result[key] != null && result[key] !== '') return toIntegerCount(result[key]);
+  }
+  return null;
+}
+
 function getImportHistoryRowsSkipped(result) {
   if (!result || typeof result !== 'object') return 0;
   if (result.skipped != null) return toIntegerCount(result.skipped);
-  return 0;
+  return Object.keys(result).reduce((sum, key) => {
+    if (!/^skipped/i.test(key)) return sum;
+    const value = Number(result[key]);
+    return Number.isFinite(value) ? sum + Math.max(0, Math.trunc(value)) : sum;
+  }, 0);
 }
 
 function normalizeImportHistoryArray(value) {
@@ -5487,9 +5513,12 @@ function buildImportHistoryMeta(config, req, result) {
   if (result && typeof result === 'object') {
     [
       'rowsRead',
+      'rowsFetched',
       'upserted',
       'importedRows',
       'imported',
+      'rowsInserted',
+      'rowsUpdated',
       'skipped',
       'matchesTotal',
       'bandsTotal',
@@ -5528,14 +5557,28 @@ async function ensureImportHistoryTable() {
       started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       finished_at TIMESTAMPTZ,
       duration_ms INTEGER,
+      import_type TEXT,
+      source_identifier TEXT,
+      rows_fetched INTEGER DEFAULT 0,
       rows_imported INTEGER DEFAULT 0,
+      rows_inserted INTEGER DEFAULT 0,
+      rows_updated INTEGER DEFAULT 0,
       rows_skipped INTEGER DEFAULT 0,
+      total_rows_after_import INTEGER,
+      error_message TEXT,
       warnings JSONB DEFAULT '[]'::jsonb,
       errors JSONB DEFAULT '[]'::jsonb,
       meta JSONB DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS import_type TEXT`);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS source_identifier TEXT`);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS rows_fetched INTEGER DEFAULT 0`);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS rows_inserted INTEGER DEFAULT 0`);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS rows_updated INTEGER DEFAULT 0`);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS total_rows_after_import INTEGER`);
+  await dbPool.query(`ALTER TABLE IF EXISTS import_history ADD COLUMN IF NOT EXISTS error_message TEXT`);
   await dbPool.query(`
     CREATE INDEX IF NOT EXISTS import_history_section_category_started_at_idx
       ON import_history (section, category, started_at DESC)
@@ -5616,6 +5659,42 @@ function getImportLockOwner() {
 function getImportLockTtlMs() {
   const ttl = Number(process.env.IMPORT_LOCK_TTL_MS);
   return Number.isFinite(ttl) && ttl > 0 ? Math.max(60_000, Math.trunc(ttl)) : 30 * 60 * 1000;
+}
+
+const IMPORT_STATUS_DATASETS = Object.freeze([
+  { section: 'music', category: 'bands', source: 'Music-Bands', route: '/admin/import/music/bands', table: 'music_bands' },
+  { section: 'music', category: 'shows', source: 'Music-Shows', route: '/admin/import/music/shows', table: 'music_shows' },
+  { section: 'music', category: 'people', source: 'Music-People', route: '/admin/import/music/people', table: 'music_people' },
+  { section: 'music', category: 'venues', source: 'Music-Venue', route: '/admin/import/music/venues', table: 'music_venues' },
+  { section: 'wrestling', category: 'shows', source: 'Wrestling-Matches', route: '/admin/import/wrestling/shows', table: 'wrestling_shows' },
+  { section: 'wrestling', category: 'people', source: 'Wrestling-People', route: '/admin/import/wrestling/people', table: 'wrestling_people' },
+  { section: 'wrestling', category: 'venues', source: 'Wrestling-Venue', route: '/admin/import/wrestling/venues', table: 'wrestling_venues' }
+]);
+
+const IMPORT_STATUS_TABLE_ALLOWLIST = new Set(IMPORT_STATUS_DATASETS.map((dataset) => dataset.table));
+
+function getImportDatasetKey(section, category) {
+  return `${String(section || '').trim().toLowerCase()}:${String(category || '').trim().toLowerCase()}`;
+}
+
+function getImportStaleWarningHours() {
+  const hours = Number(process.env.IMPORT_STALE_WARNING_HOURS);
+  return Number.isFinite(hours) && hours > 0 ? Math.max(1, Math.trunc(hours)) : 168;
+}
+
+async function getImportTableTotalRows(tableName) {
+  const cleanTable = String(tableName || '').trim();
+  if (!IMPORT_STATUS_TABLE_ALLOWLIST.has(cleanTable)) return null;
+
+  try {
+    const existingTables = await getExistingPublicTables([cleanTable]);
+    if (!existingTables.has(cleanTable)) return null;
+    const result = await dbPool.query(`SELECT count(*)::int AS count FROM ${cleanTable}`);
+    return toIntegerCount(result.rows && result.rows[0] && result.rows[0].count);
+  } catch (err) {
+    console.warn(`Import table count failed for ${cleanTable}:`, err && err.message ? err.message : String(err));
+    return null;
+  }
 }
 
 function buildImportLockApiItem(row) {
@@ -5741,7 +5820,7 @@ async function releaseImportLock(id, status, meta) {
   }
 }
 
-async function startImportHistory({ section, category, source, meta }) {
+async function startImportHistory({ section, category, source, importType, sourceIdentifier, meta }) {
   try {
     const ready = await ensureImportHistoryTable();
     if (!ready) return null;
@@ -5752,15 +5831,19 @@ async function startImportHistory({ section, category, source, meta }) {
         category,
         source,
         status,
+        import_type,
+        source_identifier,
         meta
       )
-      VALUES ($1, $2, $3, $4, $5::jsonb)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
       RETURNING id, started_at
     `, [
       section,
       category,
       source || null,
       'running',
+      importType || 'manual',
+      sourceIdentifier || source || null,
       JSON.stringify(meta && typeof meta === 'object' ? meta : {})
     ]);
 
@@ -5784,18 +5867,28 @@ async function finishImportHistory(id, details) {
         status = $2,
         finished_at = NOW(),
         duration_ms = GREATEST(0, floor(EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000)::int),
-        rows_imported = $3,
-        rows_skipped = $4,
-        warnings = $5::jsonb,
-        errors = $6::jsonb,
-        meta = coalesce(meta, '{}'::jsonb) || $7::jsonb
+        rows_fetched = $3,
+        rows_imported = $4,
+        rows_inserted = $5,
+        rows_updated = $6,
+        rows_skipped = $7,
+        total_rows_after_import = $8,
+        error_message = $9,
+        warnings = $10::jsonb,
+        errors = $11::jsonb,
+        meta = coalesce(meta, '{}'::jsonb) || $12::jsonb
       WHERE id = $1
       RETURNING id, status, duration_ms, started_at, finished_at
     `, [
       id,
       details.status || 'success',
+      toIntegerCount(details.rowsFetched),
       toIntegerCount(details.rowsImported),
+      details.rowsInserted == null ? null : toIntegerCount(details.rowsInserted),
+      details.rowsUpdated == null ? null : toIntegerCount(details.rowsUpdated),
       toIntegerCount(details.rowsSkipped),
+      details.totalRowsAfterImport == null ? null : toIntegerCount(details.totalRowsAfterImport),
+      details.errorMessage || null,
       JSON.stringify(normalizeImportHistoryArray(details.warnings)),
       JSON.stringify(normalizeImportHistoryArray(details.errors)),
       JSON.stringify(details.meta && typeof details.meta === 'object' ? details.meta : {})
@@ -5821,21 +5914,37 @@ function getImportSyncStatus(status) {
 }
 
 function buildImportHistoryApiItem(row) {
+  const meta = row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta) ? row.meta : {};
+  const errors = Array.isArray(row.errors) ? row.errors : [];
+  const errorMessage = row.error_message || errors[0] || '';
+
   return {
     id: toIntegerCount(row.id),
+    dataset: `${row.section || ''}.${row.category || ''}`,
     section: row.section || '',
     category: row.category || '',
     source: row.source || '',
+    source_identifier: row.source_identifier || '',
+    import_type: row.import_type || '',
     status: row.status || '',
     sync_health: getImportSyncStatus(row.status),
     started_at: formatStatusTimestamp(row.started_at),
+    startedAt: formatStatusTimestamp(row.started_at),
     finished_at: formatStatusTimestamp(row.finished_at),
+    finishedAt: formatStatusTimestamp(row.finished_at),
     duration_ms: row.duration_ms == null ? null : toIntegerCount(row.duration_ms),
+    duration: row.duration_ms == null ? null : `${toIntegerCount(row.duration_ms)}ms`,
+    rows_fetched: toIntegerCount(row.rows_fetched),
     rows_imported: toIntegerCount(row.rows_imported),
+    rows_inserted: row.rows_inserted == null ? null : toIntegerCount(row.rows_inserted),
+    rows_updated: row.rows_updated == null ? null : toIntegerCount(row.rows_updated),
     rows_skipped: toIntegerCount(row.rows_skipped),
+    total_rows_after_import: row.total_rows_after_import == null ? null : toIntegerCount(row.total_rows_after_import),
+    refresh: !!meta.refresh,
+    error_message: errorMessage,
     warnings: Array.isArray(row.warnings) ? row.warnings : [],
-    errors: Array.isArray(row.errors) ? row.errors : [],
-    meta: row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta) ? row.meta : {},
+    errors,
+    meta,
     created_at: formatStatusTimestamp(row.created_at)
   };
 }
@@ -5904,8 +6013,15 @@ async function handleImportHistoryRequest(req, res, fixedSection) {
          started_at,
          finished_at,
          duration_ms,
+         import_type,
+         source_identifier,
+         rows_fetched,
          rows_imported,
+         rows_inserted,
+         rows_updated,
          rows_skipped,
+         total_rows_after_import,
+         error_message,
          warnings,
          errors,
          meta,
@@ -5961,8 +6077,15 @@ async function buildLatestImportHistoryItems(section) {
        started_at,
        finished_at,
        duration_ms,
+       import_type,
+       source_identifier,
+       rows_fetched,
        rows_imported,
+       rows_inserted,
+       rows_updated,
        rows_skipped,
+       total_rows_after_import,
+       error_message,
        jsonb_array_length(CASE WHEN jsonb_typeof(warnings) = 'array' THEN warnings ELSE '[]'::jsonb END)::int AS warnings_count,
        jsonb_array_length(CASE WHEN jsonb_typeof(errors) = 'array' THEN errors ELSE '[]'::jsonb END)::int AS errors_count
      FROM import_history
@@ -5976,13 +6099,22 @@ async function buildLatestImportHistoryItems(section) {
     section: row.section || '',
     category: row.category || '',
     source: row.source || '',
+    source_identifier: row.source_identifier || '',
+    import_type: row.import_type || '',
     status: row.status || '',
     sync_health: getImportSyncStatus(row.status),
     started_at: formatStatusTimestamp(row.started_at),
+    startedAt: formatStatusTimestamp(row.started_at),
     finished_at: formatStatusTimestamp(row.finished_at),
+    finishedAt: formatStatusTimestamp(row.finished_at),
     duration_ms: row.duration_ms == null ? null : toIntegerCount(row.duration_ms),
+    rows_fetched: toIntegerCount(row.rows_fetched),
     rows_imported: toIntegerCount(row.rows_imported),
+    rows_inserted: row.rows_inserted == null ? null : toIntegerCount(row.rows_inserted),
+    rows_updated: row.rows_updated == null ? null : toIntegerCount(row.rows_updated),
     rows_skipped: toIntegerCount(row.rows_skipped),
+    total_rows_after_import: row.total_rows_after_import == null ? null : toIntegerCount(row.total_rows_after_import),
+    error_message: row.error_message || '',
     warnings_count: toIntegerCount(row.warnings_count),
     errors_count: toIntegerCount(row.errors_count)
   }));
@@ -6019,7 +6151,9 @@ function createEmptyImportHealth() {
     failingImportsLast24h: 0,
     warningImportsLast24h: 0,
     lastSuccessfulImportAt: null,
-    lastFailedImportAt: null
+    lastFailedImportAt: null,
+    latestFailureReason: null,
+    staleWarnings: []
   };
 }
 
@@ -6058,16 +6192,352 @@ async function buildImportHealth(section) {
       values
     );
     const status = statusResult.rows && statusResult.rows[0] ? statusResult.rows[0] : {};
+    const failureResult = await dbPool.query(
+      `SELECT error_message, errors
+       FROM import_history
+       ${whereSql ? `${whereSql} AND` : 'WHERE'} lower(trim(coalesce(status, ''))) IN ('failed', 'error')
+       ORDER BY started_at DESC NULLS LAST, id DESC
+       LIMIT 1`,
+      values
+    );
+    const failure = failureResult.rows && failureResult.rows[0] ? failureResult.rows[0] : {};
+    const failureErrors = Array.isArray(failure.errors) ? failure.errors : [];
 
     health.latestImports = latestItems;
     health.failingImportsLast24h = toIntegerCount(status.failing_imports_last_24h);
     health.warningImportsLast24h = toIntegerCount(status.warning_imports_last_24h);
     health.lastSuccessfulImportAt = formatStatusTimestamp(status.last_successful_import_at) || null;
     health.lastFailedImportAt = formatStatusTimestamp(status.last_failed_import_at) || null;
+    health.latestFailureReason = failure.error_message || failureErrors[0] || null;
     return health;
   } catch (err) {
     console.warn('Import health read failed:', err && err.message ? err.message : String(err));
     return health;
+  }
+}
+
+function getImportHistoryStatusSelect() {
+  return `
+    id,
+    section,
+    category,
+    source,
+    status,
+    started_at,
+    finished_at,
+    duration_ms,
+    import_type,
+    source_identifier,
+    rows_fetched,
+    rows_imported,
+    rows_inserted,
+    rows_updated,
+    rows_skipped,
+    total_rows_after_import,
+    error_message,
+    warnings,
+    errors,
+    meta,
+    created_at
+  `;
+}
+
+function buildImportStatusHistoryWhere(section) {
+  const values = [];
+  const where = [];
+  const sectionFilter = String(section || '').trim().toLowerCase();
+
+  if (sectionFilter) {
+    values.push(sectionFilter);
+    where.push(`lower(trim(coalesce(section, ''))) = $${values.length}`);
+  }
+
+  return {
+    values,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : ''
+  };
+}
+
+async function getDistinctImportHistoryItems(section, statusFilter) {
+  const options = buildImportStatusHistoryWhere(section);
+  const values = options.values.slice();
+  const where = options.whereSql ? [options.whereSql.replace(/^WHERE\s+/i, '')] : [];
+
+  if (Array.isArray(statusFilter) && statusFilter.length) {
+    values.push(statusFilter.map((status) => String(status).trim().toLowerCase()).filter(Boolean));
+    where.push(`lower(trim(coalesce(status, ''))) = ANY($${values.length}::text[])`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const result = await dbPool.query(`
+    SELECT DISTINCT ON (section, category)
+      ${getImportHistoryStatusSelect()}
+    FROM import_history
+    ${whereSql}
+    ORDER BY section, category, started_at DESC NULLS LAST, id DESC
+  `, values);
+
+  return result.rows.map(buildImportHistoryApiItem);
+}
+
+async function getRecentImportHistoryItems(section, limit = 25) {
+  const options = buildImportStatusHistoryWhere(section);
+  const values = options.values.concat([Math.min(100, Math.max(1, toIntegerCount(limit) || 25))]);
+  const limitIdx = values.length;
+  const result = await dbPool.query(`
+    SELECT ${getImportHistoryStatusSelect()}
+    FROM import_history
+    ${options.whereSql}
+    ORDER BY started_at DESC NULLS LAST, id DESC
+    LIMIT $${limitIdx}
+  `, values);
+
+  return result.rows.map(buildImportHistoryApiItem);
+}
+
+function getImportStatusFromLatest(latest, stale) {
+  if (!latest) return 'unknown';
+  const health = getImportSyncStatus(latest.status);
+  if (health === 'failed') return 'failed';
+  if (health === 'warning' || stale) return 'warning';
+  if (health === 'healthy') return 'healthy';
+  return 'unknown';
+}
+
+function getImportItemTimeMs(item, key) {
+  if (!item || !item[key]) return null;
+  const time = new Date(item[key]).getTime();
+  return Number.isNaN(time) ? null : time;
+}
+
+function getLatestImportFailureReason(item) {
+  if (!item) return null;
+  if (item.error_message) return item.error_message;
+  if (Array.isArray(item.errors) && item.errors[0]) return item.errors[0];
+  return null;
+}
+
+async function buildImportStatusReport(section) {
+  const generated = new Date();
+  const warnings = [];
+  const errors = [];
+  const requestedSection = String(section || '').trim().toLowerCase();
+  const datasets = IMPORT_STATUS_DATASETS.filter((dataset) => !requestedSection || dataset.section === requestedSection);
+  const staleWarningHours = getImportStaleWarningHours();
+  const staleMs = staleWarningHours * 60 * 60 * 1000;
+  const report = {
+    ok: true,
+    route: requestedSection ? `/api/admin/status/imports?section=${requestedSection}` : '/api/admin/status/imports',
+    source: 'postgres',
+    section: requestedSection || 'admin',
+    type: 'import-status',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    database: {
+      connected: false
+    },
+    summary: {
+      overallStatus: 'unknown',
+      datasetsTotal: datasets.length,
+      healthy: 0,
+      warning: 0,
+      failed: 0,
+      unknown: 0,
+      stale: 0,
+      lastImportAt: null,
+      lastSuccessfulImportAt: null,
+      lastFailedImportAt: null
+    },
+    stale: {
+      thresholdHours: staleWarningHours,
+      warnings: []
+    },
+    modules: {},
+    rowCounts: {},
+    recentHistory: [],
+    warnings,
+    errors
+  };
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable.');
+    return report;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+    report.database.connected = true;
+  } catch (err) {
+    errors.push(`Database disconnected: ${err && err.message ? err.message : String(err)}`);
+    report.summary.overallStatus = 'failed';
+    return report;
+  }
+
+  await ensureImportHistoryTable();
+
+  const tableNames = datasets.map((dataset) => dataset.table).concat(['import_history']);
+  const existingTables = await getExistingPublicTables(tableNames);
+  const latestItems = await getDistinctImportHistoryItems(requestedSection || null);
+  const latestSuccessItems = await getDistinctImportHistoryItems(requestedSection || null, ['success', 'warning']);
+  const latestFailureItems = await getDistinctImportHistoryItems(requestedSection || null, ['failed', 'error']);
+  const latestByDataset = new Map(latestItems.map((item) => [getImportDatasetKey(item.section, item.category), item]));
+  const successByDataset = new Map(latestSuccessItems.map((item) => [getImportDatasetKey(item.section, item.category), item]));
+  const failureByDataset = new Map(latestFailureItems.map((item) => [getImportDatasetKey(item.section, item.category), item]));
+  let lastImportMs = null;
+  let lastSuccessMs = null;
+  let lastFailureMs = null;
+
+  for (const dataset of datasets) {
+    const key = getImportDatasetKey(dataset.section, dataset.category);
+    const tableExists = existingTables.has(dataset.table);
+    const rowCount = tableExists ? await getImportTableTotalRows(dataset.table) : null;
+    const latest = latestByDataset.get(key) || null;
+    const latestSuccess = successByDataset.get(key) || null;
+    const latestFailure = failureByDataset.get(key) || null;
+    const successTimeMs = getImportItemTimeMs(latestSuccess, 'finishedAt') || getImportItemTimeMs(latestSuccess, 'startedAt');
+    const latestTimeMs = getImportItemTimeMs(latest, 'finishedAt') || getImportItemTimeMs(latest, 'startedAt');
+    const failureTimeMs = getImportItemTimeMs(latestFailure, 'finishedAt') || getImportItemTimeMs(latestFailure, 'startedAt');
+    const stale = !latestSuccess || (successTimeMs != null && generated.getTime() - successTimeMs > staleMs);
+    const status = getImportStatusFromLatest(latest, stale);
+    const staleReason = !latestSuccess
+      ? 'No successful import history found.'
+      : (stale ? `Last successful import is older than ${staleWarningHours} hours.` : '');
+    const item = {
+      dataset: `${dataset.section}.${dataset.category}`,
+      section: dataset.section,
+      category: dataset.category,
+      source: dataset.source,
+      route: dataset.route,
+      table: dataset.table,
+      tableExists,
+      rowCount,
+      status,
+      stale,
+      staleReason,
+      latestImport: latest,
+      lastSuccessfulImportAt: latestSuccess ? latestSuccess.finishedAt || latestSuccess.startedAt || null : null,
+      lastFailedImportAt: latestFailure ? latestFailure.finishedAt || latestFailure.startedAt || null : null,
+      latestFailureReason: getLatestImportFailureReason(latestFailure)
+    };
+
+    if (!tableExists) {
+      warnings.push(`Missing data table for import status: ${dataset.table}`);
+    }
+    if (stale) {
+      report.stale.warnings.push({
+        dataset: item.dataset,
+        reason: staleReason
+      });
+    }
+
+    report.modules[item.dataset] = item;
+    report.rowCounts[item.dataset] = rowCount;
+    report.summary[status] += 1;
+    if (stale) report.summary.stale += 1;
+    if (latestTimeMs != null) lastImportMs = lastImportMs == null ? latestTimeMs : Math.max(lastImportMs, latestTimeMs);
+    if (successTimeMs != null) lastSuccessMs = lastSuccessMs == null ? successTimeMs : Math.max(lastSuccessMs, successTimeMs);
+    if (failureTimeMs != null) lastFailureMs = lastFailureMs == null ? failureTimeMs : Math.max(lastFailureMs, failureTimeMs);
+  }
+
+  report.summary.lastImportAt = lastImportMs == null ? null : new Date(lastImportMs).toISOString();
+  report.summary.lastSuccessfulImportAt = lastSuccessMs == null ? null : new Date(lastSuccessMs).toISOString();
+  report.summary.lastFailedImportAt = lastFailureMs == null ? null : new Date(lastFailureMs).toISOString();
+  report.summary.overallStatus = report.summary.failed > 0
+    ? 'failed'
+    : (report.summary.warning > 0 || report.summary.stale > 0 ? 'warning' : (report.summary.unknown > 0 ? 'unknown' : 'healthy'));
+  report.recentHistory = await getRecentImportHistoryItems(requestedSection || null, 25);
+
+  return report;
+}
+
+async function buildAdminStatusResponse() {
+  const generated = new Date();
+  const importStatus = await buildImportStatusReport();
+  const importHealth = await buildImportHealth();
+  const lockHealth = await buildLockHealth();
+  const warnings = uniqueAdminWarnings((importStatus.warnings || []).concat(importStatus.stale && importStatus.stale.warnings
+    ? importStatus.stale.warnings.map((item) => `${item.dataset}: ${item.reason}`)
+    : []));
+  const errors = Array.isArray(importStatus.errors) ? importStatus.errors : [];
+  const overallStatus = errors.length > 0
+    ? 'failed'
+    : (importStatus.summary.overallStatus === 'failed' ? 'failed' : (warnings.length > 0 || importStatus.summary.overallStatus === 'warning' ? 'warning' : importStatus.summary.overallStatus));
+
+  return buildAdminResponse({
+    route: '/api/admin/status',
+    generated,
+    source: 'postgres',
+    section: 'admin',
+    type: 'status',
+    backend: {
+      service: 'VMPix-V3 Data',
+      status: overallStatus
+    },
+    database: importStatus.database,
+    summary: {
+      overallStatus,
+      imports: importStatus.summary,
+      activeLocks: lockHealth.activeLocks,
+      staleLocks: lockHealth.staleLocks
+    },
+    importHealth,
+    lockHealth,
+    importStatus,
+    rowCounts: importStatus.rowCounts,
+    warnings,
+    errors
+  });
+}
+
+async function handleAdminStatusRequest(req, res) {
+  try {
+    res.json(await buildAdminStatusResponse());
+  } catch (err) {
+    res.status(500).json(buildAdminError('/api/admin/status', err, {
+      source: 'postgres',
+      section: 'admin',
+      type: 'status'
+    }));
+  }
+}
+
+async function handleAdminImportStatusRequest(req, res, routeOverride) {
+  try {
+    const report = await buildImportStatusReport(req.query.section);
+    report.route = routeOverride || report.route;
+    res.json(report);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: routeOverride || '/api/admin/status/imports',
+      source: 'postgres',
+      section: 'admin',
+      type: 'import-status',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function handleImportDiagnosticsRequest(req, res) {
+  try {
+    const report = await buildImportStatusReport(req.query.section);
+    report.route = '/api/admin/diagnostics/imports';
+    report.type = 'import-diagnostics';
+    report.diagnostics = {
+      staleWarnings: report.stale.warnings,
+      failedDatasets: Object.values(report.modules).filter((item) => item.status === 'failed'),
+      unknownDatasets: Object.values(report.modules).filter((item) => item.status === 'unknown')
+    };
+    res.json(report);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: '/api/admin/diagnostics/imports',
+      source: 'postgres',
+      section: 'admin',
+      type: 'import-diagnostics',
+      error: err && err.message ? err.message : String(err)
+    });
   }
 }
 
@@ -6327,7 +6797,7 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
     existingTables.has('music_shows') &&
     existingTables.has('music_venues') &&
     relationshipHasColumns(columnsByTable, 'music_shows', ['venue_id'], warnings) &&
-    relationshipHasColumns(columnsByTable, 'music_venues', ['venue_id'], warnings)
+    relationshipHasColumns(columnsByTable, 'music_venues', ['venue_key'], warnings)
   ) {
     const invalidVenueIdResult = await runRelationshipQuery(
       warnings,
@@ -6335,9 +6805,9 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
       `SELECT ms.show_id, ms.name, ms.date, ms.venue_id, ms.venue
        FROM music_shows ms
        LEFT JOIN music_venues mv
-         ON trim(coalesce(ms.venue_id::text, '')) = trim(coalesce(mv.venue_id::text, ''))
+         ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
        WHERE trim(coalesce(ms.venue_id::text, '')) <> ''
-         AND mv.venue_id IS NULL
+         AND mv.venue_key IS NULL
        ORDER BY ms.show_id ASC
        LIMIT 1000`
     );
@@ -6356,6 +6826,84 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
   }
 
   if (relationshipHasTable(existingTables, 'music_venues', warnings)) {
+    if (relationshipHasColumns(columnsByTable, 'music_venues', ['venue_key'], warnings)) {
+      const missingVenueKeyResult = await runRelationshipQuery(
+        warnings,
+        'music venues missing public venue_id',
+        `SELECT venue_id, venue_key, venue, city, state
+         FROM music_venues
+         WHERE trim(coalesce(venue_key, '')) = ''
+         ORDER BY venue ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingVenueKeyResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'venues',
+          severity: 'error',
+          code: 'MISSING_VENUE_ID',
+          message: 'Music venue is missing public venue_id/venue_key.',
+          entity_id: row.venue_id,
+          entity_name: row.venue,
+          details: { venue_key: row.venue_key || '', city: row.city || '', state: row.state || '' }
+        }));
+      });
+
+      const duplicateVenueKeyResult = await runRelationshipQuery(
+        warnings,
+        'duplicate music venue ids',
+        `SELECT lower(trim(venue_key)) AS venue_key_normalized, min(venue_key) AS venue_key, count(*)::int AS count, array_agg(venue_id::text ORDER BY venue_id) AS venue_ids
+         FROM music_venues
+         WHERE trim(coalesce(venue_key, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+         ORDER BY count DESC, venue_key ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(duplicateVenueKeyResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'venues',
+          severity: 'warning',
+          code: 'DUPLICATE_VENUE_ID',
+          message: 'Duplicate music venue_id/venue_key detected.',
+          entity_id: row.venue_key,
+          entity_name: row.venue_key,
+          details: { count: toIntegerCount(row.count), venue_ids: Array.isArray(row.venue_ids) ? row.venue_ids : [] }
+        }));
+      });
+
+      if (
+        existingTables.has('music_shows') &&
+        relationshipHasColumns(columnsByTable, 'music_shows', ['venue_id'], warnings)
+      ) {
+        const orphanedVenueResult = await runRelationshipQuery(
+          warnings,
+          'music venues without linked shows',
+          `SELECT mv.venue_id, mv.venue_key, mv.venue, mv.city, mv.state
+           FROM music_venues mv
+           LEFT JOIN music_shows ms
+             ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+           WHERE trim(coalesce(mv.venue_key, '')) <> ''
+             AND ms.show_id IS NULL
+           ORDER BY mv.venue ASC
+           LIMIT 1000`
+        );
+        diagnosticRows(orphanedVenueResult).forEach((row) => {
+          items.push(buildRelationshipItem({
+            section: 'music',
+            type: 'venues',
+            severity: 'info',
+            code: 'ORPHANED_VENUE_NO_SHOWS',
+            message: 'Music venue has no linked music shows yet.',
+            entity_id: row.venue_key || row.venue_id,
+            entity_name: row.venue,
+            details: { venue_id: row.venue_key || '', city: row.city || '', state: row.state || '' }
+          }));
+        });
+      }
+    }
+
     if (relationshipHasColumns(columnsByTable, 'music_venues', ['venue'], warnings)) {
       const duplicateVenueResult = await runRelationshipQuery(
         warnings,
@@ -6465,6 +7013,112 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
         details: { count: toIntegerCount(row.count), person_ids: Array.isArray(row.person_ids) ? row.person_ids : [] }
       }));
     });
+
+    if (relationshipHasColumns(columnsByTable, 'music_people', ['person_id'], warnings)) {
+      const missingPersonIdResult = await runRelationshipQuery(
+        warnings,
+        'music people missing person_id',
+        `SELECT person_id, name, category
+         FROM music_people
+         WHERE person_id IS NULL
+         ORDER BY name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingPersonIdResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'people',
+          severity: 'error',
+          code: 'MISSING_PERSON_ID',
+          message: 'Music person is missing person_id.',
+          entity_id: row.person_id,
+          entity_name: row.name,
+          details: { category: row.category || '' }
+        }));
+      });
+    }
+
+    if (hasDiagnosticColumn(columnsByTable, 'music_people', 'bands')) {
+      const malformedPeopleBandsResult = await runRelationshipQuery(
+        warnings,
+        'malformed music people band relationships',
+        `SELECT person_id, name, jsonb_typeof(bands) AS field_type
+         FROM music_people
+         WHERE bands IS NOT NULL
+           AND jsonb_typeof(bands) <> 'array'
+         ORDER BY name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(malformedPeopleBandsResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'music',
+          type: 'people',
+          severity: 'error',
+          code: 'MALFORMED_PEOPLE_BANDS_FIELD',
+          message: 'Music person bands field is not a JSON array.',
+          entity_id: row.person_id,
+          entity_name: row.name,
+          details: { field_type: row.field_type || '' }
+        }));
+      });
+    }
+  }
+
+  if (
+    relationshipHasTable(existingTables, 'music_shows', warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_shows', ['bands'], warnings)
+  ) {
+    const malformedShowBandsResult = await runRelationshipQuery(
+      warnings,
+      'malformed music show band relationships',
+      `SELECT show_id, name, date, jsonb_typeof(bands) AS field_type
+       FROM music_shows
+       WHERE bands IS NOT NULL
+         AND jsonb_typeof(bands) <> 'array'
+       ORDER BY show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(malformedShowBandsResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'shows',
+        severity: 'error',
+        code: 'MALFORMED_SHOW_BANDS_FIELD',
+        message: 'Music show bands field is not a JSON array.',
+        entity_id: row.show_id,
+        entity_name: row.name,
+        details: { date: row.date || '', field_type: row.field_type || '' }
+      }));
+    });
+
+    const duplicateShowBandResult = await runRelationshipQuery(
+      warnings,
+      'duplicate music show band relationships',
+      `WITH refs AS (
+         SELECT ms.show_id, ms.name, ms.date, lower(trim(band_item->>'band')) AS band_key, min(band_item->>'band') AS band, count(*)::int AS count
+         FROM music_shows ms
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ms.bands) = 'array' THEN ms.bands ELSE '[]'::jsonb END) AS band_item
+         WHERE trim(coalesce(band_item->>'band', '')) <> ''
+         GROUP BY ms.show_id, ms.name, ms.date, lower(trim(band_item->>'band'))
+         HAVING count(*) > 1
+       )
+       SELECT show_id, name, date, band, count
+       FROM refs
+       ORDER BY show_id ASC, band ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(duplicateShowBandResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'shows',
+        severity: 'warning',
+        code: 'DUPLICATE_SHOW_BAND_RELATIONSHIP',
+        message: 'Music show lists the same band more than once.',
+        entity_id: row.show_id,
+        entity_name: row.name,
+        details: { band: row.band || '', date: row.date || '', count: toIntegerCount(row.count) }
+      }));
+    });
   }
 
   if (
@@ -6500,6 +7154,154 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
         entity_id: row.show_id,
         entity_name: row.name,
         details: { band: row.band || '', date: row.date || '' }
+      }));
+    });
+  }
+
+  if (
+    existingTables.has('music_people') &&
+    existingTables.has('music_bands') &&
+    relationshipHasColumns(columnsByTable, 'music_people', ['person_id', 'name', 'bands'], warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_bands', ['band'], warnings)
+  ) {
+    const malformedPeopleBandItemResult = await runRelationshipQuery(
+      warnings,
+      'malformed music people band items',
+      `SELECT mp.person_id, mp.name, jsonb_typeof(band_item) AS field_type, band_item::text AS value
+       FROM music_people mp
+       CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(mp.bands) = 'array' THEN mp.bands ELSE '[]'::jsonb END) AS band_item
+       WHERE jsonb_typeof(band_item) <> 'object'
+       ORDER BY mp.person_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(malformedPeopleBandItemResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'people',
+        severity: 'error',
+        code: 'MALFORMED_PEOPLE_BAND_ITEM',
+        message: 'Music person band relationship item is not a JSON object.',
+        entity_id: row.person_id,
+        entity_name: row.name,
+        details: { field_type: row.field_type || '', value: row.value || '' }
+      }));
+    });
+
+    const missingPersonBandResult = await runRelationshipQuery(
+      warnings,
+      'music people band references',
+      `WITH refs AS (
+         SELECT DISTINCT mp.person_id, mp.name, band_item->>'band' AS band, band_item->>'instrument' AS instrument
+         FROM music_people mp
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(mp.bands) = 'array' THEN mp.bands ELSE '[]'::jsonb END) AS band_item
+         WHERE jsonb_typeof(band_item) = 'object'
+           AND trim(coalesce(band_item->>'band', '')) <> ''
+       )
+       SELECT refs.person_id, refs.name, refs.band, refs.instrument
+       FROM refs
+       LEFT JOIN music_bands mb
+         ON lower(trim(coalesce(mb.band, ''))) = lower(trim(refs.band))
+       WHERE mb.band IS NULL
+       ORDER BY refs.name ASC, refs.band ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingPersonBandResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'people',
+        severity: 'error',
+        code: 'MISSING_PERSON_BAND_REFERENCE',
+        message: 'Music person references a band that does not exist in music_bands.',
+        entity_id: row.person_id,
+        entity_name: row.name,
+        details: { band: row.band || '', instrument: row.instrument || '' }
+      }));
+    });
+
+    const duplicatePersonBandResult = await runRelationshipQuery(
+      warnings,
+      'duplicate music people band relationships',
+      `WITH refs AS (
+         SELECT mp.person_id, mp.name, lower(trim(band_item->>'band')) AS band_key, lower(trim(coalesce(band_item->>'instrument', ''))) AS instrument_key, min(band_item->>'band') AS band, min(coalesce(band_item->>'instrument', '')) AS instrument, count(*)::int AS count
+         FROM music_people mp
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(mp.bands) = 'array' THEN mp.bands ELSE '[]'::jsonb END) AS band_item
+         WHERE jsonb_typeof(band_item) = 'object'
+           AND trim(coalesce(band_item->>'band', '')) <> ''
+         GROUP BY mp.person_id, mp.name, lower(trim(band_item->>'band')), lower(trim(coalesce(band_item->>'instrument', '')))
+         HAVING count(*) > 1
+       )
+       SELECT person_id, name, band, instrument, count
+       FROM refs
+       ORDER BY name ASC, band ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(duplicatePersonBandResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'people',
+        severity: 'warning',
+        code: 'DUPLICATE_PERSON_BAND_RELATIONSHIP',
+        message: 'Music person has the same band/instrument relationship more than once.',
+        entity_id: row.person_id,
+        entity_name: row.name,
+        details: { band: row.band || '', instrument: row.instrument || '', count: toIntegerCount(row.count) }
+      }));
+    });
+
+    const orphanedBandResult = await runRelationshipQuery(
+      warnings,
+      'music bands without people relationships',
+      `WITH person_bands AS (
+         SELECT DISTINCT lower(trim(band_item->>'band')) AS band_key
+         FROM music_people mp
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(mp.bands) = 'array' THEN mp.bands ELSE '[]'::jsonb END) AS band_item
+         WHERE jsonb_typeof(band_item) = 'object'
+           AND trim(coalesce(band_item->>'band', '')) <> ''
+       )
+       SELECT mb.band_id, mb.band
+       FROM music_bands mb
+       LEFT JOIN person_bands pb
+         ON pb.band_key = lower(trim(coalesce(mb.band, '')))
+       WHERE trim(coalesce(mb.band, '')) <> ''
+         AND pb.band_key IS NULL
+       ORDER BY mb.band ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(orphanedBandResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'bands',
+        severity: 'info',
+        code: 'ORPHANED_BAND_NO_PEOPLE',
+        message: 'Music band has no linked people records yet.',
+        entity_id: row.band_id,
+        entity_name: row.band,
+        details: {}
+      }));
+    });
+
+    const peopleWithoutBandsResult = await runRelationshipQuery(
+      warnings,
+      'music people without band links',
+      `SELECT person_id, name, category
+       FROM music_people
+       WHERE CASE
+         WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
+         ELSE 0
+       END = 0
+       ORDER BY name ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(peopleWithoutBandsResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'music',
+        type: 'people',
+        severity: 'info',
+        code: 'ORPHANED_PERSON_NO_BANDS',
+        message: 'Music person has no linked bands yet.',
+        entity_id: row.person_id,
+        entity_name: row.name,
+        details: { category: row.category || '' }
       }));
     });
   }
@@ -6592,6 +7394,37 @@ async function addWrestlingRelationshipIssues(items, warnings, existingTables, c
       });
     }
 
+    if (
+      existingTables.has('wrestling_shows') &&
+      relationshipHasColumns(columnsByTable, 'wrestling_venues', ['venue_id'], warnings) &&
+      relationshipHasColumns(columnsByTable, 'wrestling_shows', ['venue_id'], warnings)
+    ) {
+      const orphanedVenueResult = await runRelationshipQuery(
+        warnings,
+        'wrestling venues without linked shows',
+        `SELECT wv.venue_id, wv.venue_name, wv.city, wv.state
+         FROM wrestling_venues wv
+         LEFT JOIN wrestling_shows ws
+           ON lower(trim(coalesce(ws.venue_id, ''))) = lower(trim(coalesce(wv.venue_id, '')))
+         WHERE trim(coalesce(wv.venue_id, '')) <> ''
+           AND ws.show_id IS NULL
+         ORDER BY wv.venue_name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(orphanedVenueResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'wrestling',
+          type: 'venues',
+          severity: 'info',
+          code: 'ORPHANED_VENUE_NO_SHOWS',
+          message: 'Wrestling venue has no linked wrestling shows yet.',
+          entity_id: row.venue_id,
+          entity_name: row.venue_name,
+          details: { city: row.city || '', state: row.state || '' }
+        }));
+      });
+    }
+
     if (relationshipHasColumns(columnsByTable, 'wrestling_venues', ['city', 'state'], warnings)) {
       const missingLocationResult = await runRelationshipQuery(
         warnings,
@@ -6673,6 +7506,110 @@ async function addWrestlingRelationshipIssues(items, warnings, existingTables, c
         entity_id: Array.isArray(row.person_ids) ? row.person_ids[0] : '',
         entity_name: row.name,
         details: { count: toIntegerCount(row.count), person_ids: Array.isArray(row.person_ids) ? row.person_ids : [] }
+      }));
+    });
+
+    if (hasDiagnosticColumn(columnsByTable, 'wrestling_people', 'slug')) {
+      const missingWrestlerIdResult = await runRelationshipQuery(
+        warnings,
+        'wrestling people missing slug ids',
+        `SELECT id, slug, name, category
+         FROM wrestling_people
+         WHERE trim(coalesce(slug, '')) = ''
+         ORDER BY name ASC
+         LIMIT 1000`
+      );
+      diagnosticRows(missingWrestlerIdResult).forEach((row) => {
+        items.push(buildRelationshipItem({
+          section: 'wrestling',
+          type: 'people',
+          severity: 'error',
+          code: 'MISSING_WRESTLER_ID',
+          message: 'Wrestling person is missing slug/wrestler ID.',
+          entity_id: row.id,
+          entity_name: row.name,
+          details: { category: row.category || '' }
+        }));
+      });
+    }
+  }
+
+  if (
+    relationshipHasTable(existingTables, 'wrestling_shows', warnings) &&
+    relationshipHasColumns(columnsByTable, 'wrestling_shows', ['matches'], warnings)
+  ) {
+    const malformedMatchesResult = await runRelationshipQuery(
+      warnings,
+      'malformed wrestling matches field',
+      `SELECT show_id, show_name, date, jsonb_typeof(matches) AS field_type
+       FROM wrestling_shows
+       WHERE matches IS NOT NULL
+         AND jsonb_typeof(matches) <> 'array'
+       ORDER BY show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(malformedMatchesResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'shows',
+        severity: 'error',
+        code: 'MALFORMED_MATCHES_FIELD',
+        message: 'Wrestling show matches field is not a JSON array.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { date: row.date || '', field_type: row.field_type || '' }
+      }));
+    });
+
+    const emptyMatchesResult = await runRelationshipQuery(
+      warnings,
+      'wrestling shows without matches',
+      `SELECT show_id, show_name, date
+       FROM wrestling_shows
+       WHERE CASE
+         WHEN jsonb_typeof(matches) = 'array' THEN jsonb_array_length(matches)
+         ELSE 0
+       END = 0
+       ORDER BY show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(emptyMatchesResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'shows',
+        severity: 'warning',
+        code: 'ORPHANED_SHOW_NO_MATCHES',
+        message: 'Wrestling show has no match records.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { date: row.date || '' }
+      }));
+    });
+  }
+
+  if (
+    existingTables.has('wrestling_shows') &&
+    relationshipHasColumns(columnsByTable, 'wrestling_shows', ['promotion'], warnings)
+  ) {
+    const missingPromotionResult = await runRelationshipQuery(
+      warnings,
+      'wrestling shows missing promotion',
+      `SELECT show_id, show_name, date
+       FROM wrestling_shows
+       WHERE trim(coalesce(promotion, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingPromotionResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'shows',
+        severity: 'warning',
+        code: 'MISSING_PROMOTION',
+        message: 'Wrestling show is missing promotion.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { date: row.date || '' }
       }));
     });
   }
@@ -6784,6 +7721,237 @@ async function addWrestlingRelationshipIssues(items, warnings, existingTables, c
         details: { referee: row.referee || '', match_order: row.match_order || '', date: row.date || '' }
       }));
     });
+
+    const malformedMatchFieldResult = await runRelationshipQuery(
+      warnings,
+      'malformed wrestling match relationship fields',
+      `WITH fields AS (
+         SELECT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, field.field_name, jsonb_typeof(field.field_value) AS field_type, field.allows_string
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL (VALUES
+           ('participants', match_item->'participants', false),
+           ('side_1', match_item->'side_1', false),
+           ('side_2', match_item->'side_2', false),
+           ('winner', match_item->'winner', true),
+           ('referees', match_item->'referees', false),
+           ('extra_people', match_item->'extra_people', false),
+           ('tagged_people', match_item->'tagged_people', false)
+         ) AS field(field_name, field_value, allows_string)
+         WHERE field.field_value IS NOT NULL
+       )
+       SELECT show_id, show_name, date, match_order, field_name, field_type
+       FROM fields
+       WHERE (allows_string = true AND coalesce(field_type, '') NOT IN ('array', 'string'))
+          OR (allows_string = false AND coalesce(field_type, '') <> 'array')
+       ORDER BY show_id ASC, match_order ASC, field_name ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(malformedMatchFieldResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'error',
+        code: 'MALFORMED_RELATIONSHIP_FIELD',
+        message: 'Wrestling match relationship field has an unexpected JSON type.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { field: row.field_name || '', field_type: row.field_type || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const emptyRelationshipResult = await runRelationshipQuery(
+      warnings,
+      'empty wrestling match relationship fields',
+      `WITH match_rows AS (
+         SELECT ws.show_id, ws.show_name, ws.date, match_item, match_item->>'match_order' AS match_order
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+       ),
+       empty_fields AS (
+         SELECT show_id, show_name, date, match_order, 'participants' AS field_name
+         FROM match_rows
+         WHERE jsonb_array_length(${getWrestlingParticipantsArraySql('match_item')}) = 0
+         UNION ALL
+         SELECT show_id, show_name, date, match_order, 'winner' AS field_name
+         FROM match_rows
+         WHERE jsonb_array_length(${getWrestlingWinnerArraySql('match_item')}) = 0
+         UNION ALL
+         SELECT show_id, show_name, date, match_order, 'tagged_people' AS field_name
+         FROM match_rows
+         WHERE jsonb_array_length(${getWrestlingAllTaggedPeopleArraySql('match_item')}) = 0
+       )
+       SELECT show_id, show_name, date, match_order, field_name
+       FROM empty_fields
+       ORDER BY show_id ASC, match_order ASC, field_name ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(emptyRelationshipResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'warning',
+        code: row.field_name === 'winner' ? 'MISSING_WINNER' : 'EMPTY_RELATIONSHIP_FIELD',
+        message: `Wrestling match has empty ${row.field_name || 'relationship'} data.`,
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { field: row.field_name || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const missingExtraPeopleResult = await runRelationshipQuery(
+      warnings,
+      'wrestling extra_people references',
+      `WITH people_lookup AS (${peopleLookupNoTeamsSql}),
+       refs AS (
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, extra_people_item.value AS person
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingExtraPeopleArraySql('match_item')}) AS extra_people_item(value)
+         WHERE trim(extra_people_item.value) <> ''
+       )
+       SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.person
+       FROM refs
+       LEFT JOIN people_lookup pl
+         ON pl.lookup_key = lower(trim(refs.person))
+       WHERE pl.lookup_key IS NULL
+       ORDER BY refs.show_id ASC, refs.match_order ASC, refs.person ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingExtraPeopleResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'warning',
+        code: 'MISSING_EXTRA_PEOPLE_REFERENCE',
+        message: 'Wrestling match extra_people value does not exist in wrestling_people.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { person: row.person || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const missingTaggedPeopleResult = await runRelationshipQuery(
+      warnings,
+      'wrestling tagged_people references',
+      `WITH people_lookup AS (${peopleLookupNoTeamsSql}),
+       refs AS (
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, tagged_people_item.value AS person
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingTaggedPeopleArraySql('match_item')}) AS tagged_people_item(value)
+         WHERE trim(tagged_people_item.value) <> ''
+       )
+       SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.person
+       FROM refs
+       LEFT JOIN people_lookup pl
+         ON pl.lookup_key = lower(trim(refs.person))
+       WHERE pl.lookup_key IS NULL
+       ORDER BY refs.show_id ASC, refs.match_order ASC, refs.person ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingTaggedPeopleResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'warning',
+        code: 'MISSING_TAGGED_PEOPLE_REFERENCE',
+        message: 'Wrestling match tagged_people value does not exist in wrestling_people.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { person: row.person || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const missingSideResult = await runRelationshipQuery(
+      warnings,
+      'wrestling side/team references',
+      `WITH people_lookup AS (${peopleLookupSql}),
+       refs AS (
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, 'side_1' AS field_name, side_item.value AS side_name
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_item->'side_1') = 'array' THEN match_item->'side_1' ELSE '[]'::jsonb END) AS side_item(value)
+         WHERE trim(side_item.value) <> ''
+         UNION
+         SELECT DISTINCT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, 'side_2' AS field_name, side_item.value AS side_name
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_item->'side_2') = 'array' THEN match_item->'side_2' ELSE '[]'::jsonb END) AS side_item(value)
+         WHERE trim(side_item.value) <> ''
+       )
+       SELECT refs.show_id, refs.show_name, refs.date, refs.match_order, refs.field_name, refs.side_name
+       FROM refs
+       LEFT JOIN people_lookup pl
+         ON pl.lookup_key = lower(trim(refs.side_name))
+       WHERE pl.lookup_key IS NULL
+       ORDER BY refs.show_id ASC, refs.match_order ASC, refs.side_name ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(missingSideResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'warning',
+        code: 'MISSING_SIDE_REFERENCE',
+        message: 'Wrestling match side/team value does not exist in wrestling_people names, aliases, or teams.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { side: row.side_name || '', field: row.field_name || '', match_order: row.match_order || '', date: row.date || '' }
+      }));
+    });
+
+    const duplicateMatchPeopleResult = await runRelationshipQuery(
+      warnings,
+      'duplicate wrestling match people relationships',
+      `WITH refs AS (
+         SELECT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, 'participants' AS field_name, participant_item.value AS person
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingParticipantsArraySql('match_item')}) AS participant_item(value)
+         WHERE trim(participant_item.value) <> ''
+         UNION ALL
+         SELECT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, 'referees' AS field_name, referee_item.value AS person
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingRefereesArraySql('match_item')}) AS referee_item(value)
+         WHERE trim(referee_item.value) <> ''
+         UNION ALL
+         SELECT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, 'extra_people' AS field_name, extra_people_item.value AS person
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingExtraPeopleArraySql('match_item')}) AS extra_people_item(value)
+         WHERE trim(extra_people_item.value) <> ''
+         UNION ALL
+         SELECT ws.show_id, ws.show_name, ws.date, match_item->>'match_order' AS match_order, 'tagged_people' AS field_name, tagged_people_item.value AS person
+         FROM wrestling_shows ws
+         CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END) AS match_item
+         CROSS JOIN LATERAL jsonb_array_elements_text(${getWrestlingTaggedPeopleArraySql('match_item')}) AS tagged_people_item(value)
+         WHERE trim(tagged_people_item.value) <> ''
+       ),
+       grouped AS (
+         SELECT show_id, show_name, date, match_order, field_name, lower(trim(person)) AS person_key, min(person) AS person, count(*)::int AS count
+         FROM refs
+         GROUP BY show_id, show_name, date, match_order, field_name, lower(trim(person))
+         HAVING count(*) > 1
+       )
+       SELECT show_id, show_name, date, match_order, field_name, person, count
+       FROM grouped
+       ORDER BY show_id ASC, match_order ASC, field_name ASC, person ASC
+       LIMIT 1000`
+    );
+    diagnosticRows(duplicateMatchPeopleResult).forEach((row) => {
+      items.push(buildRelationshipItem({
+        section: 'wrestling',
+        type: 'matches',
+        severity: 'warning',
+        code: 'DUPLICATE_MATCH_PEOPLE_RELATIONSHIP',
+        message: 'Wrestling match contains a duplicate people relationship value.',
+        entity_id: row.show_id,
+        entity_name: row.show_name,
+        details: { person: row.person || '', field: row.field_name || '', match_order: row.match_order || '', date: row.date || '', count: toIntegerCount(row.count) }
+      }));
+    });
   }
 }
 
@@ -6848,6 +8016,71 @@ async function buildRelationshipHealth(section) {
     info: summary.info,
     overallHealth: getRelationshipOverallHealth(summary, report.unknown)
   };
+}
+
+function buildRelationshipDiagnosticSummary(items, unknown) {
+  const severity = summarizeRelationshipItems(items);
+  const codeCount = (predicate) => (items || []).filter((item) => predicate(String(item && item.code || '').toUpperCase())).length;
+  const summary = {
+    totalIssues: (items || []).length,
+    errors: severity.errors,
+    warnings: severity.warnings,
+    info: severity.info,
+    missingRelationships: codeCount((code) => code.includes('MISSING') || code.includes('INVALID')),
+    orphanedRecords: codeCount((code) => code.includes('ORPHANED')),
+    malformedFields: codeCount((code) => code.includes('MALFORMED')),
+    duplicateRelationships: codeCount((code) => code.includes('DUPLICATE')),
+    overallHealth: getRelationshipOverallHealth(severity, unknown)
+  };
+
+  return summary;
+}
+
+async function buildRelationshipDiagnosticsResponse(section) {
+  const report = await buildRelationshipReport(section);
+  const items = report.items || [];
+  const requestedSection = String(section || '').trim().toLowerCase();
+  const route = requestedSection
+    ? `/api/admin/diagnostics/${requestedSection}/relationships`
+    : '/api/admin/diagnostics/relationships';
+  const errorItems = items.filter((item) => item.severity === 'error');
+
+  return {
+    ok: true,
+    route,
+    source: 'postgres',
+    section: requestedSection || 'all',
+    module: 'relationships',
+    generatedAt: report.generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(report.generated),
+    summary: buildRelationshipDiagnosticSummary(items, report.unknown),
+    warnings: report.warnings || [],
+    errors: errorItems.slice(0, 100),
+    count: items.length,
+    items: items.slice(0, 100),
+    limited: items.length > 100,
+    routeInfo: {
+      sourceRoutes: [
+        requestedSection ? `/api/admin/relationships/${requestedSection}` : '/api/admin/relationships',
+        '/api/admin/relationships/summary'
+      ]
+    }
+  };
+}
+
+async function handleRelationshipDiagnosticsRequest(req, res, fixedSection) {
+  try {
+    res.json(await buildRelationshipDiagnosticsResponse(fixedSection));
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: fixedSection ? `/api/admin/diagnostics/${fixedSection}/relationships` : '/api/admin/diagnostics/relationships',
+      source: 'postgres',
+      section: fixedSection || 'all',
+      module: 'relationships',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
 }
 
 async function handleRelationshipsRequest(req, res, fixedSection) {
@@ -7701,6 +8934,8 @@ async function runLoggedImport(req, res, config) {
     section: area,
     category,
     source: config.source,
+    importType: req.query.refresh === '1' ? 'manual_refresh' : 'manual',
+    sourceIdentifier: config.source || config.route,
     meta: {
       route: config.route,
       refresh: req.query.refresh === '1',
@@ -7714,10 +8949,16 @@ async function runLoggedImport(req, res, config) {
     const historyWarnings = getImportHistoryWarnings(result);
     const historyErrors = getImportHistoryErrors(result);
     const historyStatus = historyErrors.length ? 'failed' : (historyWarnings.length ? 'warning' : 'success');
+    const totalRowsAfterImport = await getImportTableTotalRows(result && result.table);
     const importHistory = await finishImportHistory(history && history.id, {
       status: historyStatus,
+      rowsFetched: getImportHistoryRowsFetched(result),
       rowsImported: getImportLogRowsWritten(result),
+      rowsInserted: getNullableImportCount(result, ['rowsInserted', 'insertedRows', 'inserted']),
+      rowsUpdated: getNullableImportCount(result, ['rowsUpdated', 'updatedRows', 'updated']),
       rowsSkipped: getImportHistoryRowsSkipped(result),
+      totalRowsAfterImport,
+      errorMessage: historyErrors[0] || null,
       warnings: historyWarnings,
       errors: historyErrors,
       meta: buildImportHistoryMeta(config, req, result)
@@ -7732,8 +8973,8 @@ async function runLoggedImport(req, res, config) {
       route: config.route,
       status: historyStatus === 'failed' ? 'error' : historyStatus,
       rows_read: result && result.rowsRead,
-      rows_inserted: getImportLogRowsWritten(result),
-      rows_updated: 0,
+      rows_inserted: getNullableImportCount(result, ['rowsInserted', 'insertedRows', 'inserted']) ?? getImportLogRowsWritten(result),
+      rows_updated: getNullableImportCount(result, ['rowsUpdated', 'updatedRows', 'updated']) ?? 0,
       started_at: startedAt,
       finished_at: new Date()
     });
@@ -7747,8 +8988,13 @@ async function runLoggedImport(req, res, config) {
   } catch (err) {
     const importHistory = await finishImportHistory(history && history.id, {
       status: 'failed',
+      rowsFetched: 0,
       rowsImported: 0,
+      rowsInserted: 0,
+      rowsUpdated: 0,
       rowsSkipped: 0,
+      totalRowsAfterImport: null,
+      errorMessage: err && err.message ? err.message : String(err),
       warnings: [],
       errors: [err && err.message ? err.message : String(err)],
       meta: {
@@ -9817,6 +11063,18 @@ app.get('/api/admin/import-history/latest', async (req, res) => {
   return handleLatestImportHistoryRequest(req, res);
 });
 
+app.get('/api/admin/status', async (req, res) => {
+  return handleAdminStatusRequest(req, res);
+});
+
+app.get('/api/admin/status/imports', async (req, res) => {
+  return handleAdminImportStatusRequest(req, res, '/api/admin/status/imports');
+});
+
+app.get('/api/admin/diagnostics/imports', async (req, res) => {
+  return handleImportDiagnosticsRequest(req, res);
+});
+
 app.get('/api/admin/import-locks', async (req, res) => {
   return handleImportLocksRequest(req, res);
 });
@@ -9843,6 +11101,18 @@ app.get('/api/admin/relationships/music', async (req, res) => {
 
 app.get('/api/admin/relationships/wrestling', async (req, res) => {
   return handleRelationshipsRequest(req, res, 'wrestling');
+});
+
+app.get('/api/admin/diagnostics/relationships', async (req, res) => {
+  return handleRelationshipDiagnosticsRequest(req, res);
+});
+
+app.get('/api/admin/diagnostics/music/relationships', async (req, res) => {
+  return handleRelationshipDiagnosticsRequest(req, res, 'music');
+});
+
+app.get('/api/admin/diagnostics/wrestling/relationships', async (req, res) => {
+  return handleRelationshipDiagnosticsRequest(req, res, 'wrestling');
 });
 
 app.get('/api/admin/stats/summary', async (req, res) => {
