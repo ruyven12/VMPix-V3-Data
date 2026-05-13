@@ -227,7 +227,7 @@ function requireAdminAccess(req, res, next) {
 
     return res.status(503).json(buildAdminAccessError(
       req,
-      'Admin protection is not configured.',
+      'ADMIN_PROTECTION_NOT_CONFIGURED',
       'Set ADMIN_TOKEN or ADMIN_PASSWORD to enable admin/control routes.'
     ));
   }
@@ -236,7 +236,7 @@ function requireAdminAccess(req, res, next) {
   if (!requestTokens.length) {
     return res.status(401).json(buildAdminAccessError(
       req,
-      'Admin access required.',
+      'ADMIN_ACCESS_REQUIRED',
       'Missing admin token.'
     ));
   }
@@ -247,7 +247,7 @@ function requireAdminAccess(req, res, next) {
 
   return res.status(401).json(buildAdminAccessError(
     req,
-    'Admin access required.',
+    'ADMIN_TOKEN_INVALID',
     'Invalid admin token.'
   ));
 }
@@ -3452,6 +3452,59 @@ function getPageNumber(value) {
   return Number.isInteger(page) && page > 0 ? page : 1;
 }
 
+function buildPaginationMeta(page, limit, total, count) {
+  const safePage = getPageNumber(page);
+  const safeLimit = getClampedLimit(limit);
+  const safeTotal = toIntegerCount(total);
+  const totalPages = safeTotal > 0 ? Math.ceil(safeTotal / safeLimit) : 0;
+
+  return {
+    page: safePage,
+    limit: safeLimit,
+    count: toIntegerCount(count),
+    total: safeTotal,
+    totalPages,
+    hasNextPage: safePage < totalPages,
+    hasPrevPage: safePage > 1 && totalPages > 0
+  };
+}
+
+function getSafeErrorMessage(err) {
+  const message = err && err.message ? String(err.message) : String(err || 'Unknown error');
+  return message || 'Unknown error';
+}
+
+function buildApiError(route, err, extra = {}) {
+  const generated = extra.generated instanceof Date ? extra.generated : new Date();
+  const error = extra.error || 'INTERNAL_ERROR';
+  const message = extra.message || getSafeErrorMessage(err);
+  const payload = {
+    ok: false,
+    route,
+    error,
+    message,
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated)
+  };
+
+  ['source', 'section', 'type', 'details'].forEach((key) => {
+    if (extra[key] != null) payload[key] = extra[key];
+  });
+
+  return payload;
+}
+
+function buildListMeta({ route, source, pagination, filters, sort, warnings } = {}) {
+  const meta = {};
+  if (route) meta.route = route;
+  if (source != null) meta.source = source;
+  if (pagination) meta.pagination = pagination;
+  if (filters) meta.filters = filters;
+  if (sort) meta.sort = sort;
+  meta.warnings = Array.isArray(warnings) ? warnings : [];
+  return meta;
+}
+
 function buildMusicBandsDbQueryOptions(query) {
   const values = [];
   const where = [];
@@ -3573,6 +3626,7 @@ async function handleMusicBandsDbRequest(req, res, routePath) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
+    const pagination = buildPaginationMeta(page, limit, total, result.rows.length);
 
     res.json({
       ok: true,
@@ -3580,22 +3634,23 @@ async function handleMusicBandsDbRequest(req, res, routePath) {
       source: 'PostgreSQL:music_bands',
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
-      count: result.rows.length,
+      count: pagination.count,
       total,
       page,
       limit,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
       sort: options.sort,
+      meta: buildListMeta({ route: routePath, source: 'PostgreSQL:music_bands', pagination, filters: options.filters, sort: options.sort }),
       data: result.rows.map(buildMusicBandDbApiItem)
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: routePath,
+    res.status(500).json(buildApiError(routePath, err, {
       source: 'PostgreSQL:music_bands',
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'MUSIC_BANDS_DB_ERROR'
+    }));
   }
 }
 
@@ -3882,6 +3937,7 @@ async function handleMusicShowsDbRequest(req, res) {
     );
     const venueDetailsMap = await getMusicVenueDetailsMap(result.rows.map((row) => row.venue_id));
     const data = result.rows.map((row) => buildMusicShowDbApiItem(row, venueDetailsMap));
+    const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
       ok: true,
@@ -3889,13 +3945,16 @@ async function handleMusicShowsDbRequest(req, res) {
       source: 'PostgreSQL:music_shows',
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
-      count: data.length,
+      count: pagination.count,
       total,
       page,
       limit,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
       sort: options.sort,
+      meta: buildListMeta({ route: '/api/music/shows/db', source: 'PostgreSQL:music_shows', pagination, filters: options.filters, sort: options.sort }),
       stats: {
         showsTotal: total,
         bandsTotal: data.reduce((sum, show) => sum + (Array.isArray(show.bands) ? show.bands.length : 0), 0)
@@ -3903,12 +3962,10 @@ async function handleMusicShowsDbRequest(req, res) {
       data
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/api/music/shows/db',
+    res.status(500).json(buildApiError('/api/music/shows/db', err, {
       source: 'PostgreSQL:music_shows',
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'MUSIC_SHOWS_DB_ERROR'
+    }));
   }
 }
 
@@ -4285,6 +4342,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
     );
     const venueDetailsMap = await getWrestlingVenueDetailsMap(result.rows.map((row) => row.venue_id));
     const data = result.rows.map((row) => buildWrestlingShowDbApiItem(row, venueDetailsMap));
+    const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
       ok: true,
@@ -4292,13 +4350,16 @@ async function handleWrestlingShowsDbRequest(req, res) {
       source: 'PostgreSQL:wrestling_shows',
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
-      count: data.length,
+      count: pagination.count,
       total,
       page,
       limit,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
       sort: options.sort,
+      meta: buildListMeta({ route: '/api/wrestling/shows/db', source: 'PostgreSQL:wrestling_shows', pagination, filters: options.filters, sort: options.sort }),
       stats: {
         showsTotal: total,
         matchesTotal: data.reduce((sum, show) => sum + (Array.isArray(show.matches) ? show.matches.length : 0), 0)
@@ -4306,12 +4367,10 @@ async function handleWrestlingShowsDbRequest(req, res) {
       data
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/api/wrestling/shows/db',
+    res.status(500).json(buildApiError('/api/wrestling/shows/db', err, {
       source: 'PostgreSQL:wrestling_shows',
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'WRESTLING_SHOWS_DB_ERROR'
+    }));
   }
 }
 
@@ -4692,6 +4751,8 @@ async function handleWrestlingPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
+    const data = result.rows.map(buildWrestlingPersonDbApiItem);
+    const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
       ok: true,
@@ -4701,25 +4762,29 @@ async function handleWrestlingPeopleDbRequest(req, res) {
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
       pagination: {
-        page,
-        limit,
-        total,
-        totalPages,
-        hasNextPage: page < totalPages,
-        hasPrevPage: page > 1 && totalPages > 0
+        page: pagination.page,
+        limit: pagination.limit,
+        total: pagination.total,
+        totalPages: pagination.totalPages,
+        hasNextPage: pagination.hasNextPage,
+        hasPrevPage: pagination.hasPrevPage
       },
+      count: pagination.count,
+      total: pagination.total,
+      page: pagination.page,
+      limit: pagination.limit,
+      totalPages: pagination.totalPages,
       filters: options.filters,
       sort: options.sort,
-      data: result.rows.map(buildWrestlingPersonDbApiItem)
+      meta: buildListMeta({ route: '/api/wrestling/people', source: 'db', pagination, filters: options.filters, sort: options.sort }),
+      data
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
+    res.status(500).json(buildApiError('/api/wrestling/people', err, {
       source: 'db',
       type: 'wrestling_people',
-      route: '/api/wrestling/people',
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'WRESTLING_PEOPLE_DB_ERROR'
+    }));
   }
 }
 
@@ -4916,6 +4981,7 @@ async function handleWrestlingVenuesDbRequest(req, res) {
       dataValues
     );
     const items = result.rows.map(buildWrestlingVenueDbApiItem);
+    const pagination = buildPaginationMeta(page, limit, total, items.length);
 
     res.json({
       ok: true,
@@ -4923,26 +4989,27 @@ async function handleWrestlingVenuesDbRequest(req, res) {
       source: 'db',
       section: 'wrestling',
       type: 'venues',
-      count: items.length,
+      count: pagination.count,
       page,
       limit,
       total,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
       filters: options.filters,
       sort: options.sort,
+      meta: buildListMeta({ route: '/api/wrestling/venues/db', source: 'db', pagination, filters: options.filters, sort: options.sort }),
       items
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/api/wrestling/venues/db',
+    res.status(500).json(buildApiError('/api/wrestling/venues/db', err, {
       source: 'db',
       section: 'wrestling',
       type: 'venues',
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'WRESTLING_VENUES_DB_ERROR'
+    }));
   }
 }
 
@@ -5147,6 +5214,7 @@ async function handleMusicPeopleDbRequest(req, res) {
       dataValues
     );
     const data = result.rows.map(buildMusicPersonDbApiItem);
+    const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
       ok: true,
@@ -5157,28 +5225,29 @@ async function handleMusicPeopleDbRequest(req, res) {
       },
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
-      count: data.length,
+      count: pagination.count,
       total,
       page,
       limit,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
       sort: options.sort,
+      meta: buildListMeta({ route: '/api/music/people/db', source: { type: 'postgres', table: 'music_people' }, pagination, filters: options.filters, sort: options.sort }),
       stats: {
         peopleTotal: total
       },
       data
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/api/music/people/db',
+    res.status(500).json(buildApiError('/api/music/people/db', err, {
       source: {
         type: 'postgres',
         table: 'music_people'
       },
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'MUSIC_PEOPLE_DB_ERROR'
+    }));
   }
 }
 
@@ -5415,6 +5484,7 @@ async function handleMusicVenuesDbRequest(req, res) {
       dataValues
     );
     const data = result.rows.map(buildMusicVenueDbApiItem);
+    const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
       ok: true,
@@ -5425,28 +5495,29 @@ async function handleMusicVenuesDbRequest(req, res) {
       },
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
-      count: data.length,
+      count: pagination.count,
       total,
       page,
       limit,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
       sort: options.sort,
+      meta: buildListMeta({ route: '/api/music/venues/db', source: { type: 'postgres', table: 'music_venues' }, pagination, filters: options.filters, sort: options.sort }),
       stats: {
         venuesTotal: total
       },
       data
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/api/music/venues/db',
+    res.status(500).json(buildApiError('/api/music/venues/db', err, {
       source: {
         type: 'postgres',
         table: 'music_venues'
       },
-      error: err && err.message ? err.message : String(err)
-    });
+      error: 'MUSIC_VENUES_DB_ERROR'
+    }));
   }
 }
 
@@ -6114,6 +6185,7 @@ async function handleImportHistoryRequest(req, res, fixedSection) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
+    const pagination = buildPaginationMeta(page, limit, total, result.rows.length);
 
     res.json({
       ok: true,
@@ -6121,20 +6193,28 @@ async function handleImportHistoryRequest(req, res, fixedSection) {
       generatedAt: generated.toISOString(),
       generatedTime: formatEasternGeneratedTime(generated),
       section: fixedSection || undefined,
-      count: result.rows.length,
+      count: pagination.count,
       total,
       page,
       limit,
-      totalPages: total > 0 ? Math.ceil(total / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
+      meta: buildListMeta({ route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history', source: 'postgres', pagination, filters: options.filters }),
       items: result.rows.map(buildImportHistoryApiItem)
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
-      error: err && err.message ? err.message : String(err)
-    });
+    res.status(500).json(buildApiError(
+      fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
+      err,
+      {
+        source: 'postgres',
+        section: fixedSection || 'admin',
+        type: 'import-history',
+        error: 'IMPORT_HISTORY_ERROR'
+      }
+    ));
   }
 }
 
@@ -8174,6 +8254,11 @@ async function handleRelationshipsRequest(req, res, fixedSection) {
     const page = getPageNumber(req.query.page);
     const offset = (page - 1) * limit;
     const pagedItems = filtered.slice(offset, offset + limit);
+    const pagination = buildPaginationMeta(page, limit, filtered.length, pagedItems.length);
+    const relationshipFilters = {};
+    ['section', 'type', 'severity'].forEach((key) => {
+      if (req.query && req.query[key]) relationshipFilters[key] = String(req.query[key]);
+    });
 
     res.json({
       ok: true,
@@ -8182,19 +8267,27 @@ async function handleRelationshipsRequest(req, res, fixedSection) {
       generatedTime: formatEasternGeneratedTime(report.generated),
       page,
       limit,
-      count: pagedItems.length,
+      count: pagination.count,
       total: filtered.length,
-      totalPages: filtered.length > 0 ? Math.ceil(filtered.length / limit) : 0,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      hasPrevPage: pagination.hasPrevPage,
       summary,
       warnings: report.warnings,
+      meta: buildListMeta({ route: fixedSection ? `/api/admin/relationships/${fixedSection}` : '/api/admin/relationships', source: 'postgres', pagination, filters: relationshipFilters }),
       items: pagedItems
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: fixedSection ? `/api/admin/relationships/${fixedSection}` : '/api/admin/relationships',
-      error: err && err.message ? err.message : String(err)
-    });
+    res.status(500).json(buildApiError(
+      fixedSection ? `/api/admin/relationships/${fixedSection}` : '/api/admin/relationships',
+      err,
+      {
+        source: 'postgres',
+        section: fixedSection || 'admin',
+        type: 'relationships',
+        error: 'RELATIONSHIPS_ERROR'
+      }
+    ));
   }
 }
 
@@ -8360,12 +8453,11 @@ function buildAdminResponse(payload = {}) {
 }
 
 function buildAdminError(route, err, extra = {}) {
-  const message = err && err.message ? err.message : String(err);
   return buildAdminResponse({
     ok: false,
     route,
-    error: message,
-    message,
+    error: extra.error || 'ADMIN_ERROR',
+    message: extra.message || getSafeErrorMessage(err),
     ...extra
   });
 }
@@ -11451,12 +11543,10 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
       }
       return res.json(payload);
     } catch (err) {
-      res.status(500).json({
-        ok: false,
-        route: routePath,
+      res.status(500).json(buildApiError(routePath, err, {
         source: cfg.label,
-        error: err && err.message ? err.message : String(err)
-      });
+        error: 'SHEET_ROUTE_ERROR'
+      }));
     }
   });
 }
@@ -11472,7 +11562,11 @@ app.get('/', (req, res) => {
 });
 
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: 'Not found', path: req.path });
+  res.status(404).json(buildApiError(req.path, new Error('Route not found.'), {
+    error: 'NOT_FOUND',
+    message: 'Route not found.',
+    details: { path: req.path }
+  }));
 });
 
 async function startServer() {
