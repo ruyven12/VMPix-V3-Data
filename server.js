@@ -71,6 +71,10 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics',
     '/api/admin/diagnostics/imports',
     '/api/admin/diagnostics/music',
+    '/api/admin/diagnostics/music/bands',
+    '/api/admin/diagnostics/music/shows',
+    '/api/admin/diagnostics/music/people',
+    '/api/admin/diagnostics/music/venues',
     '/api/admin/diagnostics/wrestling',
     '/api/admin/diagnostics/relationships',
     '/api/admin/diagnostics/music/relationships',
@@ -7356,7 +7360,7 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
   if (
     existingTables.has('music_people') &&
     existingTables.has('music_bands') &&
-    relationshipHasColumns(columnsByTable, 'music_people', ['person_id', 'name', 'bands'], warnings) &&
+    relationshipHasColumns(columnsByTable, 'music_people', ['person_id', 'name', 'category', 'bands'], warnings) &&
     relationshipHasColumns(columnsByTable, 'music_bands', ['band'], warnings)
   ) {
     const malformedPeopleBandItemResult = await runRelationshipQuery(
@@ -7480,12 +7484,14 @@ async function addMusicRelationshipIssues(items, warnings, existingTables, colum
       'music people without band links',
       `SELECT person_id, name, category
        FROM music_people
-       WHERE CASE
+       WHERE lower(trim(coalesce(category, ''))) = ANY($1::text[])
+         AND CASE
          WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
          ELSE 0
        END = 0
        ORDER BY name ASC
-       LIMIT 1000`
+       LIMIT 1000`,
+      [Array.from(MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_KEYS)]
     );
     diagnosticRows(peopleWithoutBandsResult).forEach((row) => {
       items.push(buildRelationshipItem({
@@ -9475,6 +9481,70 @@ async function buildMusicStatusResponse() {
 
 const MUSIC_DIAGNOSTIC_TABLES = ['music_bands', 'music_shows', 'music_people', 'music_venues'];
 const WRESTLING_DIAGNOSTIC_TABLES = ['wrestling_shows', 'wrestling_people', 'wrestling_venues'];
+const MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_KEYS = Object.freeze(['performers', 'the fallen']);
+const MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_LABELS = Object.freeze(['Performers', 'The Fallen']);
+
+function buildMusicDiagnosticSourceTabs() {
+  return {
+    bands: {
+      sheet_tab: ROUTES['/api/music/bands'].label,
+      gid_env: ROUTES['/api/music/bands'].gidEnv,
+      source_gid: normalizeSheetGid(process.env[ROUTES['/api/music/bands'].gidEnv])
+    },
+    shows: {
+      sheet_tab: ROUTES['/api/music/shows'].label,
+      gid_env: ROUTES['/api/music/shows'].gidEnv,
+      source_gid: normalizeSheetGid(process.env[ROUTES['/api/music/shows'].gidEnv])
+    },
+    people: {
+      sheet_tab: ROUTES['/api/music/people'].label,
+      gid_env: ROUTES['/api/music/people'].gidEnv,
+      source_gid: normalizeSheetGid(process.env[ROUTES['/api/music/people'].gidEnv] || ROUTES['/api/music/people'].defaultGid)
+    },
+    venues: {
+      sheet_tab: ROUTES['/api/music/venues'].label,
+      gid_env: ROUTES['/api/music/venues'].gidEnv,
+      source_gid: normalizeSheetGid(process.env[ROUTES['/api/music/venues'].gidEnv])
+    }
+  };
+}
+
+function addDiagnosticCountAliases(target) {
+  Object.entries(target || {}).forEach(([key, value]) => {
+    if (key === 'samples' || key.endsWith('_count')) return;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      target[`${key}_count`] = value;
+    }
+  });
+}
+
+function buildMusicDiagnosticsSectionResponse(fullResponse, category, route) {
+  const section = String(category || '').trim().toLowerCase();
+  const allowed = new Set(['bands', 'shows', 'people', 'venues']);
+  if (!allowed.has(section)) return null;
+
+  return {
+    ok: fullResponse.ok,
+    route,
+    source: fullResponse.source,
+    section: fullResponse.section,
+    type: fullResponse.type,
+    category: section,
+    generatedAt: fullResponse.generatedAt,
+    generatedTime: fullResponse.generatedTime,
+    summary: fullResponse.summary,
+    source_tabs: fullResponse.source_tabs,
+    [section]: fullResponse[section] || {},
+    importHealth: {
+      ok: fullResponse.importHealth && fullResponse.importHealth.ok !== false,
+      latestImports: (fullResponse.importHealth && Array.isArray(fullResponse.importHealth.latestImports))
+        ? fullResponse.importHealth.latestImports.filter((item) => String(item.category || '').toLowerCase() === section)
+        : [],
+      lastSuccessfulImportAt: fullResponse.importHealth ? fullResponse.importHealth.lastSuccessfulImportAt : null,
+      lastFailedImportAt: fullResponse.importHealth ? fullResponse.importHealth.lastFailedImportAt : null
+    }
+  };
+}
 
 async function getExistingPublicColumns(tableNames) {
   const result = await dbPool.query(`
@@ -9584,12 +9654,26 @@ async function addMusicBandDiagnostics(response, existingTables, columnsByTable,
     const duplicateIdSamples = await runMusicDiagnosticQuery(
       warnings,
       'duplicate music band ID samples',
-      `SELECT lower(trim(band_id)) AS band_id, count(*)::int AS count
-       FROM music_bands
-       WHERE trim(coalesce(band_id, '')) <> ''
-       GROUP BY 1
-       HAVING count(*) > 1
-       ORDER BY count DESC, band_id ASC
+      `WITH duplicate_ids AS (
+         SELECT lower(trim(band_id)) AS band_id_key
+         FROM music_bands
+         WHERE trim(coalesce(band_id, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       )
+       SELECT
+         duplicate_ids.band_id_key AS band_id,
+         count(*)::int AS count,
+         jsonb_agg(jsonb_build_object(
+           'id', music_bands.id,
+           'band_id', music_bands.band_id,
+           'band', music_bands.band
+         ) ORDER BY music_bands.id ASC) AS rows
+       FROM duplicate_ids
+       JOIN music_bands
+         ON lower(trim(coalesce(music_bands.band_id, ''))) = duplicate_ids.band_id_key
+       GROUP BY duplicate_ids.band_id_key
+       ORDER BY count DESC, duplicate_ids.band_id_key ASC
        LIMIT 10`
     );
     samples.duplicate_band_ids = diagnosticRows(duplicateIdSamples);
@@ -9633,12 +9717,26 @@ async function addMusicBandDiagnostics(response, existingTables, columnsByTable,
     const duplicateNameSamples = await runMusicDiagnosticQuery(
       warnings,
       'duplicate music band name samples',
-      `SELECT lower(trim(band)) AS band, count(*)::int AS count
-       FROM music_bands
-       WHERE trim(coalesce(band, '')) <> ''
-       GROUP BY 1
-       HAVING count(*) > 1
-       ORDER BY count DESC, band ASC
+      `WITH duplicate_names AS (
+         SELECT lower(trim(band)) AS canonical_name
+         FROM music_bands
+         WHERE trim(coalesce(band, '')) <> ''
+         GROUP BY 1
+         HAVING count(*) > 1
+       )
+       SELECT
+         duplicate_names.canonical_name,
+         count(*)::int AS count,
+         jsonb_agg(jsonb_build_object(
+           'id', music_bands.id,
+           'band_id', music_bands.band_id,
+           'band', music_bands.band
+         ) ORDER BY music_bands.band_id ASC, music_bands.id ASC) AS rows
+       FROM duplicate_names
+       JOIN music_bands
+         ON lower(trim(coalesce(music_bands.band, ''))) = duplicate_names.canonical_name
+       GROUP BY duplicate_names.canonical_name
+       ORDER BY count DESC, duplicate_names.canonical_name ASC
        LIMIT 10`
     );
     samples.duplicate_band_names = diagnosticRows(duplicateNameSamples);
@@ -9688,6 +9786,7 @@ async function addMusicBandDiagnostics(response, existingTables, columnsByTable,
     samples.bands_missing_region = diagnosticRows(missingRegionSamples);
   }
 
+  addDiagnosticCountAliases(bands);
   bands.samples = samples;
 }
 
@@ -9751,25 +9850,53 @@ async function addMusicShowDiagnostics(response, existingTables, columnsByTable,
   }
 
   if (warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['venue'], warnings)) {
+    const canUseVenueIdLink = existingTables.has('music_venues') &&
+      hasDiagnosticColumn(columnsByTable, 'music_shows', 'venue_id') &&
+      hasDiagnosticColumn(columnsByTable, 'music_venues', 'venue_key');
+    const missingVenueWhere = canUseVenueIdLink
+      ? `trim(coalesce(ms.venue, '')) = ''
+         AND (
+           trim(coalesce(ms.venue_id, '')) = ''
+           OR mv.venue_key IS NULL
+         )`
+      : `trim(coalesce(ms.venue, '')) = ''`;
+    const missingVenueJoin = canUseVenueIdLink
+      ? `LEFT JOIN music_venues mv
+           ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))`
+      : '';
     const missingVenueResult = await runMusicDiagnosticQuery(
       warnings,
       'music shows missing venue',
       `SELECT count(*)::int AS shows_missing_venue
-       FROM music_shows
-       WHERE trim(coalesce(venue, '')) = ''`
+       FROM music_shows ms
+       ${missingVenueJoin}
+       WHERE ${missingVenueWhere}`
     );
     shows.shows_missing_venue = toIntegerCount(firstDiagnosticRow(missingVenueResult).shows_missing_venue);
 
     const missingVenueSamples = await runMusicDiagnosticQuery(
       warnings,
       'music shows missing venue samples',
-      `SELECT show_id, name, date, city, state
-       FROM music_shows
-       WHERE trim(coalesce(venue, '')) = ''
-       ORDER BY show_id ASC
+      `SELECT
+         ms.show_id,
+         ms.name,
+         ms.date,
+         ms.venue_id,
+         ms.venue,
+         ms.city,
+         ms.state${canUseVenueIdLink ? `,
+         (mv.venue_key IS NOT NULL) AS venue_id_exists_in_db,
+         mv.venue AS matched_venue` : ''}
+       FROM music_shows ms
+       ${missingVenueJoin}
+       WHERE ${missingVenueWhere}
+       ORDER BY ms.show_id ASC
        LIMIT 10`
     );
     samples.shows_missing_venue = diagnosticRows(missingVenueSamples);
+    if (shows.shows_missing_venue > 0 && canUseVenueIdLink) {
+      shows.refresh_hint = 'Run /admin/import/music/venues?refresh=1 before validating Music Shows diagnostics.';
+    }
   }
 
   if (warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['show_id'], warnings)) {
@@ -9801,6 +9928,7 @@ async function addMusicShowDiagnostics(response, existingTables, columnsByTable,
     samples.duplicate_show_keys = diagnosticRows(duplicateShowKeySamples);
   }
 
+  addDiagnosticCountAliases(shows);
   shows.samples = samples;
 }
 
@@ -9939,6 +10067,7 @@ async function addMusicPeopleDiagnostics(response, existingTables, columnsByTabl
     samples.people_missing_category = diagnosticRows(missingCategorySamples);
   }
 
+  addDiagnosticCountAliases(people);
   people.samples = samples;
 }
 
@@ -9957,22 +10086,22 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
   );
   venues.total_venues = toIntegerCount(firstDiagnosticRow(totalResult).total_venues);
 
-  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_id'], warnings)) {
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_key'], warnings)) {
     const missingIdResult = await runMusicDiagnosticQuery(
       warnings,
       'music venues missing ID',
       `SELECT count(*)::int AS venues_missing_id
        FROM music_venues
-       WHERE venue_id IS NULL`
+       WHERE trim(coalesce(venue_key, '')) = ''`
     );
     venues.venues_missing_id = toIntegerCount(firstDiagnosticRow(missingIdResult).venues_missing_id);
 
     const missingIdSamples = await runMusicDiagnosticQuery(
       warnings,
       'music venues missing ID samples',
-      `SELECT id, venue, city, state
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue_id AS legacy_venue_id, venue, city, state, latitude, longitude
        FROM music_venues
-       WHERE venue_id IS NULL
+       WHERE trim(coalesce(venue_key, '')) = ''
        ORDER BY venue ASC
        LIMIT 10`
     );
@@ -9983,10 +10112,10 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
       'duplicate music venue IDs',
       `SELECT count(*)::int AS duplicate_venue_ids
        FROM (
-         SELECT venue_id
+         SELECT lower(trim(venue_key)) AS venue_key
          FROM music_venues
-         WHERE venue_id IS NOT NULL
-         GROUP BY venue_id
+         WHERE trim(coalesce(venue_key, '')) <> ''
+         GROUP BY 1
          HAVING count(*) > 1
        ) duplicates`
     );
@@ -9995,10 +10124,10 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     const duplicateIdSamples = await runMusicDiagnosticQuery(
       warnings,
       'duplicate music venue ID samples',
-      `SELECT venue_id, count(*)::int AS count
+      `SELECT lower(trim(venue_key)) AS venue_id, count(*)::int AS count
        FROM music_venues
-       WHERE venue_id IS NOT NULL
-       GROUP BY venue_id
+       WHERE trim(coalesce(venue_key, '')) <> ''
+       GROUP BY 1
        HAVING count(*) > 1
        ORDER BY count DESC, venue_id ASC
        LIMIT 10`
@@ -10019,10 +10148,10 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     const missingNameSamples = await runMusicDiagnosticQuery(
       warnings,
       'music venues missing name samples',
-      `SELECT venue_id, city, state
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue, city, state, latitude, longitude
        FROM music_venues
        WHERE trim(coalesce(venue, '')) = ''
-       ORDER BY venue_id ASC
+       ORDER BY coalesce(venue_key, venue_id::text) ASC
        LIMIT 10`
     );
     samples.venues_missing_name = diagnosticRows(missingNameSamples);
@@ -10068,7 +10197,7 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     const missingCitySamples = await runMusicDiagnosticQuery(
       warnings,
       'music venues missing city samples',
-      `SELECT venue_id, venue, state
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue, city, state, latitude, longitude
        FROM music_venues
        WHERE trim(coalesce(city, '')) = ''
        ORDER BY venue ASC
@@ -10090,7 +10219,7 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     const missingStateSamples = await runMusicDiagnosticQuery(
       warnings,
       'music venues missing state samples',
-      `SELECT venue_id, venue, city
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue, city, state, latitude, longitude
        FROM music_venues
        WHERE trim(coalesce(state, '')) = ''
        ORDER BY venue ASC
@@ -10099,13 +10228,13 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     samples.venues_missing_state = diagnosticRows(missingStateSamples);
   }
 
-  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['gps_lat', 'gps_lng'], warnings)) {
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['latitude', 'longitude'], warnings)) {
     const gpsResult = await runMusicDiagnosticQuery(
       warnings,
       'music venue GPS',
       `SELECT
-         count(*) FILTER (WHERE trim(coalesce(gps_lat, '')) <> '' AND trim(coalesce(gps_lng, '')) <> '')::int AS venues_with_gps,
-         count(*) FILTER (WHERE trim(coalesce(gps_lat, '')) = '' OR trim(coalesce(gps_lng, '')) = '')::int AS venues_missing_gps
+         count(*) FILTER (WHERE latitude IS NOT NULL AND longitude IS NOT NULL)::int AS venues_with_gps,
+         count(*) FILTER (WHERE latitude IS NULL OR longitude IS NULL)::int AS venues_missing_gps
        FROM music_venues`
     );
     const gps = firstDiagnosticRow(gpsResult);
@@ -10115,15 +10244,44 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     const missingGpsSamples = await runMusicDiagnosticQuery(
       warnings,
       'music venue missing GPS samples',
-      `SELECT venue_id, venue, city, state
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue, city, state, latitude, longitude
        FROM music_venues
-       WHERE trim(coalesce(gps_lat, '')) = '' OR trim(coalesce(gps_lng, '')) = ''
+       WHERE latitude IS NULL OR longitude IS NULL
        ORDER BY venue ASC
        LIMIT 10`
     );
     samples.venues_missing_gps = diagnosticRows(missingGpsSamples);
   }
 
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_key', 'venue', 'city', 'state', 'latitude', 'longitude'], warnings)) {
+    const badMappingCondition = `length(trim(coalesce(venue, ''))) > 120
+       OR length(trim(coalesce(city, ''))) > 80
+       OR length(trim(coalesce(state, ''))) > 80
+       OR lower(coalesce(venue, '')) LIKE '%http%'
+       OR lower(coalesce(city, '')) LIKE '%http%'
+       OR lower(coalesce(state, '')) LIKE '%http%'`;
+    const badMappingResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue bad column mapping detection',
+      `SELECT count(*)::int AS bad_column_mapping_detected
+       FROM music_venues
+       WHERE ${badMappingCondition}`
+    );
+    venues.bad_column_mapping_detected = toIntegerCount(firstDiagnosticRow(badMappingResult).bad_column_mapping_detected);
+
+    const badMappingSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue bad column mapping samples',
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue, city, state, latitude, longitude
+       FROM music_venues
+       WHERE ${badMappingCondition}
+       ORDER BY venue ASC
+       LIMIT 10`
+    );
+    samples.bad_column_mapping_detected = diagnosticRows(badMappingSamples);
+  }
+
+  addDiagnosticCountAliases(venues);
   venues.samples = samples;
 }
 
@@ -10132,27 +10290,98 @@ async function addMusicRelationshipDiagnostics(response, existingTables, columns
   const samples = {};
 
   if (existingTables.has('music_shows') && warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['venue'], warnings)) {
+    const canUseVenueIdLink = existingTables.has('music_venues') &&
+      hasDiagnosticColumn(columnsByTable, 'music_shows', 'venue_id') &&
+      hasDiagnosticColumn(columnsByTable, 'music_venues', 'venue_key');
+    const missingVenueWhere = canUseVenueIdLink
+      ? `trim(coalesce(ms.venue, '')) = ''
+         AND (
+           trim(coalesce(ms.venue_id, '')) = ''
+           OR mv.venue_key IS NULL
+         )`
+      : `trim(coalesce(ms.venue, '')) = ''`;
+    const missingVenueJoin = canUseVenueIdLink
+      ? `LEFT JOIN music_venues mv
+           ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))`
+      : '';
     const missingVenueResult = await runMusicDiagnosticQuery(
       warnings,
       'music relationship shows missing venue',
       `SELECT count(*)::int AS shows_missing_venue
-       FROM music_shows
-       WHERE trim(coalesce(venue, '')) = ''`
+       FROM music_shows ms
+       ${missingVenueJoin}
+       WHERE ${missingVenueWhere}`
     );
     relationships.shows_missing_venue = toIntegerCount(firstDiagnosticRow(missingVenueResult).shows_missing_venue);
 
     const missingVenueSamples = await runMusicDiagnosticQuery(
       warnings,
       'music relationship shows missing venue samples',
-      `SELECT show_id, name, date, city, state
-       FROM music_shows
-       WHERE trim(coalesce(venue, '')) = ''
-       ORDER BY show_id ASC
+      `SELECT
+         ms.show_id,
+         ms.name,
+         ms.date,
+         ms.venue_id,
+         ms.venue,
+         ms.city,
+         ms.state${canUseVenueIdLink ? `,
+         (mv.venue_key IS NOT NULL) AS venue_id_exists_in_db,
+         mv.venue AS matched_venue` : ''}
+       FROM music_shows ms
+       ${missingVenueJoin}
+       WHERE ${missingVenueWhere}
+       ORDER BY ms.show_id ASC
        LIMIT 10`
     );
     samples.shows_missing_venue = diagnosticRows(missingVenueSamples);
+    if (relationships.shows_missing_venue > 0 && canUseVenueIdLink) {
+      relationships.refresh_hint = 'Run /admin/import/music/venues?refresh=1 before validating Music Shows diagnostics.';
+    }
   } else if (!existingTables.has('music_shows')) {
     warnings.push('Missing table for music relationship diagnostics: music_shows');
+  }
+
+  if (
+    existingTables.has('music_shows') &&
+    existingTables.has('music_venues') &&
+    warnMissingDiagnosticColumns(columnsByTable, 'music_shows', ['venue_id'], warnings) &&
+    warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_key'], warnings)
+  ) {
+    relationships.music_show_venue_id_match_column = 'music_venues.venue_key';
+    const invalidVenueIdResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music relationship shows invalid venue_id',
+      `SELECT count(*)::int AS shows_with_invalid_venue_id
+       FROM music_shows ms
+       LEFT JOIN music_venues mv
+         ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+       WHERE trim(coalesce(ms.venue_id, '')) <> ''
+         AND mv.venue_key IS NULL`
+    );
+    relationships.shows_with_invalid_venue_id = toIntegerCount(firstDiagnosticRow(invalidVenueIdResult).shows_with_invalid_venue_id);
+
+    const invalidVenueIdSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music relationship shows invalid venue_id samples',
+      `SELECT
+         ms.show_id,
+         ms.name,
+         ms.date,
+         ms.venue_id,
+         ms.venue,
+         false AS venue_id_exists_in_db
+       FROM music_shows ms
+       LEFT JOIN music_venues mv
+         ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+       WHERE trim(coalesce(ms.venue_id, '')) <> ''
+         AND mv.venue_key IS NULL
+       ORDER BY ms.show_id ASC
+       LIMIT 10`
+    );
+    samples.shows_with_invalid_venue_id = diagnosticRows(invalidVenueIdSamples);
+    if (relationships.shows_with_invalid_venue_id > 0) {
+      relationships.refresh_hint = 'Run /admin/import/music/venues?refresh=1 before validating Music Shows diagnostics.';
+    }
   }
 
   if (
@@ -10242,16 +10471,31 @@ async function addMusicRelationshipDiagnostics(response, existingTables, columns
     warnings.push('Unable to detect music bands without people because music_bands or music_people is missing.');
   }
 
-  if (existingTables.has('music_people') && warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['bands'], warnings)) {
+  if (existingTables.has('music_people') && warnMissingDiagnosticColumns(columnsByTable, 'music_people', ['bands', 'category'], warnings)) {
+    relationships.band_link_diagnostic_categories = Array.from(MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_LABELS);
+    const ignoredCategoryResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music ignored people categories for band links',
+      `SELECT coalesce(array_agg(DISTINCT category ORDER BY category), '{}'::text[]) AS ignored_categories
+       FROM music_people
+       WHERE trim(coalesce(category, '')) <> ''
+         AND NOT (lower(trim(category)) = ANY($1::text[]))`,
+      [Array.from(MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_KEYS)]
+    );
+    const ignoredCategories = firstDiagnosticRow(ignoredCategoryResult).ignored_categories;
+    relationships.ignored_categories_for_band_link_diagnostics = Array.isArray(ignoredCategories) ? ignoredCategories : [];
+
     const peopleWithoutBandsResult = await runMusicDiagnosticQuery(
       warnings,
       'music people without band links',
       `SELECT count(*)::int AS people_without_band_links_if_detectable
        FROM music_people
-       WHERE CASE
+       WHERE lower(trim(coalesce(category, ''))) = ANY($1::text[])
+         AND CASE
          WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
          ELSE 0
-       END = 0`
+       END = 0`,
+      [Array.from(MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_KEYS)]
     );
     relationships.people_without_band_links_if_detectable = toIntegerCount(firstDiagnosticRow(peopleWithoutBandsResult).people_without_band_links_if_detectable);
 
@@ -10260,18 +10504,21 @@ async function addMusicRelationshipDiagnostics(response, existingTables, columns
       'music people without band link samples',
       `SELECT person_id, name, category
        FROM music_people
-       WHERE CASE
+       WHERE lower(trim(coalesce(category, ''))) = ANY($1::text[])
+         AND CASE
          WHEN jsonb_typeof(bands) = 'array' THEN jsonb_array_length(bands)
          ELSE 0
        END = 0
        ORDER BY name ASC
-       LIMIT 10`
+       LIMIT 10`,
+      [Array.from(MUSIC_BAND_LINK_DIAGNOSTIC_CATEGORY_KEYS)]
     );
     samples.people_without_band_links_if_detectable = diagnosticRows(peopleWithoutBandsSamples);
   } else if (!existingTables.has('music_people')) {
     warnings.push('Unable to detect music people without band links because music_people is missing.');
   }
 
+  addDiagnosticCountAliases(relationships);
   relationships.samples = samples;
 }
 
@@ -10286,6 +10533,7 @@ async function buildMusicDiagnosticsResponse() {
     type: 'diagnostics',
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
+    source_tabs: buildMusicDiagnosticSourceTabs(),
     summary: {
       database_connected: false,
       tables: {
@@ -10351,6 +10599,8 @@ async function buildMusicDiagnosticsResponse() {
   await addMusicVenueDiagnostics(response, existingTables, columnsByTable, warnings);
   await addMusicRelationshipDiagnostics(response, existingTables, columnsByTable, warnings);
   response.importHealth = await buildImportHealth('music');
+  response.summary.last_imported_at = response.importHealth.lastSuccessfulImportAt;
+  response.summary.latest_imports = response.importHealth.latestImports;
   response.lockHealth = await buildLockHealth('music');
   response.relationshipHealth = await buildRelationshipHealth('music');
   response.statsHealth = await buildStatsHealth('music');
@@ -11378,6 +11628,50 @@ app.get('/api/admin/diagnostics/music', async (req, res) => {
       error: err && err.message ? err.message : String(err)
     });
   }
+});
+
+async function handleMusicDiagnosticsSectionRequest(req, res, category) {
+  const route = `/api/admin/diagnostics/music/${category}`;
+  try {
+    const fullResponse = await buildMusicDiagnosticsResponse();
+    const sectionResponse = buildMusicDiagnosticsSectionResponse(fullResponse, category, route);
+    if (!sectionResponse) {
+      return res.status(404).json({
+        ok: false,
+        route,
+        source: 'postgres',
+        section: 'music',
+        type: 'diagnostics',
+        error: 'NOT_FOUND'
+      });
+    }
+    return res.json(sectionResponse);
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      route,
+      source: 'postgres',
+      section: 'music',
+      type: 'diagnostics',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+app.get('/api/admin/diagnostics/music/bands', async (req, res) => {
+  return handleMusicDiagnosticsSectionRequest(req, res, 'bands');
+});
+
+app.get('/api/admin/diagnostics/music/shows', async (req, res) => {
+  return handleMusicDiagnosticsSectionRequest(req, res, 'shows');
+});
+
+app.get('/api/admin/diagnostics/music/people', async (req, res) => {
+  return handleMusicDiagnosticsSectionRequest(req, res, 'people');
+});
+
+app.get('/api/admin/diagnostics/music/venues', async (req, res) => {
+  return handleMusicDiagnosticsSectionRequest(req, res, 'venues');
 });
 
 app.get('/api/admin/diagnostics/wrestling', async (req, res) => {
