@@ -2334,10 +2334,25 @@ function getMusicVenueShowCountKey(venue, city, state) {
 }
 
 async function getMusicVenueShowCountMaps(client) {
+  const byVenueId = new Map();
   const exact = new Map();
   const venueOnly = new Map();
 
   try {
+    const venueIdResult = await client.query(`
+      SELECT
+        lower(trim(coalesce(venue_id, ''))) AS venue_id_key,
+        count(*)::int AS show_count
+      FROM music_shows
+      WHERE trim(coalesce(venue_id, '')) <> ''
+      GROUP BY 1
+    `);
+
+    venueIdResult.rows.forEach((row) => {
+      const venueIdKey = normalizeMusicLookupKey(row.venue_id_key);
+      if (venueIdKey) byVenueId.set(venueIdKey, toIntegerCount(row.show_count));
+    });
+
     const result = await client.query(`
       SELECT
         lower(trim(coalesce(venue, ''))) AS venue_key,
@@ -2360,10 +2375,15 @@ async function getMusicVenueShowCountMaps(client) {
     console.warn('Music-Venues showCount lookup skipped:', err && err.message ? err.message : String(err));
   }
 
-  return { exact, venueOnly };
+  return { byVenueId, exact, venueOnly };
 }
 
 function getMusicVenueShowCount(venue, showCounts) {
+  const venueIdKey = normalizeMusicLookupKey(venue.venue_key);
+  if (venueIdKey && showCounts.byVenueId && showCounts.byVenueId.has(venueIdKey)) {
+    return showCounts.byVenueId.get(venueIdKey);
+  }
+
   const exactKey = getMusicVenueShowCountKey(venue.venue, venue.city, venue.state);
   const venueKey = normalizeMusicLookupKey(venue.venue);
   if (showCounts.exact.has(exactKey)) return showCounts.exact.get(exactKey);
@@ -5098,6 +5118,7 @@ async function buildWrestlingVenuesDbStatsResponse() {
     byVenueTypeQuery
   ]);
   const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+  const venueShowTotals = venueShowTotalsResult.rows && venueShowTotalsResult.rows[0] ? venueShowTotalsResult.rows[0] : {};
 
   return {
     ok: true,
@@ -5374,7 +5395,7 @@ function buildMusicVenueDbApiItem(row) {
   const longitude = row.longitude == null ? toNullableNumber(row.gps_lng) : toNullableNumber(row.longitude);
   const geo = buildPhase1WrestlingVenueGeo(latitude, longitude, row.geo);
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
-  stats.showCount = toIntegerCount(stats.showCount);
+  stats.showCount = row.show_count == null ? toIntegerCount(stats.showCount) : toIntegerCount(row.show_count);
 
   return {
     venue_id: row.venue_key || (row.venue_id == null ? '' : String(row.venue_id)),
@@ -5512,7 +5533,39 @@ async function handleMusicVenuesDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT venue_id, venue_key, venue, city, state, country, region, gps_lat, gps_lng, logo, latitude, longitude, description, notes, status, geo, location, media, stats
+      `SELECT
+         venue_id,
+         venue_key,
+         venue,
+         city,
+         state,
+         country,
+         region,
+         gps_lat,
+         gps_lng,
+         logo,
+         latitude,
+         longitude,
+         description,
+         notes,
+         status,
+         geo,
+         location,
+         media,
+         stats,
+         (
+           SELECT count(*)::int
+           FROM music_shows ms
+           WHERE (
+             trim(coalesce(music_venues.venue_key, '')) <> ''
+             AND lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(music_venues.venue_key, '')))
+           )
+           OR (
+             trim(coalesce(ms.venue_id, '')) = ''
+             AND trim(coalesce(ms.venue, '')) <> ''
+             AND lower(trim(coalesce(ms.venue, ''))) = lower(trim(coalesce(music_venues.venue, '')))
+           )
+         ) AS show_count
        FROM music_venues
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -5602,14 +5655,51 @@ async function buildMusicVenuesDbStatsResponse() {
     GROUP BY 1
     ORDER BY venue_count DESC, region ASC
   `);
-  const [totalsResult, byStateResult, byCityResult, byStatusResult, byRegionResult] = await Promise.all([
+  const venueShowTotalsQuery = dbPool.query(`
+    SELECT
+      count(ms.show_id)::int AS show_venue_links,
+      count(DISTINCT lower(trim(mv.venue_key)))::int AS venues_with_shows
+    FROM music_venues mv
+    JOIN music_shows ms
+      ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+    WHERE trim(coalesce(ms.venue_id, '')) <> ''
+      AND trim(coalesce(mv.venue_key, '')) <> ''
+  `);
+  const topVenueShowCountsQuery = dbPool.query(`
+    SELECT
+      coalesce(mv.venue_key, mv.venue_id::text) AS venue_id,
+      mv.venue,
+      mv.city,
+      mv.state,
+      count(ms.show_id)::int AS show_count
+    FROM music_venues mv
+    LEFT JOIN music_shows ms
+      ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+     AND trim(coalesce(ms.venue_id, '')) <> ''
+    GROUP BY mv.venue_key, mv.venue_id, mv.venue, mv.city, mv.state
+    HAVING count(ms.show_id) > 0
+    ORDER BY show_count DESC, mv.venue ASC
+    LIMIT 25
+  `);
+  const [
+    totalsResult,
+    byStateResult,
+    byCityResult,
+    byStatusResult,
+    byRegionResult,
+    venueShowTotalsResult,
+    topVenueShowCountsResult
+  ] = await Promise.all([
     totalsQuery,
     byStateQuery,
     byCityQuery,
     byStatusQuery,
-    byRegionQuery
+    byRegionQuery,
+    venueShowTotalsQuery,
+    topVenueShowCountsQuery
   ]);
   const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
+  const venueShowTotals = venueShowTotalsResult.rows && venueShowTotalsResult.rows[0] ? venueShowTotalsResult.rows[0] : {};
 
   return {
     ok: true,
@@ -5625,12 +5715,21 @@ async function buildMusicVenuesDbStatsResponse() {
       venuesWithGps: toIntegerCount(totals.venues_with_gps),
       venuesMissingGps: toIntegerCount(totals.venues_missing_gps),
       venuesWithLogo: toIntegerCount(totals.venues_with_logo),
-      venuesMissingLogo: toIntegerCount(totals.venues_missing_logo)
+      venuesMissingLogo: toIntegerCount(totals.venues_missing_logo),
+      venuesWithShows: toIntegerCount(venueShowTotals.venues_with_shows),
+      showVenueLinks: toIntegerCount(venueShowTotals.show_venue_links)
     },
     venuesByState: byStateResult.rows.map((row) => ({ state: row.state, venueCount: toIntegerCount(row.venue_count) })),
     venuesByCity: byCityResult.rows.map((row) => ({ city: row.city, state: row.state, venueCount: toIntegerCount(row.venue_count) })),
     venuesByStatus: byStatusResult.rows.map((row) => ({ status: row.status, venueCount: toIntegerCount(row.venue_count) })),
-    venuesByRegion: byRegionResult.rows.map((row) => ({ region: row.region, venueCount: toIntegerCount(row.venue_count) }))
+    venuesByRegion: byRegionResult.rows.map((row) => ({ region: row.region, venueCount: toIntegerCount(row.venue_count) })),
+    topVenuesByShowCount: topVenueShowCountsResult.rows.map((row) => ({
+      venue_id: row.venue_id || '',
+      venue: row.venue || '',
+      city: row.city || '',
+      state: row.state || '',
+      showCount: toIntegerCount(row.show_count)
+    }))
   };
 }
 
@@ -10085,6 +10184,55 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     `SELECT count(*)::int AS total_venues FROM music_venues`
   );
   venues.total_venues = toIntegerCount(firstDiagnosticRow(totalResult).total_venues);
+
+  if (
+    existingTables.has('music_shows') &&
+    hasDiagnosticColumn(columnsByTable, 'music_shows', 'venue_id') &&
+    hasDiagnosticColumn(columnsByTable, 'music_venues', 'venue_key')
+  ) {
+    const showCountRelationshipResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue showCount relationship totals',
+      `SELECT
+         (SELECT count(*)::int FROM music_shows) AS music_shows_total,
+         (SELECT count(*)::int FROM music_shows WHERE trim(coalesce(venue_id, '')) <> '') AS music_shows_with_venue_id,
+         (SELECT count(*)::int
+          FROM music_shows ms
+          JOIN music_venues mv
+            ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+          WHERE trim(coalesce(ms.venue_id, '')) <> '') AS matching_show_venue_relationships,
+         (SELECT count(DISTINCT lower(trim(mv.venue_key)))::int
+          FROM music_venues mv
+          JOIN music_shows ms
+            ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+          WHERE trim(coalesce(ms.venue_id, '')) <> '') AS venues_with_show_count`
+    );
+    const showCountRelationship = firstDiagnosticRow(showCountRelationshipResult);
+    venues.music_shows_total = toIntegerCount(showCountRelationship.music_shows_total);
+    venues.music_shows_with_venue_id = toIntegerCount(showCountRelationship.music_shows_with_venue_id);
+    venues.matching_show_venue_relationships = toIntegerCount(showCountRelationship.matching_show_venue_relationships);
+    venues.venues_with_show_count = toIntegerCount(showCountRelationship.venues_with_show_count);
+
+    const showCountSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue showCount samples',
+      `SELECT
+         coalesce(mv.venue_key, mv.venue_id::text) AS venue_id,
+         mv.venue,
+         mv.city,
+         mv.state,
+         count(ms.show_id)::int AS showCount
+       FROM music_venues mv
+       LEFT JOIN music_shows ms
+         ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+        AND trim(coalesce(ms.venue_id, '')) <> ''
+       GROUP BY mv.venue_key, mv.venue_id, mv.venue, mv.city, mv.state
+       HAVING count(ms.show_id) > 0
+       ORDER BY showCount DESC, mv.venue ASC
+       LIMIT 10`
+    );
+    samples.venue_show_counts = diagnosticRows(showCountSamples);
+  }
 
   if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_key'], warnings)) {
     const missingIdResult = await runMusicDiagnosticQuery(
