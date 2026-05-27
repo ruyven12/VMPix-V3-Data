@@ -5422,6 +5422,275 @@ function buildMusicVenueDbApiItem(row) {
   };
 }
 
+
+const MUSIC_VENUE_GEOCODE_ROUTE = '/admin/enrich/music/venues/geocode';
+const MUSIC_VENUE_GEOCODE_DEFAULT_LIMIT = 5;
+const MUSIC_VENUE_GEOCODE_MAX_LIMIT = 25;
+const MUSIC_VENUE_GEOCODE_DELAY_MS = 1100;
+
+function getMusicVenueGeocodeLimit(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return MUSIC_VENUE_GEOCODE_DEFAULT_LIMIT;
+  return Math.min(MUSIC_VENUE_GEOCODE_MAX_LIMIT, Math.max(1, Math.trunc(number)));
+}
+
+function isMissingGeoValue(value) {
+  return value == null || String(value).trim() === '';
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getMusicVenueGeocodeProvider() {
+  return String(process.env.GEOCODE_PROVIDER || '').trim().toLowerCase();
+}
+
+function getMusicVenueGeocodeConfig() {
+  const provider = getMusicVenueGeocodeProvider();
+  const userAgent = String(process.env.GEOCODE_USER_AGENT || '').trim();
+
+  if (!provider) {
+    return {
+      ok: false,
+      provider: '',
+      message: 'Geocode enrichment is unavailable. Set GEOCODE_PROVIDER=nominatim and GEOCODE_USER_AGENT.'
+    };
+  }
+
+  if (provider !== 'nominatim') {
+    return {
+      ok: false,
+      provider,
+      message: `Unsupported GEOCODE_PROVIDER: ${provider}. Supported provider: nominatim.`
+    };
+  }
+
+  if (!userAgent) {
+    return {
+      ok: false,
+      provider,
+      message: 'GEOCODE_USER_AGENT is required when GEOCODE_PROVIDER=nominatim.'
+    };
+  }
+
+  return { ok: true, provider, userAgent };
+}
+
+function buildNominatimReverseUrl(latitude, longitude) {
+  const params = new URLSearchParams({
+    format: 'jsonv2',
+    lat: String(latitude),
+    lon: String(longitude),
+    addressdetails: '1'
+  });
+  return `https://nominatim.openstreetmap.org/reverse?${params.toString()}`;
+}
+
+async function fetchNominatimReverseGeocode(latitude, longitude, userAgent) {
+  const res = await fetch(buildNominatimReverseUrl(latitude, longitude), {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': userAgent
+    }
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
+    throw new Error(`Nominatim returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+  }
+
+  return res.json();
+}
+
+function getNominatimAddress(json) {
+  return json && json.address && typeof json.address === 'object' ? json.address : {};
+}
+
+function getNominatimCounty(address) {
+  return String(address.county || address.state_district || address.region || '').trim();
+}
+
+function buildMusicVenueGeocodeFields(json) {
+  const address = getNominatimAddress(json);
+  return {
+    formatted_address: String((json && json.display_name) || '').trim(),
+    county: getNominatimCounty(address),
+    postal_code: String(address.postcode || '').trim(),
+    country: String(address.country || '').trim()
+  };
+}
+
+function mergeMissingMusicVenueGeo(existingGeo, geocodeFields) {
+  const geo = createEmptyWrestlingVenueGeo();
+  const existing = existingGeo && typeof existingGeo === 'object' && !Array.isArray(existingGeo) ? existingGeo : {};
+  const filled = [];
+
+  Object.keys(geo).forEach((key) => {
+    if (existing[key] != null) geo[key] = existing[key];
+  });
+
+  ['formatted_address', 'county', 'postal_code'].forEach((key) => {
+    const value = String(geocodeFields[key] || '').trim();
+    if (value && isMissingGeoValue(geo[key])) {
+      geo[key] = value;
+      filled.push(`geo.${key}`);
+    }
+  });
+
+  return { geo, filled };
+}
+
+function buildMusicVenueGeocodeResult(row, status, extra = {}) {
+  return {
+    venue_id: row.public_venue_id || row.venue_key || (row.venue_id == null ? '' : String(row.venue_id)),
+    venue: row.venue || '',
+    status,
+    ...extra
+  };
+}
+
+async function buildMusicVenueGeocodeCandidates(limit, refresh) {
+  const result = await dbPool.query(`
+    SELECT
+      id,
+      coalesce(venue_key, venue_id::text) AS public_venue_id,
+      venue_id,
+      venue_key,
+      venue,
+      country,
+      latitude,
+      longitude,
+      gps_lat,
+      gps_lng,
+      geo
+    FROM music_venues
+    WHERE (
+      (latitude IS NOT NULL AND longitude IS NOT NULL)
+      OR (trim(coalesce(gps_lat, '')) <> '' AND trim(coalesce(gps_lng, '')) <> '')
+    )
+      AND (
+        $1::boolean
+        OR trim(coalesce(geo->>'formatted_address', '')) = ''
+      )
+    ORDER BY venue ASC, city ASC, state ASC, id ASC
+    LIMIT $2
+  `, [!!refresh, limit]);
+
+  return result.rows || [];
+}
+
+async function runMusicVenueGeocodeEnrichment(query) {
+  const generated = new Date();
+  const limit = getMusicVenueGeocodeLimit(query && query.limit);
+  const refresh = !!(query && (query.refresh === '1' || query.force === '1'));
+  const config = getMusicVenueGeocodeConfig();
+  const response = {
+    ok: !!config.ok,
+    route: MUSIC_VENUE_GEOCODE_ROUTE,
+    provider: config.provider || '',
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    limit,
+    refresh,
+    scanned: 0,
+    enriched: 0,
+    skipped: 0,
+    failed: 0,
+    results: []
+  };
+
+  if (!config.ok) {
+    response.message = config.message;
+    return response;
+  }
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    response.ok = false;
+    response.message = 'Missing DATABASE_URL environment variable.';
+    return response;
+  }
+
+  const candidates = await buildMusicVenueGeocodeCandidates(limit, refresh);
+  response.scanned = candidates.length;
+  let calls = 0;
+
+  for (const row of candidates) {
+    const latitude = row.latitude == null ? toNullableNumber(row.gps_lat) : toNullableNumber(row.latitude);
+    const longitude = row.longitude == null ? toNullableNumber(row.gps_lng) : toNullableNumber(row.longitude);
+    const coords = getValidWrestlingVenueCoordinates(latitude, longitude);
+    const existingGeo = row.geo && typeof row.geo === 'object' && !Array.isArray(row.geo) ? row.geo : {};
+
+    if (!coords) {
+      response.skipped += 1;
+      response.results.push(buildMusicVenueGeocodeResult(row, 'skipped', { reason: 'missing_coordinates' }));
+      continue;
+    }
+
+    if (!refresh && !isMissingGeoValue(existingGeo.formatted_address)) {
+      response.skipped += 1;
+      response.results.push(buildMusicVenueGeocodeResult(row, 'skipped', { reason: 'already_enriched' }));
+      continue;
+    }
+
+    if (
+      refresh &&
+      !isMissingGeoValue(existingGeo.formatted_address) &&
+      !isMissingGeoValue(existingGeo.county) &&
+      !isMissingGeoValue(existingGeo.postal_code) &&
+      !isMissingGeoValue(row.country)
+    ) {
+      response.skipped += 1;
+      response.results.push(buildMusicVenueGeocodeResult(row, 'skipped', { reason: 'already_complete' }));
+      continue;
+    }
+
+    try {
+      if (calls > 0) await sleep(MUSIC_VENUE_GEOCODE_DELAY_MS);
+      const geocodeJson = await fetchNominatimReverseGeocode(coords.lat, coords.lon, config.userAgent);
+      calls += 1;
+      const fields = buildMusicVenueGeocodeFields(geocodeJson);
+      const merged = mergeMissingMusicVenueGeo(existingGeo, fields);
+      const filled = Array.from(merged.filled);
+      const country = String(row.country || '').trim();
+      const countryFromProvider = String(fields.country || '').trim();
+
+      if (!country && countryFromProvider) filled.push('country');
+
+      if (!filled.length) {
+        response.skipped += 1;
+        response.results.push(buildMusicVenueGeocodeResult(row, 'skipped', { reason: 'no_missing_fields' }));
+        continue;
+      }
+
+      await dbPool.query(`
+        UPDATE music_venues
+        SET geo = $1::jsonb,
+            country = CASE
+              WHEN trim(coalesce(country, '')) = '' AND trim($2::text) <> '' THEN $2
+              ELSE country
+            END,
+            updated_at = NOW()
+        WHERE id = $3
+      `, [
+        stringifyDbJson(merged.geo),
+        countryFromProvider,
+        row.id
+      ]);
+
+      response.enriched += 1;
+      response.results.push(buildMusicVenueGeocodeResult(row, 'enriched', { filled }));
+    } catch (err) {
+      response.failed += 1;
+      response.results.push(buildMusicVenueGeocodeResult(row, 'failed', {
+        error: err && err.message ? err.message : String(err)
+      }));
+    }
+  }
+
+  return response;
+}
 function buildMusicVenuesDbQueryOptions(query) {
   const values = [];
   const where = [];
@@ -10388,6 +10657,7 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
     const gps = firstDiagnosticRow(gpsResult);
     venues.venues_with_gps = toIntegerCount(gps.venues_with_gps);
     venues.venues_missing_gps = toIntegerCount(gps.venues_missing_gps);
+    venues.venues_missing_coordinates = venues.venues_missing_gps;
 
     const missingGpsSamples = await runMusicDiagnosticQuery(
       warnings,
@@ -10399,6 +10669,37 @@ async function addMusicVenueDiagnostics(response, existingTables, columnsByTable
        LIMIT 10`
     );
     samples.venues_missing_gps = diagnosticRows(missingGpsSamples);
+  }
+
+  if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['latitude', 'longitude', 'geo'], warnings)) {
+    const geocodeResult = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue geocode enrichment completeness',
+      `SELECT
+         count(*) FILTER (WHERE trim(coalesce(geo->>'formatted_address', '')) <> '')::int AS venues_with_formatted_address,
+         count(*) FILTER (
+           WHERE latitude IS NOT NULL
+             AND longitude IS NOT NULL
+             AND trim(coalesce(geo->>'formatted_address', '')) = ''
+         )::int AS venues_pending_geocode_enrichment
+       FROM music_venues`
+    );
+    const geocode = firstDiagnosticRow(geocodeResult);
+    venues.venues_with_formatted_address = toIntegerCount(geocode.venues_with_formatted_address);
+    venues.venues_pending_geocode_enrichment = toIntegerCount(geocode.venues_pending_geocode_enrichment);
+
+    const pendingGeocodeSamples = await runMusicDiagnosticQuery(
+      warnings,
+      'music venue pending geocode samples',
+      `SELECT coalesce(venue_key, venue_id::text) AS venue_id, venue, city, state, latitude, longitude
+       FROM music_venues
+       WHERE latitude IS NOT NULL
+         AND longitude IS NOT NULL
+         AND trim(coalesce(geo->>'formatted_address', '')) = ''
+       ORDER BY venue ASC
+       LIMIT 10`
+    );
+    samples.venues_pending_geocode_enrichment = diagnosticRows(pendingGeocodeSamples);
   }
 
   if (warnMissingDiagnosticColumns(columnsByTable, 'music_venues', ['venue_key', 'venue', 'city', 'state', 'latitude', 'longitude'], warnings)) {
@@ -11604,6 +11905,20 @@ app.get('/admin/import/music/venues', async (req, res) => {
   });
 });
 
+
+app.get('/admin/enrich/music/venues/geocode', requireAdminAccess, async (req, res) => {
+  try {
+    const result = await runMusicVenueGeocodeEnrichment(req.query || {});
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      route: MUSIC_VENUE_GEOCODE_ROUTE,
+      provider: getMusicVenueGeocodeProvider(),
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
 app.get('/admin/import/wrestling/shows', async (req, res) => {
   return runLoggedImport(req, res, {
     area: 'wrestling',
