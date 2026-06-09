@@ -757,10 +757,65 @@ function createMusicBandsStats() {
     photosEditing: 0,
     photosEditingPct: '0.00%',
     photosNone: 0,
-    photosNonePct: '0.00%'
+    photosNonePct: '0.00%',
+    set_count: 0
   };
 }
 
+function getCanonicalNullableString(value) {
+  const clean = String(value == null ? '' : value).trim();
+  return clean || null;
+}
+
+function getCanonicalCount(value) {
+  return toIntegerCount(value);
+}
+
+function getMusicStatsNumber(stats, keys) {
+  const source = stats && typeof stats === 'object' ? stats : {};
+  for (const key of keys) {
+    if (source[key] != null && String(source[key]).trim() !== '') return getCanonicalCount(source[key]);
+  }
+  return 0;
+}
+
+function getMusicArrayCount(value) {
+  return Array.isArray(value) ? value.length : 0;
+}
+
+function addMusicCanonicalAliases(target, aliases = {}) {
+  if (!target || typeof target !== 'object') return target;
+
+  const numericKeys = [
+    'photo_count',
+    'event_count',
+    'show_count',
+    'set_count',
+    'band_count',
+    'artist_count',
+    'people_count',
+    'member_count',
+    'venue_count'
+  ];
+
+  numericKeys.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(aliases, key)) {
+      target[key] = getCanonicalCount(aliases[key]);
+    }
+  });
+
+  ['gallery_id', 'album_id', 'cover_image_url'].forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(aliases, key)) {
+      target[key] = getCanonicalNullableString(aliases[key]);
+    }
+  });
+
+  return target;
+}
+
+function addMusicStatsCanonicalAliases(stats, aliases = {}) {
+  return addMusicCanonicalAliases(stats && typeof stats === 'object' ? stats : {}, aliases);
+}
 function getMusicBandsStatsKeys(region) {
   const clean = String(region || '').trim().toLowerCase();
   if (clean === 'local') return { bands: 'bandsLocal', photos: 'photosLocal' };
@@ -797,6 +852,8 @@ function addMusicBandsSetStats(stats, row) {
   const totalSets = getSetCountNumber(row && row.total_sets);
   const archivedSets = getSetCountNumber(row && (row.archived_sets || row.archive_sets || row.sets_archive));
 
+  if (totalSets != null && totalSets > 0) stats.set_count += totalSets;
+
   if (totalSets == null || archivedSets == null || totalSets <= 0 || archivedSets <= 0) {
     stats.bandsNone += 1;
   } else if (totalSets === archivedSets) {
@@ -827,10 +884,12 @@ function orderMusicBandStats(stats, photoRank, setRank) {
   ['region', 'location', 'state', 'totalPhotos'].forEach((key) => {
     if (source[key] != null) ordered[key] = source[key];
   });
+  ordered.photo_count = getMusicStatsNumber(source, ['photo_count', 'totalPhotos', 'photoCount']);
   if (photoRank) ordered.photoRank = photoRank;
   ['archived_sets', 'total_sets'].forEach((key) => {
     if (source[key] != null) ordered[key] = source[key];
   });
+  ordered.set_count = getMusicStatsNumber(source, ['set_count', 'total_sets', 'setCount']);
   if (setRank) ordered.setRank = setRank;
   if (source.country != null) ordered.country = source.country;
 
@@ -864,6 +923,16 @@ function formatMusicBandsPhotoPct(value, total) {
 
 function finalizeMusicBandsStats(stats) {
   stats.bandsTotal = stats.bandsLocal + stats.bandsRegional + stats.bandsNational + stats.bandsInternational;
+  addMusicStatsCanonicalAliases(stats, {
+    photo_count: stats.photosTotal,
+    band_count: stats.bandsTotal,
+    artist_count: stats.bandsTotal,
+    people_count: 0,
+    event_count: 0,
+    show_count: 0,
+    venue_count: 0,
+    set_count: stats.set_count
+  });
   stats.photosLocalPct = formatMusicBandsPhotoPct(stats.photosLocal, stats.photosTotal);
   stats.photosRegionalPct = formatMusicBandsPhotoPct(stats.photosRegional, stats.photosTotal);
   stats.photosNationalPct = formatMusicBandsPhotoPct(stats.photosNational, stats.photosTotal);
@@ -1082,6 +1151,18 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
     total_sets: row.total_sets,
     country: row.country
   });
+  const galleryId = row.smug_folder || row.slug_folder;
+  const coverImageUrl = row.logo_url;
+  addMusicCanonicalAliases(general, {
+    gallery_id: galleryId,
+    album_id: null,
+    cover_image_url: coverImageUrl
+  });
+  addMusicCanonicalAliases(stats, {
+    photo_count: totalPhotos,
+    set_count: row.total_sets,
+    member_count: members.length
+  });
   const item = {};
 
   if (members.length) personnel.members = members;
@@ -1089,6 +1170,11 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
 
   if (band) item.band = band;
   if (bandId) item.band_id = bandId;
+  addMusicCanonicalAliases(item, {
+    photo_count: totalPhotos,
+    set_count: row.total_sets,
+    member_count: members.length
+  });
   if (hasJsonFields(general)) item.general = general;
   if (hasJsonFields(personnel)) item.personnel = personnel;
   if (hasJsonFields(stats)) item.stats = stats;
@@ -1198,6 +1284,19 @@ function buildMusicShowItem(row) {
 
   const bands = buildMusicShowBands(row);
   if (bands.length) item.bands = bands;
+  addMusicCanonicalAliases(item, {
+    event_count: 1,
+    show_count: 1,
+    band_count: bands.length,
+    artist_count: bands.length,
+    photo_count: 0,
+    set_count: 0,
+    people_count: 0,
+    venue_count: 0,
+    gallery_id: row.gallery_id || row.gallery || row.smug_folder || row.smugmug_gallery,
+    album_id: row.album_id || row.album || row.albumId || row.smugmug_album,
+    cover_image_url: row.cover_image_url || row.poster || row.thumbnail || row.image || row.cover
+  });
 
   return item;
 }
@@ -1257,9 +1356,19 @@ function addMusicShowBandViewCounts(data) {
 }
 
 function buildMusicShowsStats(data) {
+  const showsTotal = data.length;
+  const bandsTotal = data.reduce((total, show) => total + (Array.isArray(show.bands) ? show.bands.length : 0), 0);
   return {
-    showsTotal: data.length,
-    bandsTotal: data.reduce((total, show) => total + (Array.isArray(show.bands) ? show.bands.length : 0), 0)
+    showsTotal,
+    bandsTotal,
+    show_count: showsTotal,
+    event_count: showsTotal,
+    band_count: bandsTotal,
+    artist_count: bandsTotal,
+    photo_count: 0,
+    set_count: 0,
+    people_count: 0,
+    venue_count: 0
   };
 }
 
@@ -1380,6 +1489,20 @@ async function buildMusicPersonItem(group, forceRefresh) {
 
   const photoCount = await fetchMusicPersonPhotoCount(item.name, forceRefresh);
   if (photoCount != null) item.photoCount = photoCount;
+  addMusicCanonicalAliases(item, {
+    photo_count: photoCount,
+    band_count: getMusicArrayCount(item.bands),
+    artist_count: getMusicArrayCount(item.bands),
+    people_count: 1,
+    member_count: 0,
+    event_count: 0,
+    show_count: 0,
+    set_count: 0,
+    venue_count: 0,
+    gallery_id: null,
+    album_id: null,
+    cover_image_url: null
+  });
 
   return item;
 }
@@ -1431,13 +1554,62 @@ async function buildMusicPeopleResponse(payload, forceRefresh) {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     stats: {
-      peopleTotal: people.peopleTotal
+      peopleTotal: people.peopleTotal,
+      people_count: people.peopleTotal,
+      artist_count: people.peopleTotal,
+      band_count: 0,
+      photo_count: 0,
+      event_count: 0,
+      show_count: 0,
+      set_count: 0,
+      venue_count: 0
     },
     route: payload.route,
     source
   };
 }
 
+function buildMusicVenueSheetItem(row) {
+  const item = { ...(row || {}) };
+  addMusicCanonicalAliases(item, {
+    show_count: row && (row.show_count || row.showCount),
+    event_count: row && (row.event_count || row.eventCount || row.show_count || row.showCount),
+    venue_count: 1,
+    photo_count: row && (row.photo_count || row.photoCount || row.totalPhotos),
+    set_count: row && (row.set_count || row.setCount || row.total_sets),
+    band_count: row && (row.band_count || row.bandCount),
+    artist_count: row && (row.artist_count || row.artistCount),
+    people_count: row && (row.people_count || row.peopleCount),
+    member_count: row && (row.member_count || row.memberCount),
+    gallery_id: row && (row.gallery_id || row.gallery || row.smug_folder || row.smugmug_gallery),
+    album_id: row && (row.album_id || row.album || row.albumId || row.smugmug_album),
+    cover_image_url: row && (row.cover_image_url || row.logo || row.thumbnail || row.image || row.cover)
+  });
+  return item;
+}
+
+function buildMusicVenuesResponse(payload) {
+  const generated = new Date();
+  const rows = Array.isArray(payload.rows) ? payload.rows : [];
+  return {
+    ...payload,
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    stats: {
+      venuesTotal: rows.length,
+      venue_count: rows.length,
+      show_count: 0,
+      event_count: 0,
+      photo_count: 0,
+      set_count: 0,
+      band_count: 0,
+      artist_count: 0,
+      people_count: 0,
+      member_count: 0
+    },
+    rows: rows.map(buildMusicVenueSheetItem)
+  };
+}
 async function fetchCsvForRoute(routePath, cfg, forceRefresh) {
   const gid = normalizeSheetGid(process.env[cfg.gidEnv] || cfg.defaultGid);
   const cacheKey = `${routePath}:${gid}`;
@@ -3484,13 +3656,39 @@ async function importWrestlingVenuesToDatabase(forceRefresh) {
 }
 
 function buildMusicBandDbApiItem(row) {
-  return {
+  const general = row.general && typeof row.general === 'object' ? { ...row.general } : {};
+  const personnel = row.personnel && typeof row.personnel === 'object' ? row.personnel : {};
+  const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
+  const members = Array.isArray(personnel.members) ? personnel.members : [];
+  const galleryId = general.smug_folder || row.smug_folder;
+  const coverImageUrl = general.cover_image_url || general.logo_url || row.logo_url;
+  addMusicCanonicalAliases(general, {
+    gallery_id: galleryId,
+    album_id: null,
+    cover_image_url: coverImageUrl
+  });
+  addMusicCanonicalAliases(stats, {
+    photo_count: getMusicStatsNumber(stats, ['photo_count', 'totalPhotos', 'photoCount']),
+    set_count: getMusicStatsNumber(stats, ['set_count', 'total_sets', 'setCount']),
+    member_count: members.length
+  });
+
+  const item = {
     band: row.band,
     band_id: row.band_id,
-    general: row.general && typeof row.general === 'object' ? row.general : {},
-    personnel: row.personnel && typeof row.personnel === 'object' ? row.personnel : {},
-    stats: row.stats && typeof row.stats === 'object' ? row.stats : {}
+    general,
+    personnel,
+    stats
   };
+  addMusicCanonicalAliases(item, {
+    photo_count: stats.photo_count,
+    set_count: stats.set_count,
+    member_count: members.length,
+    gallery_id: galleryId,
+    album_id: null,
+    cover_image_url: coverImageUrl
+  });
+  return item;
 }
 
 function getPositiveLimit(value) {
@@ -3757,7 +3955,8 @@ async function getMusicBandsDbStats() {
       coalesce(sum(photo_count) FILTER (WHERE region_key = 'local'), 0)::int AS photos_local,
       coalesce(sum(photo_count) FILTER (WHERE region_key = 'regional'), 0)::int AS photos_regional,
       coalesce(sum(photo_count) FILTER (WHERE region_key = 'national'), 0)::int AS photos_national,
-      coalesce(sum(photo_count) FILTER (WHERE region_key = 'international'), 0)::int AS photos_international
+      coalesce(sum(photo_count) FILTER (WHERE region_key = 'international'), 0)::int AS photos_international,
+      coalesce(sum(total_set_count), 0)::int AS sets_total
     FROM normalized
   `);
 
@@ -3775,6 +3974,8 @@ async function buildMusicBandsDbStatsResponse(forceRefresh) {
   const photosRegional = toIntegerCount(dbStats.photos_regional);
   const photosNational = toIntegerCount(dbStats.photos_national);
   const photosInternational = toIntegerCount(dbStats.photos_international);
+  const bandsTotal = toIntegerCount(dbStats.bands_total);
+  const setCount = toIntegerCount(dbStats.sets_total);
 
   return {
     ok: true,
@@ -3783,7 +3984,13 @@ async function buildMusicBandsDbStatsResponse(forceRefresh) {
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     bandTotals: {
-      bandsTotal: toIntegerCount(dbStats.bands_total),
+      bandsTotal,
+      band_count: bandsTotal,
+      artist_count: bandsTotal,
+      people_count: 0,
+      event_count: 0,
+      show_count: 0,
+      venue_count: 0,
       bandsLocal: toIntegerCount(dbStats.bands_local),
       bandsRegional: toIntegerCount(dbStats.bands_regional),
       bandsNational: toIntegerCount(dbStats.bands_national),
@@ -3794,6 +4001,8 @@ async function buildMusicBandsDbStatsResponse(forceRefresh) {
     },
     photoTotals: {
       photosTotal,
+      photo_count: photosTotal,
+      set_count: setCount,
       photosLocal,
       photosRegional,
       photosNational,
@@ -3843,8 +4052,19 @@ async function getMusicVenueDetailsMap(venueIds) {
 function buildMusicShowDbApiItem(row, venueDetailsMap) {
   const venueId = row.venue_id || '';
   const venueDetails = venueId ? (venueDetailsMap.get(normalizeMusicLookupKey(venueId)) || null) : null;
+  const bands = Array.isArray(row.bands) ? row.bands : [];
+  const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
+  addMusicCanonicalAliases(stats, {
+    event_count: 1,
+    show_count: 1,
+    band_count: bands.length,
+    artist_count: bands.length,
+    venue_count: venueId ? 1 : 0,
+    photo_count: getMusicStatsNumber(stats, ['photo_count', 'photoCount', 'totalPhotos']),
+    set_count: getMusicStatsNumber(stats, ['set_count', 'setCount'])
+  });
 
-  return {
+  const item = {
     show_id: toIntegerCount(row.show_id),
     name: row.name || '',
     venue_id: venueId,
@@ -3857,9 +4077,22 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     notes: row.notes || '',
     camera_1: row.camera_1 || '',
     camera_2: row.camera_2 || '',
-    bands: Array.isArray(row.bands) ? row.bands : [],
-    stats: row.stats && typeof row.stats === 'object' ? row.stats : {}
+    bands,
+    stats
   };
+  addMusicCanonicalAliases(item, {
+    event_count: 1,
+    show_count: 1,
+    band_count: bands.length,
+    artist_count: bands.length,
+    venue_count: venueId ? 1 : 0,
+    photo_count: stats.photo_count,
+    set_count: stats.set_count,
+    gallery_id: row.gallery_id || row.gallery || row.smug_folder || row.smugmug_gallery,
+    album_id: row.album_id || row.album || row.smugmug_album,
+    cover_image_url: row.cover_image_url || row.poster
+  });
+  return item;
 }
 
 function buildMusicShowsDbQueryOptions(query) {
@@ -4014,7 +4247,15 @@ async function handleMusicShowsDbRequest(req, res) {
       meta: buildListMeta({ route: '/api/music/shows/db', source: 'PostgreSQL:music_shows', pagination, filters: options.filters, sort: options.sort }),
       stats: {
         showsTotal: total,
-        bandsTotal: data.reduce((sum, show) => sum + (Array.isArray(show.bands) ? show.bands.length : 0), 0)
+        bandsTotal: data.reduce((sum, show) => sum + (Array.isArray(show.bands) ? show.bands.length : 0), 0),
+        show_count: total,
+        event_count: total,
+        band_count: data.reduce((sum, show) => sum + (Array.isArray(show.bands) ? show.bands.length : 0), 0),
+        artist_count: data.reduce((sum, show) => sum + (Array.isArray(show.bands) ? show.bands.length : 0), 0),
+        people_count: 0,
+        venue_count: 0,
+        photo_count: 0,
+        set_count: 0
       },
       data
     });
@@ -4097,7 +4338,15 @@ async function buildMusicShowsDbStatsResponse() {
     totals: {
       showsTotal: toIntegerCount(totals.shows_total),
       bandAppearancesTotal: toIntegerCount(totals.band_appearances_total),
-      uniqueBands: toIntegerCount(uniqueBands.unique_bands)
+      uniqueBands: toIntegerCount(uniqueBands.unique_bands),
+      show_count: toIntegerCount(totals.shows_total),
+      event_count: toIntegerCount(totals.shows_total),
+      band_count: toIntegerCount(uniqueBands.unique_bands),
+      artist_count: toIntegerCount(uniqueBands.unique_bands),
+      people_count: 0,
+      venue_count: 0,
+      photo_count: 0,
+      set_count: 0
     },
     byYear: byYearResult.rows.map((row) => ({ year: row.year, showsTotal: toIntegerCount(row.shows_total) })),
     byState: byStateResult.rows.map((row) => ({ state: row.state, showsTotal: toIntegerCount(row.shows_total) })),
@@ -5140,15 +5389,43 @@ async function buildWrestlingVenuesDbStatsResponse() {
 }
 
 function buildMusicPersonDbApiItem(row) {
-  return {
+  const bands = Array.isArray(row.bands) ? row.bands : [];
+  const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
+  addMusicCanonicalAliases(stats, {
+    photo_count: getMusicStatsNumber(stats, ['photo_count', 'photoCount']),
+    band_count: bands.length,
+    artist_count: bands.length,
+    people_count: 1,
+    member_count: 0,
+    event_count: 0,
+    show_count: 0,
+    set_count: 0,
+    venue_count: 0
+  });
+  const item = {
     person_id: toIntegerCount(row.person_id),
     name: row.name || '',
     category: row.category || '',
     aliases: Array.isArray(row.aliases) ? row.aliases : [],
-    bands: Array.isArray(row.bands) ? row.bands : [],
+    bands,
     associations: Array.isArray(row.associations) ? row.associations : [],
-    stats: row.stats && typeof row.stats === 'object' ? row.stats : {}
+    stats
   };
+  addMusicCanonicalAliases(item, {
+    photo_count: stats.photo_count,
+    band_count: bands.length,
+    artist_count: bands.length,
+    people_count: 1,
+    member_count: 0,
+    event_count: 0,
+    show_count: 0,
+    set_count: 0,
+    venue_count: 0,
+    gallery_id: null,
+    album_id: null,
+    cover_image_url: null
+  });
+  return item;
 }
 
 function buildMusicPeopleDbQueryOptions(query) {
@@ -5294,7 +5571,16 @@ async function handleMusicPeopleDbRequest(req, res) {
       sort: options.sort,
       meta: buildListMeta({ route: '/api/music/people/db', source: { type: 'postgres', table: 'music_people' }, pagination, filters: options.filters, sort: options.sort }),
       stats: {
-        peopleTotal: total
+        peopleTotal: total,
+        people_count: total,
+        artist_count: total,
+        band_count: 0,
+        member_count: 0,
+        photo_count: 0,
+        event_count: 0,
+        show_count: 0,
+        set_count: 0,
+        venue_count: 0
       },
       data
     });
@@ -5379,10 +5665,19 @@ async function buildMusicPeopleDbStatsResponse() {
     generatedTime: formatEasternGeneratedTime(generated),
     totals: {
       peopleTotal: toIntegerCount(totals.total_people),
+      people_count: toIntegerCount(totals.total_people),
       performersTotal: toIntegerCount(totals.total_performers),
+      artist_count: toIntegerCount(totals.total_performers),
       friendsTotal: toIntegerCount(totals.total_friends),
       categoriesTotal: toIntegerCount(totals.total_categories),
-      uniqueBands: toIntegerCount(uniqueBands.unique_bands)
+      uniqueBands: toIntegerCount(uniqueBands.unique_bands),
+      band_count: toIntegerCount(uniqueBands.unique_bands),
+      member_count: 0,
+      photo_count: 0,
+      event_count: 0,
+      show_count: 0,
+      set_count: 0,
+      venue_count: 0
     },
     topBands: topBandsResult.rows.map((row) => ({ band: row.band, peopleCount: toIntegerCount(row.people_count) })),
     topInstruments: topInstrumentsResult.rows.map((row) => ({ instrument: row.instrument, peopleCount: toIntegerCount(row.people_count) })),
@@ -5396,8 +5691,17 @@ function buildMusicVenueDbApiItem(row) {
   const geo = buildPhase1WrestlingVenueGeo(latitude, longitude, row.geo);
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   stats.showCount = row.show_count == null ? toIntegerCount(stats.showCount) : toIntegerCount(row.show_count);
-
-  return {
+  addMusicCanonicalAliases(stats, {
+    show_count: stats.showCount,
+    event_count: stats.showCount,
+    venue_count: 1,
+    photo_count: 0,
+    set_count: 0,
+    band_count: 0,
+    artist_count: 0,
+    people_count: 0
+  });
+  const item = {
     venue_id: row.venue_key || (row.venue_id == null ? '' : String(row.venue_id)),
     venue: row.venue || '',
     city: row.city || '',
@@ -5416,10 +5720,25 @@ function buildMusicVenueDbApiItem(row) {
       gps_lng: longitude == null ? '' : String(longitude)
     },
     media: {
-      logo: row.logo || ''
+      logo: row.logo || '',
+      cover_image_url: getCanonicalNullableString(row.logo)
     },
     stats
   };
+  addMusicCanonicalAliases(item, {
+    show_count: stats.showCount,
+    event_count: stats.showCount,
+    venue_count: 1,
+    photo_count: 0,
+    set_count: 0,
+    band_count: 0,
+    artist_count: 0,
+    people_count: 0,
+    gallery_id: null,
+    album_id: null,
+    cover_image_url: row.logo
+  });
+  return item;
 }
 
 
@@ -5981,6 +6300,14 @@ async function buildMusicVenuesDbStatsResponse() {
     generatedTime: formatEasternGeneratedTime(generated),
     totals: {
       venuesTotal: toIntegerCount(totals.total_venues),
+      venue_count: toIntegerCount(totals.total_venues),
+      show_count: toIntegerCount(venueShowTotals.show_venue_links),
+      event_count: toIntegerCount(venueShowTotals.show_venue_links),
+      photo_count: 0,
+      set_count: 0,
+      band_count: 0,
+      artist_count: 0,
+      people_count: 0,
       venuesWithGps: toIntegerCount(totals.venues_with_gps),
       venuesMissingGps: toIntegerCount(totals.venues_missing_gps),
       venuesWithLogo: toIntegerCount(totals.venues_with_logo),
@@ -5997,7 +6324,15 @@ async function buildMusicVenuesDbStatsResponse() {
       venue: row.venue || '',
       city: row.city || '',
       state: row.state || '',
-      showCount: toIntegerCount(row.show_count)
+      showCount: toIntegerCount(row.show_count),
+      show_count: toIntegerCount(row.show_count),
+      event_count: toIntegerCount(row.show_count),
+      venue_count: 1,
+      photo_count: 0,
+      set_count: 0,
+      band_count: 0,
+      artist_count: 0,
+      people_count: 0
     }))
   };
 }
@@ -12330,6 +12665,9 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
       }
       if (routePath === '/api/music/people') {
         return res.json(await buildMusicPeopleResponse(payload, forceRefresh));
+      }
+      if (routePath === '/api/music/venues') {
+        return res.json(buildMusicVenuesResponse(payload));
       }
       return res.json(payload);
     } catch (err) {
