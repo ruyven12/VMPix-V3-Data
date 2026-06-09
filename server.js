@@ -731,6 +731,12 @@ function buildMusicBandAlbumsEndpoint(target) {
   return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!albums?_accept=application/json`;
 }
 
+function buildMusicBandParentAlbumsEndpoint(target) {
+  const path = ['Music', 'Archives', 'Bands', target.region]
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!albums?_accept=application/json`;
+}
 async function getSmugAlbumTotalPhotos(album) {
   const directCount = getSmugAlbumImageCount(album);
   if (directCount != null) return directCount;
@@ -9773,6 +9779,68 @@ function getSmugAlbumIds(albums) {
   return ids;
 }
 
+function isSmugHttpStatusError(err, status) {
+  const message = err && err.message ? err.message : String(err || '');
+  return new RegExp(`HTTP\\s+${status}(\\D|$)`, 'i').test(message);
+}
+
+function getSmugAlbumPathCandidates(album) {
+  const candidates = [
+    album && album.WebUri,
+    album && album.WebURL,
+    album && album.WebUrl,
+    album && album.Url,
+    album && album.URL,
+    album && album.Uri,
+    album && album.URI,
+    album && album.NiceName,
+    album && album.Name,
+    album && album.Title,
+    album && album.AlbumKey,
+    album && album.Key
+  ];
+
+  if (album && album.Uris && typeof album.Uris === 'object') {
+    Object.values(album.Uris).forEach((value) => {
+      if (!value || typeof value !== 'object') return;
+      candidates.push(value.Uri, value.URI, value.Url, value.URL);
+    });
+  }
+
+  return candidates.map((value) => String(value || '').trim()).filter(Boolean);
+}
+
+function decodeSmugPathSegment(value) {
+  const clean = String(value || '').trim();
+  try {
+    return decodeURIComponent(clean);
+  } catch (_) {
+    return clean;
+  }
+}
+
+function getLastSmugPathSegment(value) {
+  const clean = String(value || '').split('?')[0].split('#')[0].replace(/\/+$/g, '');
+  const parts = clean.split('/').filter(Boolean);
+  return decodeSmugPathSegment(parts[parts.length - 1] || clean);
+}
+
+function albumMatchesDirectMusicBandTarget(album, target) {
+  const expected = String(target && target.folder || '').trim();
+  if (!expected) return false;
+  const expectedPath = ['Music', 'Archives', 'Bands', target.region, target.folder].map(String).join('/');
+
+  return getSmugAlbumPathCandidates(album).some((candidate) => {
+    const decoded = decodeSmugPathSegment(candidate);
+    if (decoded === expectedPath || decoded.endsWith(`/${expectedPath}`)) return true;
+    return getLastSmugPathSegment(decoded) === expected;
+  });
+}
+
+async function resolveDirectMusicBandAlbum(target) {
+  const json = await fetchSmugJson(buildMusicBandParentAlbumsEndpoint(target));
+  return getSmugAlbums(json).filter((album) => albumMatchesDirectMusicBandTarget(album, target));
+}
 function buildSmugMusicBandDuplicateSample(row, albums) {
   return {
     band_id: row.band_id || '',
@@ -9798,7 +9866,7 @@ async function getSmugMusicBandDiscoverCandidates(limit, refresh) {
     where.push(`(
       smug_last_synced_at IS NULL
       OR trim(coalesce(smug_sync_status, '')) = ''
-      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unmatched', 'duplicate_match', 'missing_region', 'missing_smug_folder')
+      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unmatched', 'duplicate_match', 'duplicate_direct_album', 'missing_region', 'missing_smug_folder')
     )`);
   }
 
@@ -9920,8 +9988,48 @@ async function discoverSmugMusicBand(row) {
   }
 
   const galleryId = buildSmugMusicBandGalleryId(target);
-  const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
-  const albums = getSmugAlbums(json);
+  let albums = [];
+  let folderLookupError = null;
+
+  try {
+    const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
+    albums = getSmugAlbums(json);
+  } catch (err) {
+    folderLookupError = err;
+    if (!isSmugHttpStatusError(err, 404)) throw err;
+  }
+
+  if (!albums.length && folderLookupError && isSmugHttpStatusError(folderLookupError, 404)) {
+    const directAlbums = await resolveDirectMusicBandAlbum(target);
+    if (directAlbums.length) {
+      const albumIds = getSmugAlbumIds(directAlbums);
+      const photoCount = await sumSmugAlbumImageCounts(directAlbums);
+      const coverImageUrl = directAlbums.map(getSmugAlbumCoverImageUrl).find(Boolean) || row.cover_image_url || row.logo_url || null;
+      const duplicateDirectMatch = directAlbums.length > 1;
+      const updated = await updateSmugMusicBandSnapshot(row, {
+        gallery_id: galleryId,
+        album_id: albumIds.join(';') || null,
+        cover_image_url: coverImageUrl,
+        photo_count: photoCount == null ? 0 : photoCount,
+        smug_sync_status: duplicateDirectMatch ? 'duplicate_direct_album' : 'matched_direct_album',
+        smug_sync_error: duplicateDirectMatch ? `Multiple direct SmugMug album matches found for ${galleryId}.` : null
+      });
+
+      return {
+        status: duplicateDirectMatch ? 'duplicate_direct_album' : 'matched_direct_album',
+        updated,
+        diagnostic: duplicateDirectMatch ? buildSmugMusicBandDuplicateSample(row, directAlbums) : {
+          band_id: row.band_id || '',
+          band: row.band || '',
+          region: row.region || '',
+          smug_folder: row.smug_folder || '',
+          gallery_id: galleryId,
+          album_id: albumIds.join(';') || null,
+          match_method: 'direct_album_parent_lookup'
+        }
+      };
+    }
+  }
 
   if (!albums.length) {
     const updated = await updateSmugMusicBandSnapshot(row, {
@@ -9930,7 +10038,9 @@ async function discoverSmugMusicBand(row) {
       cover_image_url: row.cover_image_url || row.logo_url || null,
       photo_count: 0,
       smug_sync_status: 'unmatched',
-      smug_sync_error: `No SmugMug albums found for ${galleryId}.`
+      smug_sync_error: folderLookupError && isSmugHttpStatusError(folderLookupError, 404)
+        ? `No child albums or direct SmugMug album found for ${galleryId}.`
+        : `No SmugMug albums found for ${galleryId}.`
     });
     return {
       status: 'unmatched',
@@ -9941,7 +10051,9 @@ async function discoverSmugMusicBand(row) {
         region: row.region || '',
         smug_folder: row.smug_folder || '',
         gallery_id: galleryId,
-        diagnostic_slug_candidate: slugifyMusicBandId(row.band || '')
+        diagnostic_slug_candidate: slugifyMusicBandId(row.band || ''),
+        child_albums_endpoint_404: !!(folderLookupError && isSmugHttpStatusError(folderLookupError, 404)),
+        direct_album_lookup_attempted: !!(folderLookupError && isSmugHttpStatusError(folderLookupError, 404))
       }
     };
   }
@@ -9965,7 +10077,6 @@ async function discoverSmugMusicBand(row) {
     diagnostic: duplicateMatch ? buildSmugMusicBandDuplicateSample(row, albums) : null
   };
 }
-
 function buildSmugMusicBandDiscoverResultItem(row) {
   return {
     band_id: row && row.band_id ? row.band_id : '',
@@ -10056,8 +10167,8 @@ async function runSmugMusicBandDiscover(query = {}) {
         counters.recordsUpdated += 1;
         updatedItems.push(buildSmugMusicBandDiscoverResultItem(result.updated));
       }
-      if (result.status === 'synced') counters.matched += 1;
-      if (result.status === 'duplicate_match') {
+      if (result.status === 'synced' || result.status === 'matched_direct_album') counters.matched += 1;
+      if (result.status === 'duplicate_match' || result.status === 'duplicate_direct_album') {
         counters.matched += 1;
         counters.duplicateMatches += 1;
         if (result.diagnostic) duplicateMatches.push(result.diagnostic);
@@ -14336,6 +14447,9 @@ async function startServer() {
 }
 
 startServer();
+
+
+
 
 
 
