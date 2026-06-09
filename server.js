@@ -379,7 +379,7 @@ function logStartupEnvironmentWarnings() {
 }
 
 app.use(allowCors);
-app.use(['/api/admin', '/admin/import', '/api/wrestling/people/import'], requireAdminAccess);
+app.use(['/api/admin', '/admin/import', '/admin/smug', '/api/wrestling/people/import'], requireAdminAccess);
 app.use(requireRefreshAdminAccess);
 
 function parseCsvLine(line) {
@@ -9290,6 +9290,370 @@ function buildAdminError(route, err, extra = {}) {
   });
 }
 
+const SMUG_MUSIC_SNAPSHOT_TABLES = ['music_bands', 'music_shows'];
+const SMUG_MUSIC_SNAPSHOT_FIELDS = [
+  'gallery_id',
+  'album_id',
+  'cover_image_url',
+  'photo_count',
+  'smug_last_synced_at',
+  'smug_sync_status',
+  'smug_sync_error'
+];
+
+function getSmugMusicTableColumns(columnsByTable, tableName) {
+  return columnsByTable && columnsByTable.get(tableName) ? columnsByTable.get(tableName) : new Set();
+}
+
+function buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable) {
+  const fieldsByTable = {};
+  const missing = [];
+
+  SMUG_MUSIC_SNAPSHOT_TABLES.forEach((tableName) => {
+    const tableExists = existingTables.has(tableName);
+    const tableColumns = getSmugMusicTableColumns(columnsByTable, tableName);
+    fieldsByTable[tableName] = {
+      tablePresent: tableExists,
+      fields: {}
+    };
+
+    SMUG_MUSIC_SNAPSHOT_FIELDS.forEach((fieldName) => {
+      const present = tableExists && tableColumns.has(fieldName);
+      fieldsByTable[tableName].fields[fieldName] = present;
+      if (!present) missing.push(`${tableName}.${fieldName}`);
+    });
+  });
+
+  return {
+    present: missing.length === 0,
+    missing,
+    tables: fieldsByTable
+  };
+}
+
+async function inspectSmugMusicSnapshotFields(warnings) {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('DATABASE_URL is not configured; snapshot field inspection skipped.');
+    return {
+      present: false,
+      missing: SMUG_MUSIC_SNAPSHOT_TABLES.flatMap((tableName) => SMUG_MUSIC_SNAPSHOT_FIELDS.map((fieldName) => `${tableName}.${fieldName}`)),
+      tables: {}
+    };
+  }
+
+  try {
+    const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
+    const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
+    return buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable);
+  } catch (err) {
+    warnings.push(`Unable to inspect SmugMug snapshot fields: ${err && err.message ? err.message : String(err)}`);
+    return {
+      present: false,
+      missing: [],
+      tables: {}
+    };
+  }
+}
+
+function buildSmugMusicConfigSummary(smugConfig, snapshotFields) {
+  return {
+    readyForDiagnostics: true,
+    readyForSync: !!(smugConfig.configured && snapshotFields.present),
+    missingRequirements: (smugConfig.missing || []).concat(snapshotFields.missing || [])
+  };
+}
+
+async function buildSmugMusicConfigResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const smugConfig = getSmugMugConfigDiagnostics();
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+
+  return buildAdminResponse({
+    route: '/admin/smug/music/config',
+    generated,
+    source: 'server',
+    section: 'music',
+    type: 'smug_config',
+    config: {
+      smugApiKeyConfigured: !!SMUG_API_KEY,
+      smugNicknameConfigured: !!SMUG_NICKNAME_ENV,
+      configured: smugConfig.configured,
+      missing: smugConfig.missing,
+      nickname: SMUG_NICKNAME,
+      userAgentConfigured: !!SMUG_USER_AGENT,
+      requestRetries: SMUG_REQUEST_RETRIES,
+      retryDelayMs: SMUG_RETRY_DELAY_MS,
+      requestConcurrency: SMUG_REQUEST_CONCURRENCY
+    },
+    helper: {
+      available: typeof fetchSmugJson === 'function' && typeof buildSmugApiUrl === 'function',
+      requestHelperAvailable: typeof fetchSmugJson === 'function',
+      urlHelperAvailable: typeof buildSmugApiUrl === 'function',
+      rateLimitRetrySupported: true,
+      lowConcurrencyDefault: SMUG_REQUEST_CONCURRENCY
+    },
+    snapshotFields,
+    summary: buildSmugMusicConfigSummary(smugConfig, snapshotFields),
+    warnings
+  });
+}
+
+async function runSmugMusicCountQuery(warnings, label, sql, values = []) {
+  try {
+    const result = await dbPool.query(sql, values);
+    return toIntegerCount(result.rows && result.rows[0] && result.rows[0].count);
+  } catch (err) {
+    warnings.push(`Unable to query ${label}: ${err && err.message ? err.message : String(err)}`);
+    return 0;
+  }
+}
+
+async function runSmugMusicRowsQuery(warnings, label, sql, values = []) {
+  try {
+    const result = await dbPool.query(sql, values);
+    return diagnosticRows(result);
+  } catch (err) {
+    warnings.push(`Unable to query ${label}: ${err && err.message ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+async function buildSmugMusicBandDiagnostics(existingTables, columnsByTable, warnings) {
+  const bands = {
+    tablePresent: existingTables.has('music_bands'),
+    missingSmugFolder: { count: 0, samples: [] },
+    missingSyncData: { count: 0, samples: [] },
+    syncStatus: [],
+    snapshotAge: null
+  };
+
+  if (!bands.tablePresent) {
+    warnings.push('Missing table for SmugMug band diagnostics: music_bands');
+    return bands;
+  }
+
+  const columns = getSmugMusicTableColumns(columnsByTable, 'music_bands');
+  if (columns.has('smug_folder')) {
+    bands.missingSmugFolder.count = await runSmugMusicCountQuery(
+      warnings,
+      'bands missing smug_folder',
+      `SELECT count(*)::int AS count FROM music_bands WHERE trim(coalesce(smug_folder, '')) = ''`
+    );
+    bands.missingSmugFolder.samples = await runSmugMusicRowsQuery(
+      warnings,
+      'bands missing smug_folder samples',
+      `SELECT band_id, band, smug_folder
+       FROM music_bands
+       WHERE trim(coalesce(smug_folder, '')) = ''
+       ORDER BY band ASC
+       LIMIT 10`
+    );
+  } else {
+    warnings.push('Missing column for SmugMug band diagnostics: music_bands.smug_folder');
+  }
+
+  const hasSnapshotFields = SMUG_MUSIC_SNAPSHOT_FIELDS.every((fieldName) => columns.has(fieldName));
+  if (hasSnapshotFields) {
+    bands.missingSyncData.count = await runSmugMusicCountQuery(
+      warnings,
+      'bands missing sync data',
+      `SELECT count(*)::int AS count
+       FROM music_bands
+       WHERE trim(coalesce(gallery_id, '')) = ''
+         AND trim(coalesce(album_id, '')) = ''
+         AND trim(coalesce(cover_image_url, '')) = ''
+         AND coalesce(photo_count, 0) = 0
+         AND smug_last_synced_at IS NULL
+         AND trim(coalesce(smug_sync_status, '')) = ''`
+    );
+    bands.missingSyncData.samples = await runSmugMusicRowsQuery(
+      warnings,
+      'bands missing sync data samples',
+      `SELECT band_id, band, smug_folder, smug_sync_status, smug_last_synced_at
+       FROM music_bands
+       WHERE trim(coalesce(gallery_id, '')) = ''
+         AND trim(coalesce(album_id, '')) = ''
+         AND trim(coalesce(cover_image_url, '')) = ''
+         AND coalesce(photo_count, 0) = 0
+         AND smug_last_synced_at IS NULL
+         AND trim(coalesce(smug_sync_status, '')) = ''
+       ORDER BY band ASC
+       LIMIT 10`
+    );
+    bands.syncStatus = await runSmugMusicRowsQuery(
+      warnings,
+      'band snapshot sync status',
+      `SELECT coalesce(nullif(trim(smug_sync_status), ''), 'unsynced') AS status, count(*)::int AS count
+       FROM music_bands
+       GROUP BY 1
+       ORDER BY count DESC, status ASC`
+    );
+    bands.snapshotAge = await runSmugMusicRowsQuery(
+      warnings,
+      'band snapshot age',
+      `SELECT
+         max(smug_last_synced_at) AS latest_synced_at,
+         min(smug_last_synced_at) FILTER (WHERE smug_last_synced_at IS NOT NULL) AS oldest_synced_at,
+         count(*) FILTER (WHERE smug_last_synced_at IS NOT NULL)::int AS synced_rows,
+         count(*) FILTER (WHERE smug_last_synced_at IS NULL)::int AS never_synced_rows,
+         count(*) FILTER (WHERE smug_last_synced_at < now() - interval '7 days')::int AS stale_7d_rows,
+         count(*) FILTER (WHERE smug_last_synced_at < now() - interval '30 days')::int AS stale_30d_rows
+       FROM music_bands`
+    ).then((rows) => rows[0] || null);
+  } else {
+    warnings.push('Missing one or more music_bands SmugMug snapshot columns.');
+  }
+
+  return bands;
+}
+
+async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, warnings) {
+  const shows = {
+    tablePresent: existingTables.has('music_shows'),
+    showUrlColumnPresent: false,
+    missingPosterOrShowUrl: { count: 0, samples: [] },
+    missingSyncData: { count: 0, samples: [] },
+    syncStatus: [],
+    snapshotAge: null
+  };
+
+  if (!shows.tablePresent) {
+    warnings.push('Missing table for SmugMug show diagnostics: music_shows');
+    return shows;
+  }
+
+  const columns = getSmugMusicTableColumns(columnsByTable, 'music_shows');
+  const hasPoster = columns.has('poster');
+  const hasShowUrl = columns.has('show_url');
+  shows.showUrlColumnPresent = hasShowUrl;
+
+  if (hasPoster || hasShowUrl) {
+    const missingMediaWhere = hasShowUrl
+      ? `trim(coalesce(poster, '')) = '' AND trim(coalesce(show_url, '')) = ''`
+      : `trim(coalesce(poster, '')) = ''`;
+    const sampleFields = hasShowUrl
+      ? 'show_id, name, date, poster, show_url'
+      : 'show_id, name, date, poster';
+
+    shows.missingPosterOrShowUrl.count = await runSmugMusicCountQuery(
+      warnings,
+      'shows missing poster/show_url',
+      `SELECT count(*)::int AS count FROM music_shows WHERE ${missingMediaWhere}`
+    );
+    shows.missingPosterOrShowUrl.samples = await runSmugMusicRowsQuery(
+      warnings,
+      'shows missing poster/show_url samples',
+      `SELECT ${sampleFields}
+       FROM music_shows
+       WHERE ${missingMediaWhere}
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+  } else {
+    warnings.push('Missing poster/show_url columns for SmugMug show diagnostics.');
+  }
+
+  const hasSnapshotFields = SMUG_MUSIC_SNAPSHOT_FIELDS.every((fieldName) => columns.has(fieldName));
+  if (hasSnapshotFields) {
+    shows.missingSyncData.count = await runSmugMusicCountQuery(
+      warnings,
+      'shows missing sync data',
+      `SELECT count(*)::int AS count
+       FROM music_shows
+       WHERE trim(coalesce(gallery_id, '')) = ''
+         AND trim(coalesce(album_id, '')) = ''
+         AND trim(coalesce(cover_image_url, '')) = ''
+         AND coalesce(photo_count, 0) = 0
+         AND smug_last_synced_at IS NULL
+         AND trim(coalesce(smug_sync_status, '')) = ''`
+    );
+    shows.missingSyncData.samples = await runSmugMusicRowsQuery(
+      warnings,
+      'shows missing sync data samples',
+      `SELECT show_id, name, date, poster, smug_sync_status, smug_last_synced_at
+       FROM music_shows
+       WHERE trim(coalesce(gallery_id, '')) = ''
+         AND trim(coalesce(album_id, '')) = ''
+         AND trim(coalesce(cover_image_url, '')) = ''
+         AND coalesce(photo_count, 0) = 0
+         AND smug_last_synced_at IS NULL
+         AND trim(coalesce(smug_sync_status, '')) = ''
+       ORDER BY show_id ASC
+       LIMIT 10`
+    );
+    shows.syncStatus = await runSmugMusicRowsQuery(
+      warnings,
+      'show snapshot sync status',
+      `SELECT coalesce(nullif(trim(smug_sync_status), ''), 'unsynced') AS status, count(*)::int AS count
+       FROM music_shows
+       GROUP BY 1
+       ORDER BY count DESC, status ASC`
+    );
+    shows.snapshotAge = await runSmugMusicRowsQuery(
+      warnings,
+      'show snapshot age',
+      `SELECT
+         max(smug_last_synced_at) AS latest_synced_at,
+         min(smug_last_synced_at) FILTER (WHERE smug_last_synced_at IS NOT NULL) AS oldest_synced_at,
+         count(*) FILTER (WHERE smug_last_synced_at IS NOT NULL)::int AS synced_rows,
+         count(*) FILTER (WHERE smug_last_synced_at IS NULL)::int AS never_synced_rows,
+         count(*) FILTER (WHERE smug_last_synced_at < now() - interval '7 days')::int AS stale_7d_rows,
+         count(*) FILTER (WHERE smug_last_synced_at < now() - interval '30 days')::int AS stale_30d_rows
+       FROM music_shows`
+    ).then((rows) => rows[0] || null);
+  } else {
+    warnings.push('Missing one or more music_shows SmugMug snapshot columns.');
+  }
+
+  return shows;
+}
+
+async function buildSmugMusicDiagnosticsResponse() {
+  const generated = new Date();
+  const warnings = [];
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+  const response = buildAdminResponse({
+    route: '/admin/smug/music/diagnostics',
+    generated,
+    source: 'postgres',
+    section: 'music',
+    type: 'smug_diagnostics',
+    summary: {
+      heavyScan: false,
+      smugApiCalls: 0,
+      snapshotFieldsPresent: snapshotFields.present
+    },
+    snapshotFields,
+    bands: {},
+    shows: {},
+    warnings
+  });
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    response.summary.databaseConnected = false;
+    response.warnings = warnings;
+    return response;
+  }
+
+  try {
+    const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
+    const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
+    response.summary.databaseConnected = true;
+    response.bands = await buildSmugMusicBandDiagnostics(existingTables, columnsByTable, warnings);
+    response.shows = await buildSmugMusicShowDiagnostics(existingTables, columnsByTable, warnings);
+    response.summary.bandsMissingSmugFolder = response.bands.missingSmugFolder ? response.bands.missingSmugFolder.count : 0;
+    response.summary.bandsMissingSyncData = response.bands.missingSyncData ? response.bands.missingSyncData.count : 0;
+    response.summary.showsMissingPosterOrShowUrl = response.shows.missingPosterOrShowUrl ? response.shows.missingPosterOrShowUrl.count : 0;
+    response.summary.showsMissingSyncData = response.shows.missingSyncData ? response.shows.missingSyncData.count : 0;
+  } catch (err) {
+    response.summary.databaseConnected = false;
+    warnings.push(`Unable to build SmugMug music diagnostics: ${err && err.message ? err.message : String(err)}`);
+  }
+
+  response.warnings = warnings;
+  return response;
+}
 function normalizeAdminHealth({ diagnostics, importHealth, lockHealth, relationshipHealth, statsHealth, warnings } = {}) {
   const warningCount = Array.isArray(warnings) ? warnings.length : 0;
   const diagnosticsSummary = diagnostics && diagnostics.summary ? diagnostics.summary : {};
@@ -12456,6 +12820,29 @@ app.get('/api/admin/diagnostics/wrestling/relationships', async (req, res) => {
   return handleRelationshipDiagnosticsRequest(req, res, 'wrestling');
 });
 
+app.get('/admin/smug/music/config', async (req, res) => {
+  try {
+    res.json(await buildSmugMusicConfigResponse());
+  } catch (err) {
+    res.status(500).json(buildAdminError('/admin/smug/music/config', err, {
+      source: 'server',
+      section: 'music',
+      type: 'smug_config'
+    }));
+  }
+});
+
+app.get('/admin/smug/music/diagnostics', async (req, res) => {
+  try {
+    res.json(await buildSmugMusicDiagnosticsResponse());
+  } catch (err) {
+    res.status(500).json(buildAdminError('/admin/smug/music/diagnostics', err, {
+      source: 'postgres',
+      section: 'music',
+      type: 'smug_diagnostics'
+    }));
+  }
+});
 app.get('/api/admin/stats/summary', async (req, res) => {
   return handleStatsSummaryRequest(req, res);
 });
@@ -12792,6 +13179,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
