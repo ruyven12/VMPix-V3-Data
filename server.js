@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const fs = require('fs');
 const path = require('path');
@@ -38,8 +38,21 @@ const PORT = process.env.PORT || 3000;
 
 const SHEET_ID = String(process.env.GOOGLE_SHEET_ID || '').trim();
 const CACHE_TTL_MS = Math.max(15_000, Number(process.env.SHEET_CACHE_TTL_MS || 1000 * 60 * 5));
+
+function getIntegerEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  const number = Number.isFinite(value) ? Math.trunc(value) : fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+const SMUG_API_BASE_URL = 'https://api.smugmug.com/api/v2';
 const SMUG_API_KEY = String(process.env.SMUG_API_KEY || '').trim();
-const SMUG_NICKNAME = String(process.env.SMUG_NICKNAME || 'vmpix').trim();
+const SMUG_NICKNAME_ENV = String(process.env.SMUG_NICKNAME || '').trim();
+const SMUG_NICKNAME = SMUG_NICKNAME_ENV || 'vmpix';
+const SMUG_USER_AGENT = String(process.env.SMUG_USER_AGENT || 'VMPix-V3-Data/1.0').trim();
+const SMUG_REQUEST_RETRIES = getIntegerEnv('SMUG_REQUEST_RETRIES', 2, 0, 5);
+const SMUG_RETRY_DELAY_MS = getIntegerEnv('SMUG_RETRY_DELAY_MS', 1500, 250, 10000);
+const SMUG_REQUEST_CONCURRENCY = getIntegerEnv('SMUG_REQUEST_CONCURRENCY', 2, 1, 4);
 const SMUG_TOTAL_PHOTOS_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.SMUG_TOTAL_PHOTOS_CACHE_TTL_MS || 1000 * 60 * 60 * 12) || 1000 * 60 * 60 * 12
@@ -319,9 +332,31 @@ function allowCors(req, res, next) {
   return next();
 }
 
+function getSmugMugConfigDiagnostics() {
+  const missing = [];
+  const warnings = [];
+
+  if (!SMUG_API_KEY) missing.push('SMUG_API_KEY');
+  if (!SMUG_NICKNAME_ENV) missing.push('SMUG_NICKNAME');
+  if (!SMUG_USER_AGENT) warnings.push('SMUG_USER_AGENT is blank; using a descriptive user agent is recommended.');
+
+  return {
+    configured: missing.length === 0,
+    missing,
+    warnings,
+    nickname: SMUG_NICKNAME,
+    userAgent: SMUG_USER_AGENT,
+    retries: SMUG_REQUEST_RETRIES,
+    retryDelayMs: SMUG_RETRY_DELAY_MS,
+    concurrency: SMUG_REQUEST_CONCURRENCY
+  };
+}
+
 function getStartupEnvironmentWarnings() {
   const warnings = [];
-  if (!String(process.env.DATABASE_URL || '').trim()) warnings.push('DATABASE_URL is not configured; PostgreSQL routes and schema apply will be unavailable.');
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('DATABASE_URL is not configured; PostgreSQL routes and schema apply will be unavailable.');
+  }
   if (!SHEET_ID) warnings.push('GOOGLE_SHEET_ID is not configured; Google Sheets routes/imports will fail.');
   if (shouldRequireAdminProtection() && !getConfiguredAdminSecrets().length) {
     warnings.push('ADMIN_TOKEN or ADMIN_PASSWORD is required in Render/production; admin/control routes will return 503 until configured.');
@@ -329,9 +364,15 @@ function getStartupEnvironmentWarnings() {
   if (!String(process.env.CORS_ALLOW_ORIGINS || '').trim()) {
     warnings.push('CORS_ALLOW_ORIGINS is blank; public non-credentialed routes will allow any origin.');
   }
+
+  const smugConfig = getSmugMugConfigDiagnostics();
+  if (!smugConfig.configured) {
+    warnings.push(`SmugMug integration disabled; missing ${smugConfig.missing.join(', ')}.`);
+  }
+  smugConfig.warnings.forEach((warning) => warnings.push(`SmugMug: ${warning}`));
+
   return warnings;
 }
-
 function logStartupEnvironmentWarnings() {
   const warnings = getStartupEnvironmentWarnings();
   warnings.forEach((warning) => console.warn(`Startup warning: ${warning}`));
@@ -426,28 +467,73 @@ function formatEasternGeneratedTime(date) {
   }).format(date);
 }
 
-function buildSmugApiUrl(endpoint) {
-  const joiner = String(endpoint || '').includes('?') ? '&' : '?';
-  return `https://api.smugmug.com/api/v2${endpoint}${joiner}APIKey=${encodeURIComponent(SMUG_API_KEY)}`;
+function normalizeSmugEndpoint(endpoint) {
+  const clean = String(endpoint || '').trim();
+  if (!clean) throw new Error('Missing SmugMug endpoint.');
+  return clean.startsWith('/') ? clean : `/${clean}`;
 }
 
-async function fetchSmugJson(endpoint) {
-  const res = await fetch(buildSmugApiUrl(endpoint), {
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'VMPix-V3-Data/1.0'
-    }
-  });
+function normalizeSmugEndpoint(endpoint) {
+  const clean = String(endpoint || '').trim();
+  if (!clean) throw new Error('Missing SmugMug endpoint.');
+  return clean.startsWith('/') ? clean : `/${clean}`;
+}
 
-  if (!res.ok) {
-    const text = await res.text();
-    const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
-    throw new Error(`SmugMug returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+function buildSmugApiUrl(endpoint) {
+  const cleanEndpoint = normalizeSmugEndpoint(endpoint);
+  const url = new URL(`${SMUG_API_BASE_URL}${cleanEndpoint}`);
+  url.searchParams.set('APIKey', SMUG_API_KEY);
+  return url.toString();
+}
+
+function getSmugSafeEndpointLabel(endpoint) {
+  try {
+    const cleanEndpoint = normalizeSmugEndpoint(endpoint);
+    const idx = cleanEndpoint.indexOf('?');
+    return idx === -1 ? cleanEndpoint : cleanEndpoint.slice(0, idx);
+  } catch (_) {
+    return '/unknown';
+  }
+}
+
+function isSmugRateLimitStatus(status) {
+  return Number(status) === 429;
+}
+
+function isSmugMugConfigured() {
+  return getSmugMugConfigDiagnostics().configured;
+}
+
+async function fetchSmugJson(endpoint, options = {}) {
+  if (!isSmugMugConfigured()) {
+    throw new Error('SmugMug integration is not configured. Set SMUG_API_KEY.');
   }
 
-  return res.json();
-}
+  const retries = Number.isInteger(options.retries) ? Math.max(0, options.retries) : SMUG_REQUEST_RETRIES;
+  const retryDelayMs = Number.isInteger(options.retryDelayMs) ? Math.max(0, options.retryDelayMs) : SMUG_RETRY_DELAY_MS;
+  const safeEndpoint = getSmugSafeEndpointLabel(endpoint);
+  let lastError;
 
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const res = await fetch(buildSmugApiUrl(endpoint), {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': SMUG_USER_AGENT
+      }
+    });
+
+    if (res.ok) return res.json();
+
+    const text = await res.text();
+    const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
+    lastError = new Error(`SmugMug returned HTTP ${res.status} (${safeEndpoint})${snippet ? `: ${snippet}` : ''}`);
+
+    if (!isSmugRateLimitStatus(res.status) || attempt >= retries) throw lastError;
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (attempt + 1)));
+  }
+
+  throw lastError;
+}
 function getSmugAlbums(json) {
   const resp = json && json.Response ? json.Response : json;
   const albums = resp && (resp.Album || resp.Albums || resp.album || resp.albums);
@@ -653,7 +739,7 @@ async function getSmugAlbumTotalPhotos(album) {
 async function sumSmugAlbumImageCounts(albums) {
   let total = 0;
   let sawCount = false;
-  const counts = await mapWithConcurrency(albums, 3, getSmugAlbumTotalPhotos);
+  const counts = await mapWithConcurrency(albums, SMUG_REQUEST_CONCURRENCY, getSmugAlbumTotalPhotos);
 
   for (const count of counts) {
     if (count == null) continue;
@@ -12706,3 +12792,8 @@ async function startServer() {
 }
 
 startServer();
+
+
+
+
+
