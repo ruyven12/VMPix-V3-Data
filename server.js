@@ -294,13 +294,25 @@ async function applyDatabaseSchema() {
     }
 
     await dbPool.query(schemaSql);
-    await ensureSmugMusicSnapshotColumns();
     console.log('PostgreSQL schema applied successfully.');
   } catch (err) {
     console.error('PostgreSQL schema apply failed:', err && err.message ? err.message : String(err));
   }
 }
 
+async function applyRuntimeDatabaseMigrations() {
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    console.warn('Runtime database migrations skipped: DATABASE_URL is not configured.');
+    return;
+  }
+
+  const result = await ensureSmugMusicSnapshotColumns();
+  if (result && result.ok) {
+    console.log(`Runtime migration applied: SmugMug music snapshot columns ensured (${result.columnsEnsured.length}).`);
+  } else if (result && result.error) {
+    console.warn(`Runtime migration warning: SmugMug music snapshot columns were not fully ensured: ${result.error}`);
+  }
+}
 function isControlPlaneRequest(req) {
   if (!req || !req.path) return false;
   if (req.path.startsWith('/api/admin')) return true;
@@ -13777,6 +13789,57 @@ app.get('/api/admin/diagnostics/wrestling/relationships', async (req, res) => {
   return handleRelationshipDiagnosticsRequest(req, res, 'wrestling');
 });
 
+async function buildSmugMusicSnapshotMigrationResponse(route) {
+  const generated = new Date();
+  const warnings = [];
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    return buildAdminResponse({
+      ok: false,
+      route,
+      generated,
+      source: 'postgres',
+      section: 'music',
+      type: 'smug_snapshot_migration',
+      error: 'DATABASE_NOT_CONFIGURED',
+      message: 'DATABASE_URL is required to run SmugMug snapshot field migration.',
+      warnings
+    });
+  }
+
+  const migration = await ensureSmugMusicSnapshotColumns(warnings);
+  const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
+  const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
+  const snapshotFields = buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable);
+
+  return buildAdminResponse({
+    ok: !!(migration && migration.ok && snapshotFields.present),
+    route,
+    generated,
+    source: 'postgres',
+    section: 'music',
+    type: 'smug_snapshot_migration',
+    migration,
+    snapshotFields,
+    readyForSync: snapshotFields.present,
+    warnings
+  });
+}
+
+async function handleSmugMusicSnapshotMigrationRequest(req, res) {
+  try {
+    const response = await buildSmugMusicSnapshotMigrationResponse(req.path || '/api/admin/smug/music/migrate-snapshot-fields');
+    const statusCode = response.ok ? 200 : (response.error === 'DATABASE_NOT_CONFIGURED' ? 400 : 500);
+    return res.status(statusCode).json(response);
+  } catch (err) {
+    return res.status(500).json(buildAdminError(req.path || '/api/admin/smug/music/migrate-snapshot-fields', err, {
+      source: 'postgres',
+      section: 'music',
+      type: 'smug_snapshot_migration',
+      error: 'SMUG_SNAPSHOT_MIGRATION_ERROR'
+    }));
+  }
+}
 async function handleSmugMusicConfigRequest(req, res) {
   try {
     res.json(await buildSmugMusicConfigResponse());
@@ -13801,6 +13864,10 @@ async function handleSmugMusicDiagnosticsRequest(req, res) {
   }
 }
 
+app.get([
+  '/admin/smug/music/migrate-snapshot-fields',
+  '/api/admin/smug/music/migrate-snapshot-fields'
+], handleSmugMusicSnapshotMigrationRequest);
 app.get([
   '/admin/smug/music/bands/discover',
   '/admin/smug/music/discover',
@@ -14158,12 +14225,19 @@ app.use((req, res) => {
 async function startServer() {
   logStartupEnvironmentWarnings();
   await applyDatabaseSchema();
+  await applyRuntimeDatabaseMigrations();
   app.listen(PORT, () => {
     console.log(`VMPix V3 Data API listening on ${PORT}`);
   });
 }
 
 startServer();
+
+
+
+
+
+
 
 
 
