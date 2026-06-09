@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS music_bands (
+﻿CREATE TABLE IF NOT EXISTS music_bands (
     id SERIAL PRIMARY KEY,
     band_id TEXT UNIQUE,
     band TEXT NOT NULL,
@@ -15,6 +15,13 @@ CREATE TABLE IF NOT EXISTS music_bands (
     notes TEXT,
     archived_sets INTEGER DEFAULT 0,
     total_sets INTEGER DEFAULT 0,
+    gallery_id TEXT,
+    album_id TEXT,
+    cover_image_url TEXT,
+    photo_count INTEGER DEFAULT 0,
+    smug_last_synced_at TIMESTAMPTZ,
+    smug_sync_status TEXT,
+    smug_sync_error TEXT,
     general JSONB DEFAULT '{}'::jsonb,
     personnel JSONB DEFAULT '{}'::jsonb,
     stats JSONB DEFAULT '{}'::jsonb,
@@ -35,6 +42,27 @@ ALTER TABLE IF EXISTS music_bands
 ALTER TABLE IF EXISTS music_bands
     ADD COLUMN IF NOT EXISTS raw_sheet JSONB DEFAULT '{}'::jsonb;
 
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS gallery_id TEXT;
+
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS album_id TEXT;
+
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS cover_image_url TEXT;
+
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS photo_count INTEGER DEFAULT 0;
+
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS smug_last_synced_at TIMESTAMPTZ;
+
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS smug_sync_status TEXT;
+
+ALTER TABLE IF EXISTS music_bands
+    ADD COLUMN IF NOT EXISTS smug_sync_error TEXT;
+
 CREATE TABLE IF NOT EXISTS music_shows (
     id SERIAL PRIMARY KEY,
     show_id INTEGER UNIQUE NOT NULL,
@@ -49,6 +77,13 @@ CREATE TABLE IF NOT EXISTS music_shows (
     notes TEXT,
     camera_1 TEXT,
     camera_2 TEXT,
+    gallery_id TEXT,
+    album_id TEXT,
+    cover_image_url TEXT,
+    photo_count INTEGER DEFAULT 0,
+    smug_last_synced_at TIMESTAMPTZ,
+    smug_sync_status TEXT,
+    smug_sync_error TEXT,
     bands JSONB DEFAULT '[]'::jsonb,
     stats JSONB DEFAULT '{}'::jsonb,
     raw_sheet JSONB DEFAULT '{}'::jsonb,
@@ -100,6 +135,27 @@ ALTER TABLE IF EXISTS music_shows
 
 ALTER TABLE IF EXISTS music_shows
     ADD COLUMN IF NOT EXISTS raw_sheet JSONB DEFAULT '{}'::jsonb;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS gallery_id TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS album_id TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS cover_image_url TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS photo_count INTEGER DEFAULT 0;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS smug_last_synced_at TIMESTAMPTZ;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS smug_sync_status TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS smug_sync_error TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS music_shows_show_id_key
     ON music_shows (show_id);
@@ -560,3 +616,5 @@ ALTER TABLE IF EXISTS wrestling_venues
 
 CREATE UNIQUE INDEX IF NOT EXISTS wrestling_venues_venue_id_key
     ON wrestling_venues (venue_id);
+
+
