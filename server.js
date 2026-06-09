@@ -294,6 +294,7 @@ async function applyDatabaseSchema() {
     }
 
     await dbPool.query(schemaSql);
+    await ensureSmugMusicSnapshotColumns();
     console.log('PostgreSQL schema applied successfully.');
   } catch (err) {
     console.error('PostgreSQL schema apply failed:', err && err.message ? err.message : String(err));
@@ -9301,6 +9302,32 @@ const SMUG_MUSIC_SNAPSHOT_FIELDS = [
   'smug_sync_error'
 ];
 
+function getSmugMusicSnapshotColumnType(fieldName) {
+  if (fieldName === 'photo_count') return 'INTEGER DEFAULT 0';
+  if (fieldName === 'smug_last_synced_at') return 'TIMESTAMPTZ';
+  return 'TEXT';
+}
+
+async function ensureSmugMusicSnapshotColumns(warnings) {
+  if (!String(process.env.DATABASE_URL || '').trim()) return { ok: false, skipped: true, reason: 'DATABASE_URL_NOT_CONFIGURED' };
+
+  const columnsEnsured = [];
+  try {
+    for (const tableName of SMUG_MUSIC_SNAPSHOT_TABLES) {
+      for (const fieldName of SMUG_MUSIC_SNAPSHOT_FIELDS) {
+        const columnType = getSmugMusicSnapshotColumnType(fieldName);
+        await dbPool.query(`ALTER TABLE IF EXISTS ${tableName} ADD COLUMN IF NOT EXISTS ${fieldName} ${columnType}`);
+        columnsEnsured.push(`${tableName}.${fieldName}`);
+      }
+    }
+    return { ok: true, columnsEnsured };
+  } catch (err) {
+    const message = `Unable to ensure SmugMug snapshot columns: ${err && err.message ? err.message : String(err)}`;
+    if (Array.isArray(warnings)) warnings.push(message);
+    else console.warn(message);
+    return { ok: false, error: err && err.message ? err.message : String(err), columnsEnsured };
+  }
+}
 function getSmugMusicTableColumns(columnsByTable, tableName) {
   return columnsByTable && columnsByTable.get(tableName) ? columnsByTable.get(tableName) : new Set();
 }
@@ -9342,6 +9369,7 @@ async function inspectSmugMusicSnapshotFields(warnings) {
   }
 
   try {
+    await ensureSmugMusicSnapshotColumns(warnings);
     const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
     const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
     return buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable);
@@ -9637,6 +9665,7 @@ async function buildSmugMusicDiagnosticsResponse() {
   }
 
   try {
+    await ensureSmugMusicSnapshotColumns(warnings);
     const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
     const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
     response.summary.databaseConnected = true;
@@ -14135,6 +14164,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
