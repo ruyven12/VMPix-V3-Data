@@ -1679,6 +1679,46 @@ async function buildMusicPeopleResponse(payload, forceRefresh) {
   };
 }
 
+async function buildMusicPeoplePublicDbResponse() {
+  if (!String(process.env.DATABASE_URL || '').trim()) return null;
+
+  const generated = new Date();
+  const totalResult = await dbPool.query('SELECT count(*)::int AS total FROM music_people');
+  const total = toIntegerCount(totalResult.rows && totalResult.rows[0] && totalResult.rows[0].total);
+  const result = await dbPool.query(`
+    SELECT person_id, name, category, aliases, bands, associations, stats
+    FROM music_people
+    ORDER BY name ASC, person_id ASC
+    LIMIT 1000
+  `);
+  const data = (result.rows || []).map(buildMusicPersonDbApiItem);
+
+  return {
+    ok: true,
+    generatedAt: generated.toISOString(),
+    generatedTime: formatEasternGeneratedTime(generated),
+    route: '/api/music/people',
+    source: {
+      name: 'Music-People',
+      type: 'postgres',
+      table: 'music_people'
+    },
+    stats: {
+      peopleTotal: total,
+      people_count: total,
+      artist_count: total,
+      band_count: 0,
+      photo_count: 0,
+      event_count: 0,
+      show_count: 0,
+      set_count: 0,
+      venue_count: 0
+    },
+    count: data.length,
+    total,
+    data
+  };
+}
 function buildMusicVenueSheetItem(row) {
   const item = { ...(row || {}) };
   addMusicCanonicalAliases(item, {
@@ -14480,6 +14520,17 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
   app.get(routePath, async (req, res) => {
     try {
       const forceRefresh = req.query.refresh === '1';
+      if (routePath === '/api/music/people' && !forceRefresh) {
+        try {
+          const dbPeopleResponse = await buildMusicPeoplePublicDbResponse();
+          if (dbPeopleResponse) {
+            res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
+            return res.json(dbPeopleResponse);
+          }
+        } catch (dbErr) {
+          console.warn('Music-People public DB response failed; falling back to sheet route:', getSafeErrorMessage(dbErr));
+        }
+      }
       const payload = await fetchCsvForRoute(routePath, cfg, forceRefresh);
       res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
       if (routePath === '/api/music/bands') {
@@ -14532,6 +14583,8 @@ async function startServer() {
 }
 
 startServer();
+
+
 
 
 
