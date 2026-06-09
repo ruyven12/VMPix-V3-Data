@@ -724,13 +724,18 @@ function getMusicBandSmugTarget(row) {
   return { region, folder };
 }
 
-function buildMusicBandAlbumsEndpoint(target) {
-  const path = ['Music', 'Archives', 'Bands', target.region, target.folder]
+function buildMusicBandFolderPath(target) {
+  return ['Music', 'Archives', 'Bands', target.region, target.folder]
     .map((segment) => encodeURIComponent(segment))
     .join('/');
-  return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!albums?_accept=application/json`;
 }
 
+function buildMusicBandFolderEndpoint(target) {
+  return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${buildMusicBandFolderPath(target)}?_accept=application/json`;
+}
+function buildMusicBandAlbumsEndpoint(target) {
+  return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${buildMusicBandFolderPath(target)}!albums?_accept=application/json`;
+}
 function buildMusicBandParentAlbumsEndpoint(target) {
   const path = ['Music', 'Archives', 'Bands', target.region]
     .map((segment) => encodeURIComponent(segment))
@@ -9779,6 +9784,76 @@ function getSmugAlbumIds(albums) {
   return ids;
 }
 
+function getSmugFolderObject(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const folder = resp && (resp.Folder || resp.folder || resp);
+  return folder && typeof folder === 'object' ? folder : null;
+}
+
+function getSmugFolderUri(folder) {
+  const candidates = [
+    folder && folder.Uri,
+    folder && folder.URI,
+    folder && folder.Url,
+    folder && folder.URL,
+    folder && folder.WebUri,
+    folder && folder.WebURL,
+    folder && folder.Uris && folder.Uris.Folder && folder.Uris.Folder.Uri,
+    folder && folder.Uris && folder.Uris.Folder && folder.Uris.Folder.URI,
+    folder && folder.Uris && folder.Uris.Folder && folder.Uris.Folder.Url,
+    folder && folder.Uris && folder.Uris.Folder && folder.Uris.Folder.URL
+  ];
+  return String(candidates.find((value) => String(value || '').trim()) || '').trim();
+}
+
+function getSmugFolderKey(folder) {
+  const candidates = [
+    folder && folder.FolderKey,
+    folder && folder.folderKey,
+    folder && folder.Key,
+    folder && folder.key
+  ];
+  const direct = String(candidates.find((value) => String(value || '').trim()) || '').trim();
+  if (direct) return direct;
+
+  const uri = getSmugFolderUri(folder);
+  const match = uri.match(/\/folder\/([^/?#]+)/i);
+  return match && match[1] ? String(match[1]).trim() : '';
+}
+
+function buildSmugMusicBandFolderDiagnostic(row, target, status, folderMeta, extra = {}) {
+  const folder = folderMeta && folderMeta.folder ? folderMeta.folder : null;
+  const folderExists = !!(folderMeta && folderMeta.exists);
+  return {
+    band_id: row.band_id || '',
+    band: row.band || '',
+    region: row.region || '',
+    smug_folder: row.smug_folder || '',
+    gallery_id: buildSmugMusicBandGalleryId(target),
+    path_attempted: buildSmugMusicBandGalleryId(target),
+    folderExists,
+    folderUri: folder ? getSmugFolderUri(folder) : '',
+    folderKey: folder ? getSmugFolderKey(folder) : '',
+    childAlbumsAttempted: !!extra.childAlbumsAttempted,
+    childAlbumCount: extra.childAlbumCount == null ? null : toIntegerCount(extra.childAlbumCount),
+    status,
+    message: extra.message || '',
+    diagnostic_slug_candidate: slugifyMusicBandId(row.band || '')
+  };
+}
+
+async function resolveMusicBandFolderMetadata(target) {
+  try {
+    const json = await fetchSmugJson(buildMusicBandFolderEndpoint(target));
+    const folder = getSmugFolderObject(json);
+    return { exists: !!folder, folder, status: folder ? 'folder_exists' : 'folder_not_found', error: null };
+  } catch (err) {
+    if (isSmugHttpStatusError(err, 404)) {
+      return { exists: false, folder: null, status: 'folder_not_found', error: err };
+    }
+    throw err;
+  }
+}
 function isSmugHttpStatusError(err, status) {
   const message = err && err.message ? err.message : String(err || '');
   return new RegExp(`HTTP\\s+${status}(\\D|$)`, 'i').test(message);
@@ -9866,7 +9941,7 @@ async function getSmugMusicBandDiscoverCandidates(limit, refresh) {
     where.push(`(
       smug_last_synced_at IS NULL
       OR trim(coalesce(smug_sync_status, '')) = ''
-      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unmatched', 'duplicate_match', 'duplicate_direct_album', 'missing_region', 'missing_smug_folder')
+      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unmatched', 'folder_not_found', 'folder_exists_no_child_albums', 'duplicate_match', 'duplicate_direct_album', 'missing_region', 'missing_smug_folder')
     )`);
   }
 
@@ -9988,73 +10063,63 @@ async function discoverSmugMusicBand(row) {
   }
 
   const galleryId = buildSmugMusicBandGalleryId(target);
-  let albums = [];
-  let folderLookupError = null;
+  const folderMeta = await resolveMusicBandFolderMetadata(target);
 
-  try {
-    const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
-    albums = getSmugAlbums(json);
-  } catch (err) {
-    folderLookupError = err;
-    if (!isSmugHttpStatusError(err, 404)) throw err;
-  }
-
-  if (!albums.length && folderLookupError && isSmugHttpStatusError(folderLookupError, 404)) {
-    const directAlbums = await resolveDirectMusicBandAlbum(target);
-    if (directAlbums.length) {
-      const albumIds = getSmugAlbumIds(directAlbums);
-      const photoCount = await sumSmugAlbumImageCounts(directAlbums);
-      const coverImageUrl = directAlbums.map(getSmugAlbumCoverImageUrl).find(Boolean) || row.cover_image_url || row.logo_url || null;
-      const duplicateDirectMatch = directAlbums.length > 1;
-      const updated = await updateSmugMusicBandSnapshot(row, {
-        gallery_id: galleryId,
-        album_id: albumIds.join(';') || null,
-        cover_image_url: coverImageUrl,
-        photo_count: photoCount == null ? 0 : photoCount,
-        smug_sync_status: duplicateDirectMatch ? 'duplicate_direct_album' : 'matched_direct_album',
-        smug_sync_error: duplicateDirectMatch ? `Multiple direct SmugMug album matches found for ${galleryId}.` : null
-      });
-
-      return {
-        status: duplicateDirectMatch ? 'duplicate_direct_album' : 'matched_direct_album',
-        updated,
-        diagnostic: duplicateDirectMatch ? buildSmugMusicBandDuplicateSample(row, directAlbums) : {
-          band_id: row.band_id || '',
-          band: row.band || '',
-          region: row.region || '',
-          smug_folder: row.smug_folder || '',
-          gallery_id: galleryId,
-          album_id: albumIds.join(';') || null,
-          match_method: 'direct_album_parent_lookup'
-        }
-      };
-    }
-  }
-
-  if (!albums.length) {
+  if (!folderMeta.exists) {
+    const message = folderMeta.error
+      ? `SmugMug folder not found for ${galleryId}: ${getSafeErrorMessage(folderMeta.error)}`
+      : `SmugMug folder not found for ${galleryId}.`;
     const updated = await updateSmugMusicBandSnapshot(row, {
       gallery_id: galleryId,
       album_id: null,
       cover_image_url: row.cover_image_url || row.logo_url || null,
       photo_count: 0,
-      smug_sync_status: 'unmatched',
-      smug_sync_error: folderLookupError && isSmugHttpStatusError(folderLookupError, 404)
-        ? `No child albums or direct SmugMug album found for ${galleryId}.`
-        : `No SmugMug albums found for ${galleryId}.`
+      smug_sync_status: 'folder_not_found',
+      smug_sync_error: message
     });
+
     return {
-      status: 'unmatched',
+      status: 'folder_not_found',
       updated,
-      diagnostic: {
-        band_id: row.band_id || '',
-        band: row.band || '',
-        region: row.region || '',
-        smug_folder: row.smug_folder || '',
-        gallery_id: galleryId,
-        diagnostic_slug_candidate: slugifyMusicBandId(row.band || ''),
-        child_albums_endpoint_404: !!(folderLookupError && isSmugHttpStatusError(folderLookupError, 404)),
-        direct_album_lookup_attempted: !!(folderLookupError && isSmugHttpStatusError(folderLookupError, 404))
-      }
+      diagnostic: buildSmugMusicBandFolderDiagnostic(row, target, 'folder_not_found', folderMeta, {
+        childAlbumsAttempted: false,
+        childAlbumCount: null,
+        message
+      })
+    };
+  }
+
+  let albums = [];
+  let childAlbumsError = null;
+
+  try {
+    const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
+    albums = getSmugAlbums(json);
+  } catch (err) {
+    childAlbumsError = err;
+  }
+
+  if (!albums.length) {
+    const message = childAlbumsError
+      ? `SmugMug folder exists but child albums lookup failed for ${galleryId}: ${getSafeErrorMessage(childAlbumsError)}`
+      : `SmugMug folder exists but returned no child albums for ${galleryId}.`;
+    const updated = await updateSmugMusicBandSnapshot(row, {
+      gallery_id: galleryId,
+      album_id: null,
+      cover_image_url: row.cover_image_url || row.logo_url || null,
+      photo_count: 0,
+      smug_sync_status: 'folder_exists_no_child_albums',
+      smug_sync_error: message
+    });
+
+    return {
+      status: 'folder_exists_no_child_albums',
+      updated,
+      diagnostic: buildSmugMusicBandFolderDiagnostic(row, target, 'folder_exists_no_child_albums', folderMeta, {
+        childAlbumsAttempted: true,
+        childAlbumCount: childAlbumsError ? null : albums.length,
+        message
+      })
     };
   }
 
@@ -10146,6 +10211,8 @@ async function runSmugMusicBandDiscover(query = {}) {
   const missingRegion = await getSmugMusicBandMissingRegionDiagnostics();
   const candidates = await getSmugMusicBandDiscoverCandidates(limit, refresh);
   const unmatchedBands = [];
+  const folderNotFoundBands = [];
+  const folderExistsNoChildAlbums = [];
   const duplicateMatches = [];
   const failures = [];
   const updatedItems = [];
@@ -10154,6 +10221,8 @@ async function runSmugMusicBandDiscover(query = {}) {
     attempted: 0,
     matched: 0,
     unmatched: 0,
+    folderNotFound: 0,
+    folderExistsNoChildAlbums: 0,
     duplicateMatches: 0,
     failed: 0,
     recordsUpdated: 0
@@ -10176,6 +10245,16 @@ async function runSmugMusicBandDiscover(query = {}) {
       if (result.status === 'unmatched') {
         counters.unmatched += 1;
         if (result.diagnostic) unmatchedBands.push(result.diagnostic);
+      }
+      if (result.status === 'folder_not_found') {
+        counters.unmatched += 1;
+        counters.folderNotFound += 1;
+        if (result.diagnostic) folderNotFoundBands.push(result.diagnostic);
+      }
+      if (result.status === 'folder_exists_no_child_albums') {
+        counters.unmatched += 1;
+        counters.folderExistsNoChildAlbums += 1;
+        if (result.diagnostic) folderExistsNoChildAlbums.push(result.diagnostic);
       }
       return result;
     } catch (err) {
@@ -10211,6 +10290,8 @@ async function runSmugMusicBandDiscover(query = {}) {
     attempted: counters.attempted,
     matched: counters.matched,
     unmatched: counters.unmatched,
+    folderNotFound: counters.folderNotFound,
+    folderExistsNoChildAlbums: counters.folderExistsNoChildAlbums,
     duplicateMatches: counters.duplicateMatches,
     failed: counters.failed,
     recordsUpdated: counters.recordsUpdated,
@@ -10218,6 +10299,8 @@ async function runSmugMusicBandDiscover(query = {}) {
       recordsUpdated: counters.recordsUpdated,
       matched: counters.matched,
       unmatched: counters.unmatched,
+      folderNotFound: counters.folderNotFound,
+      folderExistsNoChildAlbums: counters.folderExistsNoChildAlbums,
       duplicateMatches: counters.duplicateMatches,
       missingSmugFolder: missingSmugFolder.count,
       missingRegion: missingRegion.count,
@@ -10228,6 +10311,8 @@ async function runSmugMusicBandDiscover(query = {}) {
       missingSmugFolder,
       missingRegion,
       unmatchedBands: unmatchedBands.slice(0, 25),
+      folderNotFoundBands: folderNotFoundBands.slice(0, 25),
+      folderExistsNoChildAlbums: folderExistsNoChildAlbums.slice(0, 25),
       duplicateMatches: duplicateMatches.slice(0, 25),
       failures: failures.slice(0, 25)
     },
@@ -14447,6 +14532,11 @@ async function startServer() {
 }
 
 startServer();
+
+
+
+
+
 
 
 
