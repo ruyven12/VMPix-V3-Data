@@ -3767,7 +3767,7 @@ function buildMusicBandDbApiItem(row) {
     stats
   };
   addMusicCanonicalAliases(item, {
-    photo_count: stats.photo_count,
+    photo_count: row.photo_count != null ? toIntegerCount(row.photo_count) : stats.photo_count,
     set_count: stats.set_count,
     member_count: members.length,
     gallery_id: galleryId,
@@ -4146,7 +4146,7 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     band_count: bands.length,
     artist_count: bands.length,
     venue_count: venueId ? 1 : 0,
-    photo_count: getMusicStatsNumber(stats, ['photo_count', 'photoCount', 'totalPhotos']),
+    photo_count: row.photo_count != null ? toIntegerCount(row.photo_count) : getMusicStatsNumber(stats, ['photo_count', 'photoCount', 'totalPhotos']),
     set_count: getMusicStatsNumber(stats, ['set_count', 'setCount'])
   });
 
@@ -4172,7 +4172,7 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     band_count: bands.length,
     artist_count: bands.length,
     venue_count: venueId ? 1 : 0,
-    photo_count: stats.photo_count,
+    photo_count: row.photo_count != null ? toIntegerCount(row.photo_count) : stats.photo_count,
     set_count: stats.set_count,
     gallery_id: row.gallery_id || row.gallery || row.smug_folder || row.smugmug_gallery,
     album_id: row.album_id || row.album || row.smugmug_album,
@@ -4303,7 +4303,7 @@ async function handleMusicShowsDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT show_id, name, venue_id, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats
+      `SELECT show_id, name, venue_id, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
        FROM music_shows
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -10146,6 +10146,442 @@ async function handleSmugMusicBandDiscoverRequest(req, res) {
     return res.status(500).json(errorResponse);
   }
 }
+const SMUG_MUSIC_SHOW_RESOLVE_DEFAULT_LIMIT = 25;
+const SMUG_MUSIC_SHOW_RESOLVE_MAX_LIMIT = 100;
+
+function getSmugMusicShowResolveLimit(value) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isFinite(parsed)) return SMUG_MUSIC_SHOW_RESOLVE_DEFAULT_LIMIT;
+  return Math.min(SMUG_MUSIC_SHOW_RESOLVE_MAX_LIMIT, Math.max(1, parsed));
+}
+
+function extractSmugImageKeyFromUrl(url) {
+  const clean = String(url || '').trim();
+  if (!clean) return '';
+
+  const direct = clean.match(/\b\/i-([A-Za-z0-9]+)\b/i);
+  if (direct && direct[1]) return String(direct[1]).trim();
+
+  const fileStyle = clean.match(/\/([A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
+  if (fileStyle && fileStyle[1]) return String(fileStyle[1]).trim();
+
+  const segmentStyle = clean.match(/\/\d+-([A-Za-z0-9]+)(?:\/|$)/i);
+  if (segmentStyle && segmentStyle[1]) return String(segmentStyle[1]).trim();
+
+  return '';
+}
+
+function extractSmugAlbumKeyFromImageDetail(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const img = resp && (resp.Image || resp.image || resp);
+  if (!img || typeof img !== 'object') return '';
+
+  if (img.AlbumKey) return String(img.AlbumKey).trim();
+  if (img.albumKey) return String(img.albumKey).trim();
+  if (img.Album && img.Album.AlbumKey) return String(img.Album.AlbumKey).trim();
+  if (img.album && img.album.albumKey) return String(img.album.albumKey).trim();
+
+  const directUri =
+    (img.Uris && img.Uris.Album && (img.Uris.Album.Uri || img.Uris.Album.URI || img.Uris.Album.Url || img.Uris.Album.URL)) ||
+    img.AlbumUri ||
+    img.AlbumUrl ||
+    img.AlbumURL ||
+    '';
+  const directMatch = String(directUri || '').match(/\/album\/([^/?#]+)/i);
+  if (directMatch && directMatch[1]) return String(directMatch[1]).trim();
+
+  try {
+    const stack = [resp, img, img.Uris].filter((node) => node && typeof node === 'object');
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
+      seen.add(cur);
+
+      const directKey = cur.AlbumKey || cur.albumKey || '';
+      if (typeof directKey === 'string' && directKey.trim()) return directKey.trim();
+
+      const uriCandidates = [cur.Uri, cur.URI, cur.Url, cur.URL, cur.AlbumUri, cur.AlbumURL, cur.AlbumUrl];
+      for (const candidate of uriCandidates) {
+        const match = String(candidate || '').match(/\/album\/([^/?#]+)/i);
+        if (match && match[1]) return String(match[1]).trim();
+      }
+
+      Object.values(cur).forEach((value) => {
+        if (value && typeof value === 'object') stack.push(value);
+      });
+    }
+  } catch (_) {
+    return '';
+  }
+
+  return '';
+}
+
+function getSmugMusicShowRawField(row, key) {
+  const raw = row && row.raw_sheet && typeof row.raw_sheet === 'object' ? row.raw_sheet : {};
+  return String(raw[key] || '').trim();
+}
+
+function getSmugMusicShowSourceUrl(row) {
+  const candidates = [
+    row && row.show_url,
+    row && row.poster_url,
+    row && row.poster,
+    getSmugMusicShowRawField(row, 'show_url'),
+    getSmugMusicShowRawField(row, 'showurl'),
+    getSmugMusicShowRawField(row, 'poster_url'),
+    getSmugMusicShowRawField(row, 'posterurl'),
+    getSmugMusicShowRawField(row, 'poster')
+  ];
+
+  for (const candidate of candidates) {
+    const clean = String(candidate || '').trim();
+    if (clean) return clean;
+  }
+
+  return '';
+}
+
+function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
+  const sourceUrl = getSmugMusicShowSourceUrl(row);
+  return {
+    show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
+    name: row && row.name ? row.name : '',
+    date: row && row.date ? row.date : '',
+    poster: row && row.poster ? row.poster : '',
+    source_url: sourceUrl,
+    image_key: extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '',
+    album_id: extra.album_id || '',
+    status,
+    message: extra.message || ''
+  };
+}
+
+async function getSmugMusicShowResolveCandidates(limit, refresh) {
+  const sourceWhere = `(
+    trim(coalesce(poster, '')) <> ''
+    OR trim(coalesce(raw_sheet->>'show_url', '')) <> ''
+    OR trim(coalesce(raw_sheet->>'showurl', '')) <> ''
+    OR trim(coalesce(raw_sheet->>'poster_url', '')) <> ''
+    OR trim(coalesce(raw_sheet->>'posterurl', '')) <> ''
+    OR trim(coalesce(raw_sheet->>'poster', '')) <> ''
+  )`;
+  const where = [sourceWhere];
+
+  if (!refresh) {
+    where.push(`(
+      smug_last_synced_at IS NULL
+      OR trim(coalesce(smug_sync_status, '')) = ''
+      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unresolved', 'missing_media', 'no_image_key', 'no_album_key')
+    )`);
+  }
+
+  return dbPool.query(`
+    SELECT id, show_id, name, date, poster, raw_sheet, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
+    FROM music_shows
+    WHERE ${where.join(' AND ')}
+    ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+    LIMIT $1
+  `, [limit]);
+}
+
+async function getSmugMusicShowMissingSourceDiagnostics() {
+  const missingWhere = `
+    trim(coalesce(poster, '')) = ''
+    AND trim(coalesce(raw_sheet->>'show_url', '')) = ''
+    AND trim(coalesce(raw_sheet->>'showurl', '')) = ''
+    AND trim(coalesce(raw_sheet->>'poster_url', '')) = ''
+    AND trim(coalesce(raw_sheet->>'posterurl', '')) = ''
+    AND trim(coalesce(raw_sheet->>'poster', '')) = ''
+  `;
+  const countResult = await dbPool.query(`SELECT count(*)::int AS count FROM music_shows WHERE ${missingWhere}`);
+  const sampleResult = await dbPool.query(`
+    SELECT show_id, name, date, poster, raw_sheet->>'show_url' AS show_url, raw_sheet->>'poster_url' AS poster_url
+    FROM music_shows
+    WHERE ${missingWhere}
+    ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+    LIMIT 25
+  `);
+  return {
+    count: toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].count),
+    samples: sampleResult.rows || []
+  };
+}
+
+async function updateSmugMusicShowSnapshot(row, snapshot) {
+  const result = await dbPool.query(`
+    UPDATE music_shows
+    SET gallery_id = $2,
+        album_id = $3,
+        cover_image_url = $4,
+        photo_count = $5,
+        smug_last_synced_at = NOW(),
+        smug_sync_status = $6,
+        smug_sync_error = $7,
+        updated_at = NOW()
+    WHERE id = $1
+    RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+  `, [
+    row.id,
+    snapshot.gallery_id || null,
+    snapshot.album_id || null,
+    snapshot.cover_image_url || null,
+    toIntegerCount(snapshot.photo_count),
+    snapshot.smug_sync_status || 'synced',
+    snapshot.smug_sync_error || null
+  ]);
+  return result.rows && result.rows[0] ? result.rows[0] : null;
+}
+
+async function updateSmugMusicShowSyncError(row, status, error) {
+  const result = await dbPool.query(`
+    UPDATE music_shows
+    SET smug_last_synced_at = NOW(),
+        smug_sync_status = $2,
+        smug_sync_error = $3,
+        updated_at = NOW()
+    WHERE id = $1
+    RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+  `, [
+    row.id,
+    status || 'error',
+    getSafeErrorMessage(error)
+  ]);
+  return result.rows && result.rows[0] ? result.rows[0] : null;
+}
+
+async function resolveSmugMusicShowAlbum(row) {
+  const sourceUrl = getSmugMusicShowSourceUrl(row);
+  if (!sourceUrl) {
+    const updated = await updateSmugMusicShowSyncError(row, 'missing_media', new Error('Missing show_url/poster_url source.'));
+    return { status: 'missing_media', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'missing_media') };
+  }
+
+  const imageKey = extractSmugImageKeyFromUrl(sourceUrl);
+  if (!imageKey) {
+    const updated = await updateSmugMusicShowSyncError(row, 'no_image_key', new Error('Unable to extract SmugMug ImageKey from show_url/poster_url.'));
+    return { status: 'no_image_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_image_key') };
+  }
+
+  const imageJson = await fetchSmugJson(`/image/${encodeURIComponent(imageKey)}-0?_accept=application/json&_verbosity=1&_expand=Image`);
+  const albumKey = extractSmugAlbumKeyFromImageDetail(imageJson);
+  if (!albumKey) {
+    const updated = await updateSmugMusicShowSyncError(row, 'no_album_key', new Error('SmugMug image detail did not include a parent AlbumKey.'));
+    return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { image_key: imageKey }) };
+  }
+
+  const photoCount = await getSmugAlbumTotalPhotos({ AlbumKey: albumKey });
+  const updated = await updateSmugMusicShowSnapshot(row, {
+    gallery_id: albumKey,
+    album_id: albumKey,
+    cover_image_url: sourceUrl,
+    photo_count: photoCount == null ? 0 : photoCount,
+    smug_sync_status: 'synced',
+    smug_sync_error: null
+  });
+
+  return {
+    status: 'synced',
+    updated,
+    diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'synced', { image_key: imageKey, album_id: albumKey })
+  };
+}
+
+function buildSmugMusicShowResolveResultItem(row) {
+  return {
+    show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
+    name: row && row.name ? row.name : '',
+    date: row && row.date ? row.date : '',
+    gallery_id: row && row.gallery_id ? row.gallery_id : null,
+    album_id: row && row.album_id ? row.album_id : null,
+    cover_image_url: row && row.cover_image_url ? row.cover_image_url : null,
+    photo_count: toIntegerCount(row && row.photo_count),
+    smug_last_synced_at: row && row.smug_last_synced_at ? new Date(row.smug_last_synced_at).toISOString() : null,
+    smug_sync_status: row && row.smug_sync_status ? row.smug_sync_status : ''
+  };
+}
+
+async function runSmugMusicShowResolve(query = {}) {
+  const generated = new Date();
+  const refresh = query.refresh === '1' || query.force === '1';
+  const limit = getSmugMusicShowResolveLimit(query.limit);
+  const warnings = [];
+  const config = getSmugMugConfigDiagnostics();
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    return buildAdminResponse({
+      ok: false,
+      route: '/admin/smug/music/shows/resolve',
+      generated,
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_show_album_resolution',
+      error: 'DATABASE_NOT_CONFIGURED',
+      message: 'DATABASE_URL is required for SmugMug show album resolution.',
+      warnings
+    });
+  }
+
+  if (!config.configured) {
+    return buildAdminResponse({
+      ok: false,
+      route: '/admin/smug/music/shows/resolve',
+      generated,
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_show_album_resolution',
+      error: 'SMUGMUG_NOT_CONFIGURED',
+      message: 'SMUG_API_KEY and SMUG_NICKNAME are required for SmugMug show album resolution.',
+      missing: config.missing,
+      warnings
+    });
+  }
+
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+  if (!snapshotFields.present) {
+    return buildAdminResponse({
+      ok: false,
+      route: '/admin/smug/music/shows/resolve',
+      generated,
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_show_album_resolution',
+      error: 'SNAPSHOT_FIELDS_MISSING',
+      message: 'Music show SmugMug snapshot fields are missing. Restart/deploy so schema.sql can apply.',
+      snapshotFields,
+      warnings
+    });
+  }
+
+  const missingSource = await getSmugMusicShowMissingSourceDiagnostics();
+  const candidates = await getSmugMusicShowResolveCandidates(limit, refresh);
+  const unresolvedShows = [];
+  const failures = [];
+  const updatedItems = [];
+  const counters = {
+    scanned: candidates.rows.length,
+    attempted: 0,
+    resolved: 0,
+    unresolved: 0,
+    failed: 0,
+    recordsUpdated: 0
+  };
+
+  await mapWithConcurrency(candidates.rows, SMUG_REQUEST_CONCURRENCY, async (row) => {
+    counters.attempted += 1;
+    try {
+      const result = await resolveSmugMusicShowAlbum(row);
+      if (result.updated) {
+        counters.recordsUpdated += 1;
+        updatedItems.push(buildSmugMusicShowResolveResultItem(result.updated));
+      }
+      if (result.status === 'synced') counters.resolved += 1;
+      if (result.status !== 'synced') {
+        counters.unresolved += 1;
+        unresolvedShows.push(result.diagnostic || buildSmugMusicShowResolveDiagnostic(row, result.status));
+      }
+    } catch (err) {
+      counters.failed += 1;
+      const updated = await updateSmugMusicShowSyncError(row, 'error', err);
+      if (updated) {
+        counters.recordsUpdated += 1;
+        updatedItems.push(buildSmugMusicShowResolveResultItem(updated));
+      }
+      failures.push(buildSmugMusicShowResolveDiagnostic(row, 'error', { message: getSafeErrorMessage(err) }));
+    }
+  });
+
+  return buildAdminResponse({
+    route: '/admin/smug/music/shows/resolve',
+    generated,
+    source: 'smugmug',
+    section: 'music',
+    type: 'smug_show_album_resolution',
+    refresh,
+    limit,
+    summary: {
+      showsScanned: counters.scanned,
+      showsAttempted: counters.attempted,
+      showsResolved: counters.resolved,
+      showsUnresolved: counters.unresolved,
+      failures: counters.failed,
+      recordsUpdated: counters.recordsUpdated,
+      missingSource: missingSource.count
+    },
+    showsResolved: counters.resolved,
+    showsUnresolved: counters.unresolved,
+    recordsUpdated: counters.recordsUpdated,
+    diagnostics: {
+      missingSource,
+      unresolvedShows: unresolvedShows.slice(0, 25),
+      failures: failures.slice(0, 25)
+    },
+    updatedItems: updatedItems.slice(0, 25),
+    resultCount: updatedItems.length,
+    warnings
+  });
+}
+
+async function handleSmugMusicShowResolveRequest(req, res) {
+  let importLock = null;
+  try {
+    const config = getSmugMugConfigDiagnostics();
+    if (!String(process.env.DATABASE_URL || '').trim() || !config.configured) {
+      const response = await runSmugMusicShowResolve(req.query || {});
+      return res.status(response.ok ? 200 : 400).json(response);
+    }
+
+    const lockAttempt = await acquireImportLock({
+      section: 'music',
+      category: 'smug_shows_resolve',
+      owner: getImportLockOwner(),
+      meta: {
+        route: '/admin/smug/music/shows/resolve',
+        refresh: req.query && req.query.refresh === '1'
+      }
+    });
+
+    if (lockAttempt && lockAttempt.acquired === false) {
+      return res.status(409).json(buildAdminResponse({
+        ok: false,
+        route: '/admin/smug/music/shows/resolve',
+        source: 'smugmug',
+        section: 'music',
+        type: 'smug_show_album_resolution',
+        locked: true,
+        message: 'Import already running',
+        lock: lockAttempt.lock
+      }));
+    }
+
+    importLock = lockAttempt && lockAttempt.lock ? lockAttempt.lock : null;
+    const response = await runSmugMusicShowResolve(req.query || {});
+    const released = await releaseImportLock(importLock && importLock.id, response.ok ? 'completed' : 'failed', {
+      completedAt: new Date().toISOString(),
+      status: response.ok ? 'completed' : 'failed',
+      route: '/admin/smug/music/shows/resolve',
+      recordsUpdated: response.recordsUpdated || 0
+    });
+    if (released) response.importLock = released;
+    return res.status(response.ok ? 200 : 400).json(response);
+  } catch (err) {
+    const released = await releaseImportLock(importLock && importLock.id, 'failed', {
+      completedAt: new Date().toISOString(),
+      status: 'failed',
+      error: getSafeErrorMessage(err),
+      route: '/admin/smug/music/shows/resolve'
+    });
+    const errorResponse = buildAdminError('/admin/smug/music/shows/resolve', err, {
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_show_album_resolution',
+      error: 'SMUG_SHOW_RESOLUTION_ERROR'
+    });
+    if (released) errorResponse.importLock = released;
+    return res.status(500).json(errorResponse);
+  }
+}
 function normalizeAdminHealth({ diagnostics, importHealth, lockHealth, relationshipHealth, statsHealth, warnings } = {}) {
   const warningCount = Array.isArray(warnings) ? warnings.length : 0;
   const diagnosticsSummary = diagnostics && diagnostics.summary ? diagnostics.summary : {};
@@ -13315,6 +13751,9 @@ app.get('/api/admin/diagnostics/wrestling/relationships', async (req, res) => {
 app.get('/admin/smug/music/bands/discover', async (req, res) => {
   return handleSmugMusicBandDiscoverRequest(req, res);
 });
+app.get('/admin/smug/music/shows/resolve', async (req, res) => {
+  return handleSmugMusicShowResolveRequest(req, res);
+});
 app.get('/admin/smug/music/config', async (req, res) => {
   try {
     res.json(await buildSmugMusicConfigResponse());
@@ -13674,6 +14113,9 @@ async function startServer() {
 }
 
 startServer();
+
+
+
 
 
 
