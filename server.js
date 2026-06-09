@@ -9654,6 +9654,498 @@ async function buildSmugMusicDiagnosticsResponse() {
   response.warnings = warnings;
   return response;
 }
+const SMUG_MUSIC_BAND_DISCOVER_DEFAULT_LIMIT = 25;
+const SMUG_MUSIC_BAND_DISCOVER_MAX_LIMIT = 100;
+
+function getSmugMusicBandDiscoverLimit(value) {
+  const limit = Number(String(value || '').trim());
+  if (!Number.isInteger(limit)) return SMUG_MUSIC_BAND_DISCOVER_DEFAULT_LIMIT;
+  return Math.min(SMUG_MUSIC_BAND_DISCOVER_MAX_LIMIT, Math.max(1, limit));
+}
+
+function buildSmugMusicBandGalleryId(target) {
+  if (!target) return '';
+  return ['Music', 'Archives', 'Bands', target.region, target.folder].join('/');
+}
+
+function getSmugAlbumTitle(album) {
+  const keys = ['Title', 'Name', 'NiceName', 'AlbumName', 'title', 'name', 'niceName', 'albumName'];
+  for (const key of keys) {
+    const value = String(album && album[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function isLikelySmugImageUrl(value) {
+  const text = String(value || '').trim();
+  if (!/^https?:\/\//i.test(text)) return false;
+  if (/\.(jpe?g|png|webp)(\?|#|$)/i.test(text)) return true;
+  return /photos\.smugmug\.com/i.test(text) && !/\/browse\//i.test(text);
+}
+
+function getSmugImageUrlFromObject(source, depth = 0) {
+  if (!source || typeof source !== 'object' || depth > 3) return '';
+
+  const preferredKeys = [
+    'ThumbnailUrl', 'thumbnailUrl', 'TinyUrl', 'tinyUrl', 'SmallUrl', 'smallUrl',
+    'MediumUrl', 'mediumUrl', 'LargeUrl', 'largeUrl', 'XLargeUrl', 'xlargeUrl',
+    'ImageUrl', 'ImageURL', 'imageUrl', 'CoverImageUrl', 'CoverImageURL', 'coverImageUrl',
+    'OriginalUrl', 'originalUrl', 'ArchivedUri', 'ArchivedURL', 'ArchivedUrl', 'archivedUri', 'archivedUrl'
+  ];
+
+  for (const key of preferredKeys) {
+    if (isLikelySmugImageUrl(source[key])) return String(source[key]).trim();
+  }
+
+  const nestedKeys = ['HighlightImage', 'Image', 'AlbumImage', 'CoverImage', 'LargestImage', 'Uris'];
+  for (const key of nestedKeys) {
+    const nested = source[key];
+    if (Array.isArray(nested)) {
+      for (const item of nested) {
+        const url = getSmugImageUrlFromObject(item, depth + 1);
+        if (url) return url;
+      }
+    } else {
+      const url = getSmugImageUrlFromObject(nested, depth + 1);
+      if (url) return url;
+    }
+  }
+
+  for (const [key, value] of Object.entries(source)) {
+    if (/image|thumb|cover|photo|url|uri/i.test(key) && isLikelySmugImageUrl(value)) return String(value).trim();
+  }
+
+  return '';
+}
+
+function getSmugAlbumCoverImageUrl(album) {
+  return getSmugImageUrlFromObject(album);
+}
+
+function getSmugAlbumIds(albums) {
+  const ids = [];
+  (Array.isArray(albums) ? albums : []).forEach((album) => {
+    const key = getSmugAlbumKey(album);
+    if (key && !ids.includes(key)) ids.push(key);
+  });
+  return ids;
+}
+
+function buildSmugMusicBandDuplicateSample(row, albums) {
+  return {
+    band_id: row.band_id || '',
+    band: row.band || '',
+    region: row.region || '',
+    smug_folder: row.smug_folder || '',
+    diagnostic_slug_candidate: slugifyMusicBandId(row.band || ''),
+    match_count: Array.isArray(albums) ? albums.length : 0,
+    albums: (Array.isArray(albums) ? albums : []).slice(0, 10).map((album) => ({
+      album_id: getSmugAlbumKey(album),
+      title: getSmugAlbumTitle(album)
+    }))
+  };
+}
+
+async function getSmugMusicBandDiscoverCandidates(limit, refresh) {
+  const where = [
+    "trim(coalesce(smug_folder, '')) <> ''",
+    "trim(coalesce(region, '')) <> ''"
+  ];
+
+  if (!refresh) {
+    where.push(`(
+      smug_last_synced_at IS NULL
+      OR trim(coalesce(smug_sync_status, '')) = ''
+      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unmatched', 'duplicate_match', 'missing_region', 'missing_smug_folder')
+    )`);
+  }
+
+  const countResult = await dbPool.query(`
+    SELECT count(*)::int AS count
+    FROM music_bands
+    WHERE ${where.join(' AND ')}
+  `);
+
+  const rowsResult = await dbPool.query(`
+    SELECT id, band_id, band, region, smug_folder, logo_url, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
+    FROM music_bands
+    WHERE ${where.join(' AND ')}
+    ORDER BY band ASC, id ASC
+    LIMIT $1
+  `, [limit]);
+
+  return {
+    eligible: toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].count),
+    rows: rowsResult.rows || []
+  };
+}
+
+async function getSmugMusicBandMissingFolderDiagnostics() {
+  const countResult = await dbPool.query(`
+    SELECT count(*)::int AS count
+    FROM music_bands
+    WHERE trim(coalesce(smug_folder, '')) = ''
+  `);
+  const sampleResult = await dbPool.query(`
+    SELECT band_id, band, region, smug_folder
+    FROM music_bands
+    WHERE trim(coalesce(smug_folder, '')) = ''
+    ORDER BY band ASC, id ASC
+    LIMIT 10
+  `);
+  return {
+    count: toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].count),
+    samples: sampleResult.rows || []
+  };
+}
+
+async function getSmugMusicBandMissingRegionDiagnostics() {
+  const countResult = await dbPool.query(`
+    SELECT count(*)::int AS count
+    FROM music_bands
+    WHERE trim(coalesce(smug_folder, '')) <> ''
+      AND trim(coalesce(region, '')) = ''
+  `);
+  const sampleResult = await dbPool.query(`
+    SELECT band_id, band, region, smug_folder
+    FROM music_bands
+    WHERE trim(coalesce(smug_folder, '')) <> ''
+      AND trim(coalesce(region, '')) = ''
+    ORDER BY band ASC, id ASC
+    LIMIT 10
+  `);
+  return {
+    count: toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].count),
+    samples: sampleResult.rows || []
+  };
+}
+
+async function updateSmugMusicBandSnapshot(row, snapshot) {
+  const result = await dbPool.query(`
+    UPDATE music_bands
+    SET gallery_id = $2,
+        album_id = $3,
+        cover_image_url = $4,
+        photo_count = $5,
+        smug_last_synced_at = NOW(),
+        smug_sync_status = $6,
+        smug_sync_error = $7,
+        updated_at = NOW()
+    WHERE id = $1
+    RETURNING id, band_id, band, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+  `, [
+    row.id,
+    snapshot.gallery_id || null,
+    snapshot.album_id || null,
+    snapshot.cover_image_url || null,
+    toIntegerCount(snapshot.photo_count),
+    snapshot.smug_sync_status || 'synced',
+    snapshot.smug_sync_error || null
+  ]);
+  return result.rows && result.rows[0] ? result.rows[0] : null;
+}
+
+async function updateSmugMusicBandSyncError(row, status, error) {
+  const message = getSafeErrorMessage(error).slice(0, 500);
+  const result = await dbPool.query(`
+    UPDATE music_bands
+    SET smug_last_synced_at = NOW(),
+        smug_sync_status = $2,
+        smug_sync_error = $3,
+        updated_at = NOW()
+    WHERE id = $1
+    RETURNING id, band_id, band, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+  `, [row.id, status || 'error', message || null]);
+  return result.rows && result.rows[0] ? result.rows[0] : null;
+}
+
+async function discoverSmugMusicBand(row) {
+  const target = getMusicBandSmugTarget(row);
+  if (!target) {
+    const status = String(row.smug_folder || '').trim() ? 'missing_region' : 'missing_smug_folder';
+    const updated = await updateSmugMusicBandSyncError(row, status, new Error(`Missing ${status === 'missing_region' ? 'region' : 'smug_folder'}.`));
+    return {
+      status,
+      updated,
+      diagnostic: {
+        band_id: row.band_id || '',
+        band: row.band || '',
+        region: row.region || '',
+        smug_folder: row.smug_folder || '',
+        diagnostic_slug_candidate: slugifyMusicBandId(row.band || '')
+      }
+    };
+  }
+
+  const galleryId = buildSmugMusicBandGalleryId(target);
+  const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
+  const albums = getSmugAlbums(json);
+
+  if (!albums.length) {
+    const updated = await updateSmugMusicBandSnapshot(row, {
+      gallery_id: galleryId,
+      album_id: null,
+      cover_image_url: row.cover_image_url || row.logo_url || null,
+      photo_count: 0,
+      smug_sync_status: 'unmatched',
+      smug_sync_error: `No SmugMug albums found for ${galleryId}.`
+    });
+    return {
+      status: 'unmatched',
+      updated,
+      diagnostic: {
+        band_id: row.band_id || '',
+        band: row.band || '',
+        region: row.region || '',
+        smug_folder: row.smug_folder || '',
+        gallery_id: galleryId,
+        diagnostic_slug_candidate: slugifyMusicBandId(row.band || '')
+      }
+    };
+  }
+
+  const albumIds = getSmugAlbumIds(albums);
+  const photoCount = await sumSmugAlbumImageCounts(albums);
+  const coverImageUrl = albums.map(getSmugAlbumCoverImageUrl).find(Boolean) || row.cover_image_url || row.logo_url || null;
+  const duplicateMatch = albums.length > 1;
+  const updated = await updateSmugMusicBandSnapshot(row, {
+    gallery_id: galleryId,
+    album_id: albumIds.join(';') || null,
+    cover_image_url: coverImageUrl,
+    photo_count: photoCount == null ? 0 : photoCount,
+    smug_sync_status: duplicateMatch ? 'duplicate_match' : 'synced',
+    smug_sync_error: duplicateMatch ? `Multiple SmugMug albums found for ${galleryId}.` : null
+  });
+
+  return {
+    status: duplicateMatch ? 'duplicate_match' : 'synced',
+    updated,
+    diagnostic: duplicateMatch ? buildSmugMusicBandDuplicateSample(row, albums) : null
+  };
+}
+
+function buildSmugMusicBandDiscoverResultItem(row) {
+  return {
+    band_id: row && row.band_id ? row.band_id : '',
+    band: row && row.band ? row.band : '',
+    gallery_id: row && row.gallery_id ? row.gallery_id : null,
+    album_id: row && row.album_id ? row.album_id : null,
+    cover_image_url: row && row.cover_image_url ? row.cover_image_url : null,
+    photo_count: toIntegerCount(row && row.photo_count),
+    smug_last_synced_at: row && row.smug_last_synced_at ? new Date(row.smug_last_synced_at).toISOString() : null,
+    smug_sync_status: row && row.smug_sync_status ? row.smug_sync_status : ''
+  };
+}
+
+async function runSmugMusicBandDiscover(query = {}) {
+  const generated = new Date();
+  const refresh = query.refresh === '1' || query.force === '1';
+  const limit = getSmugMusicBandDiscoverLimit(query.limit);
+  const warnings = [];
+  const config = getSmugMugConfigDiagnostics();
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    return buildAdminResponse({
+      ok: false,
+      route: '/admin/smug/music/bands/discover',
+      generated,
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_band_discovery',
+      error: 'DATABASE_NOT_CONFIGURED',
+      message: 'DATABASE_URL is required for SmugMug band discovery.',
+      warnings
+    });
+  }
+
+  if (!config.configured) {
+    return buildAdminResponse({
+      ok: false,
+      route: '/admin/smug/music/bands/discover',
+      generated,
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_band_discovery',
+      error: 'SMUGMUG_NOT_CONFIGURED',
+      message: 'SMUG_API_KEY and SMUG_NICKNAME are required for SmugMug band discovery.',
+      missing: config.missing,
+      warnings
+    });
+  }
+
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+  if (!snapshotFields.present) {
+    return buildAdminResponse({
+      ok: false,
+      route: '/admin/smug/music/bands/discover',
+      generated,
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_band_discovery',
+      error: 'SNAPSHOT_FIELDS_MISSING',
+      message: 'Music band SmugMug snapshot fields are missing. Restart/deploy so schema.sql can apply.',
+      snapshotFields,
+      warnings
+    });
+  }
+
+  const missingSmugFolder = await getSmugMusicBandMissingFolderDiagnostics();
+  const missingRegion = await getSmugMusicBandMissingRegionDiagnostics();
+  const candidates = await getSmugMusicBandDiscoverCandidates(limit, refresh);
+  const unmatchedBands = [];
+  const duplicateMatches = [];
+  const failures = [];
+  const updatedItems = [];
+  const counters = {
+    scanned: candidates.rows.length,
+    attempted: 0,
+    matched: 0,
+    unmatched: 0,
+    duplicateMatches: 0,
+    failed: 0,
+    recordsUpdated: 0
+  };
+
+  const results = await mapWithConcurrency(candidates.rows, SMUG_REQUEST_CONCURRENCY, async (row) => {
+    counters.attempted += 1;
+    try {
+      const result = await discoverSmugMusicBand(row);
+      if (result.updated) {
+        counters.recordsUpdated += 1;
+        updatedItems.push(buildSmugMusicBandDiscoverResultItem(result.updated));
+      }
+      if (result.status === 'synced') counters.matched += 1;
+      if (result.status === 'duplicate_match') {
+        counters.matched += 1;
+        counters.duplicateMatches += 1;
+        if (result.diagnostic) duplicateMatches.push(result.diagnostic);
+      }
+      if (result.status === 'unmatched') {
+        counters.unmatched += 1;
+        if (result.diagnostic) unmatchedBands.push(result.diagnostic);
+      }
+      return result;
+    } catch (err) {
+      counters.failed += 1;
+      const updated = await updateSmugMusicBandSyncError(row, 'error', err);
+      if (updated) {
+        counters.recordsUpdated += 1;
+        updatedItems.push(buildSmugMusicBandDiscoverResultItem(updated));
+      }
+      failures.push({
+        band_id: row.band_id || '',
+        band: row.band || '',
+        region: row.region || '',
+        smug_folder: row.smug_folder || '',
+        error: getSafeErrorMessage(err),
+        diagnostic_slug_candidate: slugifyMusicBandId(row.band || '')
+      });
+      return { status: 'error', error: getSafeErrorMessage(err) };
+    }
+  });
+
+  return buildAdminResponse({
+    route: '/admin/smug/music/bands/discover',
+    generated,
+    source: 'smugmug',
+    section: 'music',
+    type: 'smug_band_discovery',
+    refresh,
+    limit,
+    concurrency: SMUG_REQUEST_CONCURRENCY,
+    eligible: candidates.eligible,
+    scanned: counters.scanned,
+    attempted: counters.attempted,
+    matched: counters.matched,
+    unmatched: counters.unmatched,
+    duplicateMatches: counters.duplicateMatches,
+    failed: counters.failed,
+    recordsUpdated: counters.recordsUpdated,
+    summary: {
+      recordsUpdated: counters.recordsUpdated,
+      matched: counters.matched,
+      unmatched: counters.unmatched,
+      duplicateMatches: counters.duplicateMatches,
+      missingSmugFolder: missingSmugFolder.count,
+      missingRegion: missingRegion.count,
+      failed: counters.failed,
+      heavyScan: false
+    },
+    diagnostics: {
+      missingSmugFolder,
+      missingRegion,
+      unmatchedBands: unmatchedBands.slice(0, 25),
+      duplicateMatches: duplicateMatches.slice(0, 25),
+      failures: failures.slice(0, 25)
+    },
+    updated: updatedItems.slice(0, 25),
+    resultCount: Array.isArray(results) ? results.length : 0,
+    warnings
+  });
+}
+
+async function handleSmugMusicBandDiscoverRequest(req, res) {
+  let importLock = null;
+  let response = null;
+
+  try {
+    const config = getSmugMugConfigDiagnostics();
+    if (!String(process.env.DATABASE_URL || '').trim() || !config.configured) {
+      response = await runSmugMusicBandDiscover(req.query || {});
+      return res.status(response.ok ? 200 : 400).json(response);
+    }
+
+    const lockAttempt = await acquireImportLock({
+      section: 'music',
+      category: 'smug_bands_discover',
+      owner: getImportLockOwner(),
+      meta: {
+        route: '/admin/smug/music/bands/discover',
+        refresh: req.query && req.query.refresh === '1'
+      }
+    });
+
+    if (lockAttempt && lockAttempt.acquired === false) {
+      return res.status(409).json(buildAdminResponse({
+        ok: false,
+        route: '/admin/smug/music/bands/discover',
+        source: 'smugmug',
+        section: 'music',
+        type: 'smug_band_discovery',
+        locked: true,
+        message: 'Import already running',
+        lock: lockAttempt.lock
+      }));
+    }
+
+    importLock = lockAttempt && lockAttempt.lock ? lockAttempt.lock : null;
+    response = await runSmugMusicBandDiscover(req.query || {});
+    const released = await releaseImportLock(importLock && importLock.id, response.ok ? 'completed' : 'failed', {
+      completedAt: new Date().toISOString(),
+      status: response.ok ? 'completed' : 'failed',
+      route: '/admin/smug/music/bands/discover',
+      recordsUpdated: response.recordsUpdated || 0
+    });
+    if (released) response.importLock = released;
+    return res.status(response.ok ? 200 : 400).json(response);
+  } catch (err) {
+    const released = await releaseImportLock(importLock && importLock.id, 'failed', {
+      completedAt: new Date().toISOString(),
+      status: 'failed',
+      error: getSafeErrorMessage(err),
+      route: '/admin/smug/music/bands/discover'
+    });
+    const errorResponse = buildAdminError('/admin/smug/music/bands/discover', err, {
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_band_discovery',
+      error: 'SMUG_BAND_DISCOVERY_ERROR'
+    });
+    if (released) errorResponse.importLock = released;
+    return res.status(500).json(errorResponse);
+  }
+}
 function normalizeAdminHealth({ diagnostics, importHealth, lockHealth, relationshipHealth, statsHealth, warnings } = {}) {
   const warningCount = Array.isArray(warnings) ? warnings.length : 0;
   const diagnosticsSummary = diagnostics && diagnostics.summary ? diagnostics.summary : {};
@@ -12820,6 +13312,9 @@ app.get('/api/admin/diagnostics/wrestling/relationships', async (req, res) => {
   return handleRelationshipDiagnosticsRequest(req, res, 'wrestling');
 });
 
+app.get('/admin/smug/music/bands/discover', async (req, res) => {
+  return handleSmugMusicBandDiscoverRequest(req, res);
+});
 app.get('/admin/smug/music/config', async (req, res) => {
   try {
     res.json(await buildSmugMusicConfigResponse());
@@ -13179,6 +13674,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
