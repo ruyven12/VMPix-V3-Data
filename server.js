@@ -13748,35 +13748,57 @@ app.get('/api/admin/diagnostics/wrestling/relationships', async (req, res) => {
   return handleRelationshipDiagnosticsRequest(req, res, 'wrestling');
 });
 
-app.get('/admin/smug/music/bands/discover', async (req, res) => {
-  return handleSmugMusicBandDiscoverRequest(req, res);
-});
-app.get('/admin/smug/music/shows/resolve', async (req, res) => {
-  return handleSmugMusicShowResolveRequest(req, res);
-});
-app.get('/admin/smug/music/config', async (req, res) => {
+async function handleSmugMusicConfigRequest(req, res) {
   try {
     res.json(await buildSmugMusicConfigResponse());
   } catch (err) {
-    res.status(500).json(buildAdminError('/admin/smug/music/config', err, {
+    res.status(500).json(buildAdminError(req.path || '/admin/smug/music/config', err, {
       source: 'server',
       section: 'music',
       type: 'smug_config'
     }));
   }
-});
+}
 
-app.get('/admin/smug/music/diagnostics', async (req, res) => {
+async function handleSmugMusicDiagnosticsRequest(req, res) {
   try {
     res.json(await buildSmugMusicDiagnosticsResponse());
   } catch (err) {
-    res.status(500).json(buildAdminError('/admin/smug/music/diagnostics', err, {
+    res.status(500).json(buildAdminError(req.path || '/admin/smug/music/diagnostics', err, {
       source: 'postgres',
       section: 'music',
       type: 'smug_diagnostics'
     }));
   }
+}
+
+app.get([
+  '/admin/smug/music/bands/discover',
+  '/admin/smug/music/discover',
+  '/api/admin/smug/music/bands/discover',
+  '/api/admin/smug/music/discover'
+], async (req, res) => {
+  return handleSmugMusicBandDiscoverRequest(req, res);
 });
+
+app.get([
+  '/admin/smug/music/shows/resolve',
+  '/admin/smug/music/resolve',
+  '/api/admin/smug/music/shows/resolve',
+  '/api/admin/smug/music/resolve'
+], async (req, res) => {
+  return handleSmugMusicShowResolveRequest(req, res);
+});
+
+app.get([
+  '/admin/smug/music/config',
+  '/api/admin/smug/music/config'
+], handleSmugMusicConfigRequest);
+
+app.get([
+  '/admin/smug/music/diagnostics',
+  '/api/admin/smug/music/diagnostics'
+], handleSmugMusicDiagnosticsRequest);
 app.get('/api/admin/stats/summary', async (req, res) => {
   return handleStatsSummaryRequest(req, res);
 });
@@ -14113,6 +14135,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
