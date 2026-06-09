@@ -10264,41 +10264,89 @@ function getSmugMusicShowRawField(row, key) {
   return String(raw[key] || '').trim();
 }
 
-function getSmugMusicShowSourceUrl(row) {
-  const candidates = [
-    row && row.show_url,
-    row && row.poster_url,
-    row && row.poster,
-    getSmugMusicShowRawField(row, 'show_url'),
-    getSmugMusicShowRawField(row, 'showurl'),
-    getSmugMusicShowRawField(row, 'poster_url'),
-    getSmugMusicShowRawField(row, 'posterurl'),
-    getSmugMusicShowRawField(row, 'poster')
-  ];
+function isSmugMusicShowLogoSourceUrl(url) {
+  const clean = String(url || '').trim();
+  if (!clean) return false;
 
-  for (const candidate of candidates) {
-    const clean = String(candidate || '').trim();
-    if (clean) return clean;
+  const lower = clean.toLowerCase();
+  let decoded = lower;
+  try {
+    decoded = decodeURIComponent(lower);
+  } catch (_) {
+    decoded = lower;
   }
 
-  return '';
+  return decoded.includes('/music/band-logos/') ||
+    decoded.includes('/band-logos/') ||
+    decoded.includes('band-logo') ||
+    decoded.includes('band_logo') ||
+    decoded.includes('logo');
+}
+
+function getSmugMusicShowSourceSelection(row) {
+  const showUrlCandidates = [
+    { field: 'show_url', url: row && row.show_url },
+    { field: 'raw_sheet.show_url', url: getSmugMusicShowRawField(row, 'show_url') },
+    { field: 'raw_sheet.showurl', url: getSmugMusicShowRawField(row, 'showurl') }
+  ];
+
+  for (const candidate of showUrlCandidates) {
+    const url = String(candidate.url || '').trim();
+    if (url) return { status: 'selected', url, field: candidate.field, skipped_url: '' };
+  }
+
+  const posterCandidates = [
+    { field: 'poster_url', url: row && row.poster_url },
+    { field: 'raw_sheet.poster_url', url: getSmugMusicShowRawField(row, 'poster_url') },
+    { field: 'raw_sheet.posterurl', url: getSmugMusicShowRawField(row, 'posterurl') },
+    { field: 'poster', url: row && row.poster },
+    { field: 'raw_sheet.poster', url: getSmugMusicShowRawField(row, 'poster') }
+  ];
+  let skippedLogoSource = null;
+
+  for (const candidate of posterCandidates) {
+    const url = String(candidate.url || '').trim();
+    if (!url) continue;
+    if (isSmugMusicShowLogoSourceUrl(url)) {
+      if (!skippedLogoSource) skippedLogoSource = { field: candidate.field, url };
+      continue;
+    }
+    return { status: 'selected', url, field: candidate.field, skipped_url: skippedLogoSource ? skippedLogoSource.url : '' };
+  }
+
+  if (skippedLogoSource) {
+    return {
+      status: 'skipped_logo_source',
+      url: '',
+      field: '',
+      skipped_url: skippedLogoSource.url,
+      skipped_field: skippedLogoSource.field
+    };
+  }
+
+  return { status: 'no_source_url', url: '', field: '', skipped_url: '' };
+}
+
+function getSmugMusicShowSourceUrl(row) {
+  return getSmugMusicShowSourceSelection(row).url;
 }
 
 function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
-  const sourceUrl = getSmugMusicShowSourceUrl(row);
+  const sourceSelection = getSmugMusicShowSourceSelection(row);
+  const sourceUrl = extra.source_url || sourceSelection.url || sourceSelection.skipped_url || '';
   return {
     show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
     name: row && row.name ? row.name : '',
     date: row && row.date ? row.date : '',
     poster: row && row.poster ? row.poster : '',
     source_url: sourceUrl,
+    source_field: extra.source_field || sourceSelection.field || sourceSelection.skipped_field || '',
     image_key: extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '',
     album_id: extra.album_id || '',
     status,
     message: extra.message || ''
   };
 }
-
 async function getSmugMusicShowResolveCandidates(limit, refresh) {
   const sourceWhere = `(
     trim(coalesce(poster, '')) <> ''
@@ -10314,7 +10362,7 @@ async function getSmugMusicShowResolveCandidates(limit, refresh) {
     where.push(`(
       smug_last_synced_at IS NULL
       OR trim(coalesce(smug_sync_status, '')) = ''
-      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unresolved', 'missing_media', 'no_image_key', 'no_album_key')
+      OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unresolved', 'missing_media', 'no_source_url', 'no_image_key', 'no_album_key')
     )`);
   }
 
@@ -10393,23 +10441,38 @@ async function updateSmugMusicShowSyncError(row, status, error) {
 }
 
 async function resolveSmugMusicShowAlbum(row) {
-  const sourceUrl = getSmugMusicShowSourceUrl(row);
-  if (!sourceUrl) {
-    const updated = await updateSmugMusicShowSyncError(row, 'missing_media', new Error('Missing show_url/poster_url source.'));
-    return { status: 'missing_media', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'missing_media') };
+  const sourceSelection = getSmugMusicShowSourceSelection(row);
+
+  if (sourceSelection.status === 'skipped_logo_source') {
+    const updated = await updateSmugMusicShowSyncError(row, 'skipped_logo_source', new Error('Skipped logo-style poster source; show_url is required for direct album resolution.'));
+    return {
+      status: 'skipped_logo_source',
+      updated,
+      diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'skipped_logo_source', {
+        source_url: sourceSelection.skipped_url,
+        source_field: sourceSelection.skipped_field,
+        message: 'Skipped logo-style poster source; no SmugMug lookup attempted.'
+      })
+    };
   }
 
+  if (!sourceSelection.url) {
+    const updated = await updateSmugMusicShowSyncError(row, 'no_source_url', new Error('Missing show_url/poster_url source.'));
+    return { status: 'no_source_url', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_source_url') };
+  }
+
+  const sourceUrl = sourceSelection.url;
   const imageKey = extractSmugImageKeyFromUrl(sourceUrl);
   if (!imageKey) {
     const updated = await updateSmugMusicShowSyncError(row, 'no_image_key', new Error('Unable to extract SmugMug ImageKey from show_url/poster_url.'));
-    return { status: 'no_image_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_image_key') };
+    return { status: 'no_image_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_image_key', { source_url: sourceUrl, source_field: sourceSelection.field }) };
   }
 
   const imageJson = await fetchSmugJson(`/image/${encodeURIComponent(imageKey)}-0?_accept=application/json&_verbosity=1&_expand=Image`);
   const albumKey = extractSmugAlbumKeyFromImageDetail(imageJson);
   if (!albumKey) {
     const updated = await updateSmugMusicShowSyncError(row, 'no_album_key', new Error('SmugMug image detail did not include a parent AlbumKey.'));
-    return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { image_key: imageKey }) };
+    return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey }) };
   }
 
   const photoCount = await getSmugAlbumTotalPhotos({ AlbumKey: albumKey });
@@ -10425,10 +10488,9 @@ async function resolveSmugMusicShowAlbum(row) {
   return {
     status: 'synced',
     updated,
-    diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'synced', { image_key: imageKey, album_id: albumKey })
+    diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'synced', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey, album_id: albumKey })
   };
 }
-
 function buildSmugMusicShowResolveResultItem(row) {
   return {
     show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
@@ -10498,6 +10560,10 @@ async function runSmugMusicShowResolve(query = {}) {
   const missingSource = await getSmugMusicShowMissingSourceDiagnostics();
   const candidates = await getSmugMusicShowResolveCandidates(limit, refresh);
   const unresolvedShows = [];
+  const skippedLogoSources = [];
+  const noSourceUrlShows = [];
+  const noImageKeyShows = [];
+  const noAlbumKeyShows = [];
   const failures = [];
   const updatedItems = [];
   const counters = {
@@ -10505,6 +10571,10 @@ async function runSmugMusicShowResolve(query = {}) {
     attempted: 0,
     resolved: 0,
     unresolved: 0,
+    skipped_logo_source: 0,
+    no_source_url: 0,
+    no_image_key: 0,
+    no_album_key: 0,
     failed: 0,
     recordsUpdated: 0
   };
@@ -10517,10 +10587,32 @@ async function runSmugMusicShowResolve(query = {}) {
         counters.recordsUpdated += 1;
         updatedItems.push(buildSmugMusicShowResolveResultItem(result.updated));
       }
-      if (result.status === 'synced') counters.resolved += 1;
-      if (result.status !== 'synced') {
-        counters.unresolved += 1;
-        unresolvedShows.push(result.diagnostic || buildSmugMusicShowResolveDiagnostic(row, result.status));
+      if (result.status === 'synced') {
+        counters.resolved += 1;
+      } else {
+        const diagnostic = result.diagnostic || buildSmugMusicShowResolveDiagnostic(row, result.status);
+        if (result.status === 'skipped_logo_source') {
+          counters.skipped_logo_source += 1;
+          skippedLogoSources.push(diagnostic);
+        } else if (result.status === 'no_source_url') {
+          counters.no_source_url += 1;
+          counters.unresolved += 1;
+          noSourceUrlShows.push(diagnostic);
+          unresolvedShows.push(diagnostic);
+        } else if (result.status === 'no_image_key') {
+          counters.no_image_key += 1;
+          counters.unresolved += 1;
+          noImageKeyShows.push(diagnostic);
+          unresolvedShows.push(diagnostic);
+        } else if (result.status === 'no_album_key') {
+          counters.no_album_key += 1;
+          counters.unresolved += 1;
+          noAlbumKeyShows.push(diagnostic);
+          unresolvedShows.push(diagnostic);
+        } else {
+          counters.unresolved += 1;
+          unresolvedShows.push(diagnostic);
+        }
       }
     } catch (err) {
       counters.failed += 1;
@@ -10546,15 +10638,27 @@ async function runSmugMusicShowResolve(query = {}) {
       showsAttempted: counters.attempted,
       showsResolved: counters.resolved,
       showsUnresolved: counters.unresolved,
+      skippedLogoSource: counters.skipped_logo_source,
+      noSourceUrl: counters.no_source_url,
+      noImageKey: counters.no_image_key,
+      noAlbumKey: counters.no_album_key,
       failures: counters.failed,
       recordsUpdated: counters.recordsUpdated,
       missingSource: missingSource.count
     },
     showsResolved: counters.resolved,
     showsUnresolved: counters.unresolved,
+    skippedLogoSource: counters.skipped_logo_source,
+    noSourceUrl: counters.no_source_url,
+    noImageKey: counters.no_image_key,
+    noAlbumKey: counters.no_album_key,
     recordsUpdated: counters.recordsUpdated,
     diagnostics: {
       missingSource,
+      skippedLogoSource: skippedLogoSources.slice(0, 25),
+      noSourceUrl: noSourceUrlShows.slice(0, 25),
+      noImageKey: noImageKeyShows.slice(0, 25),
+      noAlbumKey: noAlbumKeyShows.slice(0, 25),
       unresolvedShows: unresolvedShows.slice(0, 25),
       failures: failures.slice(0, 25)
     },
@@ -14232,6 +14336,8 @@ async function startServer() {
 }
 
 startServer();
+
+
 
 
 
