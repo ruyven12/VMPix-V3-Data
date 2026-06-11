@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS music_shows (
     smug_last_synced_at TIMESTAMPTZ,
     smug_sync_status TEXT,
     smug_sync_error TEXT,
+    smug_albums JSONB DEFAULT '[]'::jsonb,
     bands JSONB DEFAULT '[]'::jsonb,
     stats JSONB DEFAULT '{}'::jsonb,
     raw_sheet JSONB DEFAULT '{}'::jsonb,
@@ -160,6 +161,9 @@ ALTER TABLE IF EXISTS music_shows
 
 ALTER TABLE IF EXISTS music_shows
     ADD COLUMN IF NOT EXISTS smug_sync_error TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS smug_albums JSONB DEFAULT '[]'::jsonb;
 
 CREATE UNIQUE INDEX IF NOT EXISTS music_shows_show_id_key
     ON music_shows (show_id);
