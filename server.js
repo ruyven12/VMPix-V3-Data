@@ -10569,18 +10569,24 @@ function getSmugMusicShowResolveLimit(value) {
   return Math.min(SMUG_MUSIC_SHOW_RESOLVE_MAX_LIMIT, Math.max(1, parsed));
 }
 
+function normalizeSmugImageKey(value) {
+  const clean = String(value || '').trim();
+  if (!clean) return '';
+  return /^i-/i.test(clean) ? clean : `i-${clean}`;
+}
+
 function extractSmugImageKeyFromUrl(url) {
   const clean = String(url || '').trim();
   if (!clean) return '';
 
   const direct = clean.match(/\b\/i-([A-Za-z0-9]+)\b/i);
-  if (direct && direct[1]) return String(direct[1]).trim();
+  if (direct && direct[1]) return normalizeSmugImageKey(direct[1]);
 
   const fileStyle = clean.match(/\/([A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
-  if (fileStyle && fileStyle[1]) return String(fileStyle[1]).trim();
+  if (fileStyle && fileStyle[1]) return normalizeSmugImageKey(fileStyle[1]);
 
   const segmentStyle = clean.match(/\/\d+-([A-Za-z0-9]+)(?:\/|$)/i);
-  if (segmentStyle && segmentStyle[1]) return String(segmentStyle[1]).trim();
+  if (segmentStyle && segmentStyle[1]) return normalizeSmugImageKey(segmentStyle[1]);
 
   return '';
 }
