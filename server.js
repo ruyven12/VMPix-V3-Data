@@ -10639,7 +10639,6 @@ function buildSmugImageDetailEndpoints(imageKey) {
 
   keyCandidates.forEach((candidate) => {
     endpointSegments.push(`${candidate}-0`);
-    endpointSegments.push(candidate);
   });
 
   const seen = new Set();
@@ -10687,14 +10686,14 @@ function extractSmugImageKeyFromUrl(url) {
   const clean = String(url || '').trim();
   if (!clean) return '';
 
-  const direct = clean.match(/\b\/i-([A-Za-z0-9]+)\b/i);
-  if (direct && direct[1]) return getBareSmugImageKey(direct[1]);
+  const direct = clean.match(/\b\/(i-[A-Za-z0-9]+)\b/i);
+  if (direct && direct[1]) return String(direct[1]).trim();
 
-  const fileStyle = clean.match(/\/(?:i-)?([A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
-  if (fileStyle && fileStyle[1]) return getBareSmugImageKey(fileStyle[1]);
+  const fileStyle = clean.match(/\/((?:i-)?[A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
+  if (fileStyle && fileStyle[1]) return String(fileStyle[1]).trim();
 
-  const segmentStyle = clean.match(/\/\d+-(?:i-)?([A-Za-z0-9]+)(?:\/|$)/i);
-  if (segmentStyle && segmentStyle[1]) return getBareSmugImageKey(segmentStyle[1]);
+  const segmentStyle = clean.match(/\/\d+-((?:i-)?[A-Za-z0-9]+)(?:\/|$)/i);
+  if (segmentStyle && segmentStyle[1]) return String(segmentStyle[1]).trim();
 
   return '';
 }
