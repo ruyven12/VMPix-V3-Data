@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const fs = require('fs');
 const path = require('path');
@@ -4199,9 +4199,86 @@ async function getMusicVenueDetailsMap(venueIds) {
   return venues;
 }
 
+function isVenueLogoUrl(value) {
+  const clean = String(value || '').trim();
+  if (!clean) return false;
+
+  const lower = clean.toLowerCase();
+  let decoded = lower;
+  try {
+    decoded = decodeURIComponent(lower);
+  } catch (_) {
+    decoded = lower;
+  }
+
+  return decoded.includes('/music/venue-logos/') ||
+    decoded.includes('/venue-logos/') ||
+    decoded.includes('venue-logo') ||
+    decoded.includes('venue_logo');
+}
+
+function isUsableShowImageUrl(value) {
+  const clean = String(value || '').trim();
+  if (!clean) return false;
+  if (isVenueLogoUrl(clean)) return false;
+  if (typeof isSmugMusicShowLogoSourceUrl === 'function' && isSmugMusicShowLogoSourceUrl(clean)) return false;
+  if (typeof isLikelySmugImageUrl === 'function') return isLikelySmugImageUrl(clean);
+  return /^https?:\/\//i.test(clean);
+}
+
+function getMusicShowCoverImageUrl(row) {
+  const storedCover = row && row.cover_image_url;
+  if (isUsableShowImageUrl(storedCover)) return String(storedCover).trim();
+
+  const poster = row && row.poster;
+  if (isUsableShowImageUrl(poster)) return String(poster).trim();
+
+  return null;
+}
+
+function formatMusicShowSyncTimestamp(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function buildMusicShowVenueDetailsSummary(venueDetails) {
+  if (!venueDetails || typeof venueDetails !== 'object') return null;
+
+  const logo = String((venueDetails.media && venueDetails.media.logo) || venueDetails.logo || '').trim();
+  return {
+    venue_id: venueDetails.venue_id || '',
+    venue: venueDetails.venue || '',
+    city: venueDetails.city || '',
+    state: venueDetails.state || '',
+    country: venueDetails.country || '',
+    region: venueDetails.region || '',
+    status: venueDetails.status || '',
+    latitude: venueDetails.latitude == null ? null : venueDetails.latitude,
+    longitude: venueDetails.longitude == null ? null : venueDetails.longitude,
+    media: {
+      logo
+    }
+  };
+}
+
+function buildMusicShowLegacyStatAliases(stats) {
+  return {
+    photo_count: toIntegerCount(stats && stats.photo_count),
+    event_count: toIntegerCount(stats && stats.event_count),
+    show_count: toIntegerCount(stats && stats.show_count),
+    set_count: toIntegerCount(stats && stats.set_count),
+    band_count: toIntegerCount(stats && stats.band_count),
+    artist_count: toIntegerCount(stats && stats.artist_count),
+    people_count: toIntegerCount(stats && stats.people_count),
+    venue_count: toIntegerCount(stats && stats.venue_count)
+  };
+}
+
 function buildMusicShowDbApiItem(row, venueDetailsMap) {
   const venueId = row.venue_id || '';
-  const venueDetails = venueId ? (venueDetailsMap.get(normalizeMusicLookupKey(venueId)) || null) : null;
+  const fullVenueDetails = venueId ? (venueDetailsMap.get(normalizeMusicLookupKey(venueId)) || null) : null;
+  const venueDetails = buildMusicShowVenueDetailsSummary(fullVenueDetails);
   const bands = Array.isArray(row.bands) ? row.bands : [];
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   addMusicCanonicalAliases(stats, {
@@ -4217,34 +4294,30 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
   const item = {
     show_id: toIntegerCount(row.show_id),
     name: row.name || '',
+    date: row.date || '',
     venue_id: venueId,
     venue: venueDetails ? venueDetails.venue : (row.venue || ''),
     venue_details: venueDetails,
     city: row.city || (venueDetails ? venueDetails.city : ''),
     state: row.state || (venueDetails ? venueDetails.state : ''),
-    date: row.date || '',
     poster: row.poster || '',
+    cover_image_url: getMusicShowCoverImageUrl(row),
     notes: row.notes || '',
     camera_1: row.camera_1 || '',
     camera_2: row.camera_2 || '',
     bands,
-    stats
+    stats,
+    gallery_id: getCanonicalNullableString(row.gallery_id || row.gallery || row.smug_folder || row.smugmug_gallery),
+    album_id: getCanonicalNullableString(row.album_id || row.album || row.smugmug_album),
+    smug_sync_status: getCanonicalNullableString(row.smug_sync_status),
+    smug_last_synced_at: formatMusicShowSyncTimestamp(row.smug_last_synced_at),
+    smug_sync_error: getCanonicalNullableString(row.smug_sync_error)
   };
-  addMusicCanonicalAliases(item, {
-    event_count: 1,
-    show_count: 1,
-    band_count: bands.length,
-    artist_count: bands.length,
-    venue_count: venueId ? 1 : 0,
-    photo_count: row.photo_count != null ? toIntegerCount(row.photo_count) : stats.photo_count,
-    set_count: stats.set_count,
-    gallery_id: row.gallery_id || row.gallery || row.smug_folder || row.smugmug_gallery,
-    album_id: row.album_id || row.album || row.smugmug_album,
-    cover_image_url: row.cover_image_url || row.poster
-  });
+
+  // Temporary compatibility: current frontend code still reads these flattened counters.
+  Object.assign(item, buildMusicShowLegacyStatAliases(stats));
   return item;
 }
-
 function buildMusicShowsDbQueryOptions(query) {
   const values = [];
   const where = [];
@@ -4367,7 +4440,7 @@ async function handleMusicShowsDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT show_id, name, venue_id, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
+      `SELECT show_id, name, venue_id, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
        FROM music_shows
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -4378,6 +4451,23 @@ async function handleMusicShowsDbRequest(req, res) {
     const venueDetailsMap = await getMusicVenueDetailsMap(result.rows.map((row) => row.venue_id));
     const data = result.rows.map((row) => buildMusicShowDbApiItem(row, venueDetailsMap));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
+
+    const meta = buildListMeta({ route: '/api/music/shows/db', source: 'PostgreSQL:music_shows', pagination, filters: options.filters, sort: options.sort });
+    meta.payload = {
+      canonicalStats: 'data[].stats',
+      legacyFlattenedStatFields: [
+        'photo_count',
+        'event_count',
+        'show_count',
+        'set_count',
+        'band_count',
+        'artist_count',
+        'people_count',
+        'venue_count'
+      ],
+      legacyCompatibilityNote: 'Flattened stat fields are retained temporarily for active frontend compatibility.',
+      venueDetailsShape: 'compact'
+    };
 
     res.json({
       ok: true,
@@ -4394,7 +4484,7 @@ async function handleMusicShowsDbRequest(req, res) {
       hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
       sort: options.sort,
-      meta: buildListMeta({ route: '/api/music/shows/db', source: 'PostgreSQL:music_shows', pagination, filters: options.filters, sort: options.sort }),
+      meta,
       stats: {
         showsTotal: total,
         bandsTotal: data.reduce((sum, show) => sum + (Array.isArray(show.bands) ? show.bands.length : 0), 0),
