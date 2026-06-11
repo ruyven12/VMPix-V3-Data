@@ -10878,39 +10878,52 @@ function getSmugMusicShowSourceUrl(row) {
 }
 
 function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
+  const attemptedAlbumPaths = Array.isArray(extra.attempted_album_paths)
+    ? extra.attempted_album_paths
+    : Array.isArray(extra.album_path_attempts)
+      ? extra.album_path_attempts
+      : Array.isArray(extra.smug_albums)
+        ? extra.smug_albums.map((item) => item && item.smug_path).filter(Boolean)
+        : [];
+  const hasAlbumPathDiagnostics = attemptedAlbumPaths.length > 0 || Array.isArray(extra.smug_albums);
   const sourceSelection = getSmugMusicShowSourceSelection(row);
-  const sourceUrl = extra.source_url || sourceSelection.url || sourceSelection.skipped_url || '';
-  const extractedImageKey = extra.extracted_image_key || extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '';
-  const attemptedImageKeys = Array.isArray(extra.attempted_image_keys)
-    ? extra.attempted_image_keys
-    : (extractedImageKey ? getSmugImageKeyCandidates(extractedImageKey) : []);
-  const imageEndpointAttempts = Array.isArray(extra.image_endpoint_attempts)
-    ? extra.image_endpoint_attempts
-    : Array.isArray(extra.image_endpoints)
-      ? extra.image_endpoints
-      : (extractedImageKey ? buildSmugImageDetailEndpoints(extractedImageKey) : []);
+  const sourceUrl = hasAlbumPathDiagnostics ? '' : (extra.source_url || sourceSelection.url || sourceSelection.skipped_url || '');
+  const extractedImageKey = hasAlbumPathDiagnostics ? '' : (extra.extracted_image_key || extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '');
+  const attemptedImageKeys = hasAlbumPathDiagnostics
+    ? []
+    : Array.isArray(extra.attempted_image_keys)
+      ? extra.attempted_image_keys
+      : (extractedImageKey ? getSmugImageKeyCandidates(extractedImageKey) : []);
+  const imageEndpointAttempts = hasAlbumPathDiagnostics
+    ? []
+    : Array.isArray(extra.image_endpoint_attempts)
+      ? extra.image_endpoint_attempts
+      : Array.isArray(extra.image_endpoints)
+        ? extra.image_endpoints
+        : (extractedImageKey ? buildSmugImageDetailEndpoints(extractedImageKey) : []);
   const imageApiUrlAttemptsBeforeApiKey = imageEndpointAttempts.map((endpoint) => buildSmugApiDebugUrl(endpoint));
 
   return {
     show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
     name: row && row.name ? row.name : '',
     date: row && row.date ? row.date : '',
-    poster: row && row.poster ? row.poster : '',
-    source_url: sourceUrl,
-    source_field: extra.source_field || sourceSelection.field || sourceSelection.skipped_field || '',
-    image_key: extractedImageKey,
-    extracted_image_key: extractedImageKey,
-    attempted_image_keys: attemptedImageKeys,
-    image_endpoint: extra.image_endpoint || imageEndpointAttempts[0] || '',
-    image_endpoint_attempts: imageEndpointAttempts,
-    image_api_url_before_api_key: extra.image_api_url_before_api_key || imageApiUrlAttemptsBeforeApiKey[0] || '',
-    image_api_url_attempts_before_api_key: imageApiUrlAttemptsBeforeApiKey,
-    album_id: extra.album_id || '',
     status,
     message: extra.message || '',
     date_folder: extra.date_folder || formatMusicShowDateFolder(row && row.date),
-    album_path_attempts: Array.isArray(extra.album_path_attempts) ? extra.album_path_attempts : [],
-    smug_albums: Array.isArray(extra.smug_albums) ? extra.smug_albums : []
+    attempted_album_paths: attemptedAlbumPaths,
+    album_path_attempts: attemptedAlbumPaths,
+    smug_albums: Array.isArray(extra.smug_albums) ? extra.smug_albums : [],
+    album_id: extra.album_id || '',
+    poster: row && row.poster ? row.poster : '',
+    source_url: sourceUrl,
+    source_field: hasAlbumPathDiagnostics ? '' : (extra.source_field || sourceSelection.field || sourceSelection.skipped_field || ''),
+    image_key: extractedImageKey,
+    extracted_image_key: extractedImageKey,
+    attempted_image_keys: attemptedImageKeys,
+    image_endpoint: hasAlbumPathDiagnostics ? '' : (extra.image_endpoint || imageEndpointAttempts[0] || ''),
+    image_endpoint_attempts: imageEndpointAttempts,
+    image_api_url_before_api_key: hasAlbumPathDiagnostics ? '' : (extra.image_api_url_before_api_key || imageApiUrlAttemptsBeforeApiKey[0] || ''),
+    image_api_url_attempts_before_api_key: imageApiUrlAttemptsBeforeApiKey
   };
 }
 function getSmugAlbumObject(json) {
@@ -11269,7 +11282,7 @@ async function resolveSmugMusicShowAlbum(row, bandLookup = new Map()) {
       unresolvedMappings: [],
       diagnostic: buildSmugMusicShowResolveDiagnostic(row, status, {
         date_folder: '',
-        album_path_attempts: [],
+        attempted_album_paths: [],
         smug_albums: [],
         message
       })
@@ -11291,7 +11304,7 @@ async function resolveSmugMusicShowAlbum(row, bandLookup = new Map()) {
       unresolvedMappings: [],
       diagnostic: buildSmugMusicShowResolveDiagnostic(row, status, {
         date_folder: dateFolder,
-        album_path_attempts: [],
+        attempted_album_paths: [],
         smug_albums: [],
         message
       })
@@ -11344,7 +11357,7 @@ async function resolveSmugMusicShowAlbum(row, bandLookup = new Map()) {
       unresolvedMappings,
       diagnostic: buildSmugMusicShowResolveDiagnostic(row, status, {
         date_folder: dateFolder,
-        album_path_attempts: albumPathAttempts,
+        attempted_album_paths: albumPathAttempts,
         smug_albums: mappings,
         message
       })
@@ -11378,7 +11391,7 @@ async function resolveSmugMusicShowAlbum(row, bandLookup = new Map()) {
     missingCoverImage: !coverImageUrl,
     diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'resolved', {
       date_folder: dateFolder,
-      album_path_attempts: albumPathAttempts,
+      attempted_album_paths: albumPathAttempts,
       smug_albums: mappings,
       album_id: first.album_id,
       message: coverImageUrl ? '' : 'At least one album resolved, but no cover image was available.'
@@ -11553,7 +11566,12 @@ async function runSmugMusicShowResolve(query = {}) {
         counters.recordsUpdated += 1;
         updatedItems.push(buildSmugMusicShowResolveResultItem(updated));
       }
-      failures.push(buildSmugMusicShowResolveDiagnostic(row, 'error', { message: getSafeErrorMessage(err) }));
+      const fallbackCandidates = getSmugMusicShowAlbumCandidates(row, bandLookup);
+      failures.push(buildSmugMusicShowResolveDiagnostic(row, 'error', {
+        date_folder: fallbackCandidates.dateFolder,
+        attempted_album_paths: fallbackCandidates.candidates.map((candidate) => candidate.smug_path),
+        message: getSafeErrorMessage(err)
+      }));
     }
   });
 
