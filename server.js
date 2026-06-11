@@ -4254,26 +4254,12 @@ function buildMusicShowVenueDetailsSummary(venueDetails) {
     country: venueDetails.country || '',
     region: venueDetails.region || '',
     status: venueDetails.status || '',
-    latitude: venueDetails.latitude == null ? null : venueDetails.latitude,
-    longitude: venueDetails.longitude == null ? null : venueDetails.longitude,
     media: {
       logo
     }
   };
 }
 
-function buildMusicShowLegacyStatAliases(stats) {
-  return {
-    photo_count: toIntegerCount(stats && stats.photo_count),
-    event_count: toIntegerCount(stats && stats.event_count),
-    show_count: toIntegerCount(stats && stats.show_count),
-    set_count: toIntegerCount(stats && stats.set_count),
-    band_count: toIntegerCount(stats && stats.band_count),
-    artist_count: toIntegerCount(stats && stats.artist_count),
-    people_count: toIntegerCount(stats && stats.people_count),
-    venue_count: toIntegerCount(stats && stats.venue_count)
-  };
-}
 
 function buildMusicShowDbApiItem(row, venueDetailsMap) {
   const venueId = row.venue_id || '';
@@ -4314,10 +4300,9 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     smug_sync_error: getCanonicalNullableString(row.smug_sync_error)
   };
 
-  // Temporary compatibility: current frontend code still reads these flattened counters.
-  Object.assign(item, buildMusicShowLegacyStatAliases(stats));
   return item;
 }
+
 function buildMusicShowsDbQueryOptions(query) {
   const values = [];
   const where = [];
@@ -4455,17 +4440,7 @@ async function handleMusicShowsDbRequest(req, res) {
     const meta = buildListMeta({ route: '/api/music/shows/db', source: 'PostgreSQL:music_shows', pagination, filters: options.filters, sort: options.sort });
     meta.payload = {
       canonicalStats: 'data[].stats',
-      legacyFlattenedStatFields: [
-        'photo_count',
-        'event_count',
-        'show_count',
-        'set_count',
-        'band_count',
-        'artist_count',
-        'people_count',
-        'venue_count'
-      ],
-      legacyCompatibilityNote: 'Flattened stat fields are retained temporarily for active frontend compatibility.',
+      flattenedStats: 'removed',
       venueDetailsShape: 'compact'
     };
 
