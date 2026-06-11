@@ -306,6 +306,13 @@ async function applyRuntimeDatabaseMigrations() {
     return;
   }
 
+  const showResolverResult = await ensureMusicShowResolverColumns();
+  if (showResolverResult && showResolverResult.ok) {
+    console.log('Runtime migration applied: Music show resolver columns ensured.');
+  } else if (showResolverResult && showResolverResult.error) {
+    console.warn(`Runtime migration warning: Music show resolver columns were not fully ensured: ${showResolverResult.error}`);
+  }
+
   const result = await ensureSmugMusicSnapshotColumns();
   if (result && result.ok) {
     console.log(`Runtime migration applied: SmugMug music snapshot columns ensured (${result.columnsEnsured.length}).`);
@@ -2087,6 +2094,8 @@ const MUSIC_SHOW_IMPORT_HEADER_ALIASES = {
   date: 'date',
   show_date: 'date',
   showdate: 'date',
+  show_url: 'show_url',
+  showurl: 'show_url',
   poster: 'poster',
   poster_url: 'poster',
   posterurl: 'poster',
@@ -2163,7 +2172,7 @@ function parseMusicShowDate(value) {
 }
 
 function hasMusicShowImportData(row) {
-  if (['name', 'venue_id', 'venue', 'city', 'state', 'date', 'poster', 'notes', 'camera_1', 'camera_2'].some((key) => toDbText(row[key]))) {
+  if (['name', 'venue_id', 'venue', 'city', 'state', 'date', 'show_url', 'poster', 'notes', 'camera_1', 'camera_2'].some((key) => toDbText(row[key]))) {
     return true;
   }
 
@@ -2215,6 +2224,7 @@ function buildMusicShowDbRow(row, showId, bandCounts) {
     date: toDbText(row.date),
     show_date: parsedDate ? parsedDate.iso : null,
     poster: toDbText(row.poster),
+    show_url: toDbText(row.show_url),
     notes: toDbText(row.notes),
     camera_1: toDbText(row.camera_1),
     camera_2: toDbText(row.camera_2),
@@ -2238,6 +2248,7 @@ async function upsertMusicShowDbRow(client, item) {
       date,
       show_date,
       poster,
+      show_url,
       notes,
       camera_1,
       camera_2,
@@ -2248,7 +2259,7 @@ async function upsertMusicShowDbRow(client, item) {
     VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10,
-      $11, $12, $13::jsonb, $14::jsonb, $15::jsonb
+      $11, $12, $13, $14::jsonb, $15::jsonb, $16::jsonb
     )
     ON CONFLICT (show_id) DO UPDATE SET
       name = EXCLUDED.name,
@@ -2259,6 +2270,7 @@ async function upsertMusicShowDbRow(client, item) {
       date = EXCLUDED.date,
       show_date = EXCLUDED.show_date,
       poster = EXCLUDED.poster,
+      show_url = EXCLUDED.show_url,
       notes = EXCLUDED.notes,
       camera_1 = EXCLUDED.camera_1,
       camera_2 = EXCLUDED.camera_2,
@@ -2276,6 +2288,7 @@ async function upsertMusicShowDbRow(client, item) {
     item.date,
     item.show_date,
     item.poster,
+    item.show_url,
     item.notes,
     item.camera_1,
     item.camera_2,
@@ -4287,6 +4300,7 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     city: row.city || (venueDetails ? venueDetails.city : ''),
     state: row.state || (venueDetails ? venueDetails.state : ''),
     poster: row.poster || '',
+    show_url: row.show_url || '',
     cover_image_url: getMusicShowCoverImageUrl(row),
     notes: row.notes || '',
     camera_1: row.camera_1 || '',
@@ -4346,6 +4360,7 @@ function buildMusicShowsDbQueryOptions(query) {
       OR coalesce(state, '') ILIKE $${idx}
       OR coalesce(notes, '') ILIKE $${idx}
       OR coalesce(poster, '') ILIKE $${idx}
+      OR coalesce(show_url, '') ILIKE $${idx}
       OR bands::text ILIKE $${idx}
     )`);
     filters.search = search;
@@ -4425,7 +4440,7 @@ async function handleMusicShowsDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT show_id, name, venue_id, venue, city, state, date, poster, notes, camera_1, camera_2, bands, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+      `SELECT show_id, name, venue_id, venue, city, state, date, poster, show_url, notes, camera_1, camera_2, bands, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
        FROM music_shows
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -9436,6 +9451,20 @@ function getSmugMusicSnapshotColumnType(fieldName) {
   return 'TEXT';
 }
 
+async function ensureMusicShowResolverColumns(warnings) {
+  if (!String(process.env.DATABASE_URL || '').trim()) return { ok: false, skipped: true, reason: 'DATABASE_URL_NOT_CONFIGURED' };
+
+  try {
+    await dbPool.query('ALTER TABLE IF EXISTS music_shows ADD COLUMN IF NOT EXISTS show_url TEXT');
+    return { ok: true, columnsEnsured: ['music_shows.show_url'] };
+  } catch (err) {
+    const message = `Unable to ensure Music show resolver columns: ${err && err.message ? err.message : String(err)}`;
+    if (Array.isArray(warnings)) warnings.push(message);
+    else console.warn(message);
+    return { ok: false, error: err && err.message ? err.message : String(err), columnsEnsured: [] };
+  }
+}
+
 async function ensureSmugMusicSnapshotColumns(warnings) {
   if (!String(process.env.DATABASE_URL || '').trim()) return { ok: false, skipped: true, reason: 'DATABASE_URL_NOT_CONFIGURED' };
 
@@ -9791,7 +9820,7 @@ async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, war
       samples: await runSmugMusicRowsQuery(
         warnings,
         'show unresolved SmugMug samples',
-        `SELECT show_id, name, date, poster, raw_sheet->>'show_url' AS show_url, raw_sheet->>'poster_url' AS poster_url, smug_sync_status, smug_sync_error
+        `SELECT show_id, name, date, poster, show_url, raw_sheet->>'show_url' AS raw_show_url, raw_sheet->>'poster_url' AS poster_url, smug_sync_status, smug_sync_error
          FROM music_shows
          WHERE trim(coalesce(smug_sync_status, '')) = ''
             OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unresolved', 'no_source_url', 'no_image_key', 'no_album_key', 'skipped_logo_source', 'skipped_venue_logo_source', 'raw_photo_source_no_album_context')
@@ -9820,7 +9849,8 @@ async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, war
         'show poster fallback candidates',
         `SELECT count(*)::int AS count
          FROM music_shows
-         WHERE trim(coalesce(raw_sheet->>'show_url', '')) = ''
+         WHERE trim(coalesce(show_url, '')) = ''
+           AND trim(coalesce(raw_sheet->>'show_url', '')) = ''
            AND trim(coalesce(raw_sheet->>'showurl', '')) = ''
            AND (
              trim(coalesce(poster, '')) <> ''
@@ -10742,7 +10772,7 @@ function getSmugMusicShowSourceSkip(candidate) {
   if (isSmugMusicShowLogoSourceUrl(url)) {
     return { status: 'skipped_logo_source', field: candidate.field, url };
   }
-  if (isSmugRawPhotoCdnUrl(url)) {
+  if (isSmugRawPhotoCdnUrl(url) && isSmugMusicShowPosterField(candidate.field)) {
     return { status: 'raw_photo_source_no_album_context', field: candidate.field, url };
   }
   return null;
@@ -10897,7 +10927,8 @@ function buildSmugMusicShowStatsSnapshot(row, photoCount) {
 }
 async function getSmugMusicShowResolveCandidates(limit, refresh) {
   const sourceWhere = `(
-    trim(coalesce(poster, '')) <> ''
+    trim(coalesce(show_url, '')) <> ''
+    OR trim(coalesce(poster, '')) <> ''
     OR trim(coalesce(raw_sheet->>'show_url', '')) <> ''
     OR trim(coalesce(raw_sheet->>'showurl', '')) <> ''
     OR trim(coalesce(raw_sheet->>'poster_url', '')) <> ''
@@ -10915,7 +10946,7 @@ async function getSmugMusicShowResolveCandidates(limit, refresh) {
   }
 
   return dbPool.query(`
-    SELECT id, show_id, name, date, poster, raw_sheet, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
+    SELECT id, show_id, name, date, poster, show_url, raw_sheet, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
     FROM music_shows
     WHERE ${where.join(' AND ')}
     ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
@@ -10925,7 +10956,8 @@ async function getSmugMusicShowResolveCandidates(limit, refresh) {
 
 async function getSmugMusicShowMissingSourceDiagnostics() {
   const missingWhere = `
-    trim(coalesce(poster, '')) = ''
+    trim(coalesce(show_url, '')) = ''
+    AND trim(coalesce(poster, '')) = ''
     AND trim(coalesce(raw_sheet->>'show_url', '')) = ''
     AND trim(coalesce(raw_sheet->>'showurl', '')) = ''
     AND trim(coalesce(raw_sheet->>'poster_url', '')) = ''
@@ -10934,7 +10966,7 @@ async function getSmugMusicShowMissingSourceDiagnostics() {
   `;
   const countResult = await dbPool.query(`SELECT count(*)::int AS count FROM music_shows WHERE ${missingWhere}`);
   const sampleResult = await dbPool.query(`
-    SELECT show_id, name, date, poster, raw_sheet->>'show_url' AS show_url, raw_sheet->>'poster_url' AS poster_url
+    SELECT show_id, name, date, poster, show_url, raw_sheet->>'show_url' AS raw_show_url, raw_sheet->>'poster_url' AS poster_url
     FROM music_shows
     WHERE ${missingWhere}
     ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
@@ -11001,7 +11033,7 @@ async function resolveSmugMusicShowAlbum(row) {
     const message = status === 'skipped_venue_logo_source'
       ? 'Skipped Music Venue logo source; no SmugMug lookup attempted.'
       : status === 'raw_photo_source_no_album_context'
-        ? 'Skipped raw photos.smugmug.com CDN image source; it does not provide album context for API-key album resolution. Add a show_url or album/page URL to resolve the album.'
+        ? 'Skipped raw poster CDN image source; poster is display media only. Add show_url to resolve the album.'
         : 'Skipped logo-style poster source; no SmugMug lookup attempted.';
     const updated = await updateSmugMusicShowSyncError(row, status, new Error(message));
     return {

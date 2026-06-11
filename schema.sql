@@ -1,4 +1,4 @@
-﻿CREATE TABLE IF NOT EXISTS music_bands (
+CREATE TABLE IF NOT EXISTS music_bands (
     id SERIAL PRIMARY KEY,
     band_id TEXT UNIQUE,
     band TEXT NOT NULL,
@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS music_shows (
     date TEXT,
     show_date DATE,
     poster TEXT,
+    show_url TEXT,
     notes TEXT,
     camera_1 TEXT,
     camera_2 TEXT,
@@ -117,6 +118,9 @@ ALTER TABLE IF EXISTS music_shows
 
 ALTER TABLE IF EXISTS music_shows
     ADD COLUMN IF NOT EXISTS poster TEXT;
+
+ALTER TABLE IF EXISTS music_shows
+    ADD COLUMN IF NOT EXISTS show_url TEXT;
 
 ALTER TABLE IF EXISTS music_shows
     ADD COLUMN IF NOT EXISTS notes TEXT;
