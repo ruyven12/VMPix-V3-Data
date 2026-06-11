@@ -9682,7 +9682,9 @@ async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, war
   const columns = getSmugMusicTableColumns(columnsByTable, 'music_shows');
   const hasPoster = columns.has('poster');
   const hasShowUrl = columns.has('show_url');
+  const hasRawSheet = columns.has('raw_sheet');
   shows.showUrlColumnPresent = hasShowUrl;
+  shows.rawSheetColumnPresent = hasRawSheet;
 
   if (hasPoster || hasShowUrl) {
     const missingMediaWhere = hasShowUrl
@@ -9708,6 +9710,14 @@ async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, war
     );
   } else {
     warnings.push('Missing poster/show_url columns for SmugMug show diagnostics.');
+  }
+
+  if (hasRawSheet) {
+    try {
+      shows.missingPosterOrShowUrl = await getSmugMusicShowMissingSourceDiagnostics();
+    } catch (err) {
+      warnings.push(`Unable to build raw-sheet show source diagnostics: ${err && err.message ? err.message : String(err)}`);
+    }
   }
 
   const hasSnapshotFields = SMUG_MUSIC_SNAPSHOT_FIELDS.every((fieldName) => columns.has(fieldName));
@@ -9758,6 +9768,68 @@ async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, war
          count(*) FILTER (WHERE smug_last_synced_at < now() - interval '30 days')::int AS stale_30d_rows
        FROM music_shows`
     ).then((rows) => rows[0] || null);
+
+    shows.coverage = await runSmugMusicRowsQuery(
+      warnings,
+      'show SmugMug coverage',
+      `SELECT
+         count(*)::int AS total_shows,
+         count(*) FILTER (WHERE lower(trim(coalesce(smug_sync_status, ''))) IN ('resolved', 'synced'))::int AS resolved_shows,
+         count(*) FILTER (WHERE trim(coalesce(smug_sync_status, '')) = '' OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unresolved', 'no_source_url', 'no_image_key', 'no_album_key', 'skipped_logo_source', 'skipped_venue_logo_source'))::int AS unresolved_shows,
+         count(*) FILTER (WHERE lower(trim(coalesce(smug_sync_status, ''))) = 'skipped_logo_source')::int AS skipped_logo_sources,
+         count(*) FILTER (WHERE lower(trim(coalesce(smug_sync_status, ''))) = 'skipped_venue_logo_source')::int AS skipped_venue_logo_sources,
+         count(*) FILTER (WHERE lower(trim(coalesce(smug_sync_status, ''))) = 'no_image_key')::int AS missing_image_key,
+         count(*) FILTER (WHERE lower(trim(coalesce(smug_sync_status, ''))) = 'no_album_key')::int AS missing_album_key,
+         count(*) FILTER (WHERE trim(coalesce(album_id, '')) <> '' AND trim(coalesce(cover_image_url, '')) = '')::int AS missing_cover_image,
+         count(*) FILTER (WHERE smug_last_synced_at IS NULL)::int AS never_synced,
+         count(*) FILTER (WHERE smug_last_synced_at < now() - interval '30 days')::int AS stale_syncs_30d
+       FROM music_shows`
+    ).then((rows) => rows[0] || null);
+
+    shows.unresolved = {
+      count: shows.coverage ? toIntegerCount(shows.coverage.unresolved_shows) : 0,
+      samples: await runSmugMusicRowsQuery(
+        warnings,
+        'show unresolved SmugMug samples',
+        `SELECT show_id, name, date, poster, raw_sheet->>'show_url' AS show_url, raw_sheet->>'poster_url' AS poster_url, smug_sync_status, smug_sync_error
+         FROM music_shows
+         WHERE trim(coalesce(smug_sync_status, '')) = ''
+            OR lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'unresolved', 'no_source_url', 'no_image_key', 'no_album_key', 'skipped_logo_source', 'skipped_venue_logo_source')
+         ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+         LIMIT 10`
+      )
+    };
+
+    shows.missingCoverImage = {
+      count: shows.coverage ? toIntegerCount(shows.coverage.missing_cover_image) : 0,
+      samples: await runSmugMusicRowsQuery(
+        warnings,
+        'show missing cover image samples',
+        `SELECT show_id, name, date, album_id, gallery_id, poster, smug_sync_status
+         FROM music_shows
+         WHERE trim(coalesce(album_id, '')) <> ''
+           AND trim(coalesce(cover_image_url, '')) = ''
+         ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+         LIMIT 10`
+      )
+    };
+
+    shows.posterFallbackUsage = {
+      count: hasRawSheet ? await runSmugMusicCountQuery(
+        warnings,
+        'show poster fallback candidates',
+        `SELECT count(*)::int AS count
+         FROM music_shows
+         WHERE trim(coalesce(raw_sheet->>'show_url', '')) = ''
+           AND trim(coalesce(raw_sheet->>'showurl', '')) = ''
+           AND (
+             trim(coalesce(poster, '')) <> ''
+             OR trim(coalesce(raw_sheet->>'poster_url', '')) <> ''
+             OR trim(coalesce(raw_sheet->>'posterurl', '')) <> ''
+             OR trim(coalesce(raw_sheet->>'poster', '')) <> ''
+           )`
+      ) : 0
+    };
   } else {
     warnings.push('Missing one or more music_shows SmugMug snapshot columns.');
   }
@@ -10565,23 +10637,51 @@ function getSmugMusicShowRawField(row, key) {
   return String(raw[key] || '').trim();
 }
 
-function isSmugMusicShowLogoSourceUrl(url) {
+function decodeSmugSourceUrlForChecks(url) {
   const clean = String(url || '').trim();
-  if (!clean) return false;
-
   const lower = clean.toLowerCase();
-  let decoded = lower;
   try {
-    decoded = decodeURIComponent(lower);
+    return decodeURIComponent(lower);
   } catch (_) {
-    decoded = lower;
+    return lower;
   }
+}
 
-  return decoded.includes('/music/band-logos/') ||
+function isSmugMusicShowVenueLogoSourceUrl(url) {
+  const decoded = decodeSmugSourceUrlForChecks(url);
+  if (!decoded) return false;
+  return decoded.includes('/music/venue-logos/') ||
+    decoded.includes('/venue-logos/') ||
+    decoded.includes('venue-logo') ||
+    decoded.includes('venue_logo');
+}
+
+function isSmugMusicShowLogoSourceUrl(url) {
+  const decoded = decodeSmugSourceUrlForChecks(url);
+  if (!decoded) return false;
+
+  return isSmugMusicShowVenueLogoSourceUrl(url) ||
+    decoded.includes('/music/band-logos/') ||
     decoded.includes('/band-logos/') ||
     decoded.includes('band-logo') ||
     decoded.includes('band_logo') ||
     decoded.includes('logo');
+}
+
+function getSmugMusicShowSourceSkip(candidate) {
+  const url = String(candidate && candidate.url || '').trim();
+  if (!url) return null;
+  if (isSmugMusicShowVenueLogoSourceUrl(url)) {
+    return { status: 'skipped_venue_logo_source', field: candidate.field, url };
+  }
+  if (isSmugMusicShowLogoSourceUrl(url)) {
+    return { status: 'skipped_logo_source', field: candidate.field, url };
+  }
+  return null;
+}
+
+function isSmugMusicShowPosterField(field) {
+  return /(^|\.)poster(_url|url)?$/i.test(String(field || ''));
 }
 
 function getSmugMusicShowSourceSelection(row) {
@@ -10590,12 +10690,6 @@ function getSmugMusicShowSourceSelection(row) {
     { field: 'raw_sheet.show_url', url: getSmugMusicShowRawField(row, 'show_url') },
     { field: 'raw_sheet.showurl', url: getSmugMusicShowRawField(row, 'showurl') }
   ];
-
-  for (const candidate of showUrlCandidates) {
-    const url = String(candidate.url || '').trim();
-    if (url) return { status: 'selected', url, field: candidate.field, skipped_url: '' };
-  }
-
   const posterCandidates = [
     { field: 'poster_url', url: row && row.poster_url },
     { field: 'raw_sheet.poster_url', url: getSmugMusicShowRawField(row, 'poster_url') },
@@ -10603,16 +10697,50 @@ function getSmugMusicShowSourceSelection(row) {
     { field: 'poster', url: row && row.poster },
     { field: 'raw_sheet.poster', url: getSmugMusicShowRawField(row, 'poster') }
   ];
+  let skippedVenueLogoSource = null;
   let skippedLogoSource = null;
 
-  for (const candidate of posterCandidates) {
+  const chooseCandidate = (candidate, sourceType) => {
     const url = String(candidate.url || '').trim();
-    if (!url) continue;
-    if (isSmugMusicShowLogoSourceUrl(url)) {
-      if (!skippedLogoSource) skippedLogoSource = { field: candidate.field, url };
-      continue;
+    if (!url) return null;
+    const skip = getSmugMusicShowSourceSkip({ field: candidate.field, url });
+    if (skip) {
+      if (skip.status === 'skipped_venue_logo_source' && !skippedVenueLogoSource) skippedVenueLogoSource = skip;
+      if (skip.status === 'skipped_logo_source' && !skippedLogoSource) skippedLogoSource = skip;
+      return null;
     }
-    return { status: 'selected', url, field: candidate.field, skipped_url: skippedLogoSource ? skippedLogoSource.url : '' };
+    return {
+      status: 'selected',
+      url,
+      field: candidate.field,
+      source_type: sourceType,
+      poster_fallback: sourceType === 'poster' || isSmugMusicShowPosterField(candidate.field),
+      skipped_url: skippedVenueLogoSource ? skippedVenueLogoSource.url : (skippedLogoSource ? skippedLogoSource.url : ''),
+      skipped_field: skippedVenueLogoSource ? skippedVenueLogoSource.field : (skippedLogoSource ? skippedLogoSource.field : ''),
+      skipped_status: skippedVenueLogoSource ? skippedVenueLogoSource.status : (skippedLogoSource ? skippedLogoSource.status : '')
+    };
+  };
+
+  for (const candidate of showUrlCandidates) {
+    const selected = chooseCandidate(candidate, 'show_url');
+    if (selected) return selected;
+  }
+
+  for (const candidate of posterCandidates) {
+    const selected = chooseCandidate(candidate, 'poster');
+    if (selected) return selected;
+  }
+
+  if (skippedVenueLogoSource) {
+    return {
+      status: 'skipped_venue_logo_source',
+      url: '',
+      field: '',
+      skipped_url: skippedVenueLogoSource.url,
+      skipped_field: skippedVenueLogoSource.field,
+      skipped_status: skippedVenueLogoSource.status,
+      poster_fallback: false
+    };
   }
 
   if (skippedLogoSource) {
@@ -10621,13 +10749,14 @@ function getSmugMusicShowSourceSelection(row) {
       url: '',
       field: '',
       skipped_url: skippedLogoSource.url,
-      skipped_field: skippedLogoSource.field
+      skipped_field: skippedLogoSource.field,
+      skipped_status: skippedLogoSource.status,
+      poster_fallback: false
     };
   }
 
-  return { status: 'no_source_url', url: '', field: '', skipped_url: '' };
+  return { status: 'no_source_url', url: '', field: '', skipped_url: '', poster_fallback: false };
 }
-
 function getSmugMusicShowSourceUrl(row) {
   return getSmugMusicShowSourceSelection(row).url;
 }
@@ -10647,6 +10776,41 @@ function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
     status,
     message: extra.message || ''
   };
+}
+function getSmugAlbumObject(json) {
+  const albums = getSmugAlbums(json);
+  if (albums.length) return albums[0];
+
+  const resp = json && json.Response ? json.Response : json;
+  const album = resp && (resp.Album || resp.album || resp);
+  return album && typeof album === 'object' ? album : null;
+}
+
+async function fetchSmugAlbumMetadata(albumKey) {
+  const cleanKey = String(albumKey || '').trim();
+  if (!cleanKey) return null;
+  const json = await fetchSmugJson(`/album/${encodeURIComponent(cleanKey)}?_accept=application/json&_verbosity=1&_expand=HighlightImage`);
+  return getSmugAlbumObject(json);
+}
+
+function getSmugMusicShowResolvedCoverImageUrl(album, sourceUrl, row) {
+  const albumCover = getSmugAlbumCoverImageUrl(album);
+  if (isUsableShowImageUrl(albumCover)) return String(albumCover).trim();
+  if (isUsableShowImageUrl(sourceUrl)) return String(sourceUrl).trim();
+  if (row && isUsableShowImageUrl(row.poster)) return String(row.poster).trim();
+  return null;
+}
+
+function buildSmugMusicShowStatsSnapshot(row, photoCount) {
+  const stats = row && row.stats && typeof row.stats === 'object' && !Array.isArray(row.stats)
+    ? { ...row.stats }
+    : {};
+  const count = toIntegerCount(photoCount);
+  stats.photoCount = count;
+  addMusicCanonicalAliases(stats, {
+    photo_count: count
+  });
+  return stats;
 }
 async function getSmugMusicShowResolveCandidates(limit, refresh) {
   const sourceWhere = `(
@@ -10668,7 +10832,7 @@ async function getSmugMusicShowResolveCandidates(limit, refresh) {
   }
 
   return dbPool.query(`
-    SELECT id, show_id, name, date, poster, raw_sheet, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
+    SELECT id, show_id, name, date, poster, raw_sheet, stats, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status
     FROM music_shows
     WHERE ${where.join(' AND ')}
     ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
@@ -10700,6 +10864,9 @@ async function getSmugMusicShowMissingSourceDiagnostics() {
 }
 
 async function updateSmugMusicShowSnapshot(row, snapshot) {
+  const stats = snapshot.stats && typeof snapshot.stats === 'object'
+    ? snapshot.stats
+    : buildSmugMusicShowStatsSnapshot(row, snapshot.photo_count);
   const result = await dbPool.query(`
     UPDATE music_shows
     SET gallery_id = $2,
@@ -10709,17 +10876,19 @@ async function updateSmugMusicShowSnapshot(row, snapshot) {
         smug_last_synced_at = NOW(),
         smug_sync_status = $6,
         smug_sync_error = $7,
+        stats = $8::jsonb,
         updated_at = NOW()
     WHERE id = $1
-    RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+    RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, stats, smug_last_synced_at, smug_sync_status, smug_sync_error
   `, [
     row.id,
     snapshot.gallery_id || null,
     snapshot.album_id || null,
     snapshot.cover_image_url || null,
     toIntegerCount(snapshot.photo_count),
-    snapshot.smug_sync_status || 'synced',
-    snapshot.smug_sync_error || null
+    snapshot.smug_sync_status || 'resolved',
+    snapshot.smug_sync_error || null,
+    stringifyDbJson(stats)
   ]);
   return result.rows && result.rows[0] ? result.rows[0] : null;
 }
@@ -10732,7 +10901,7 @@ async function updateSmugMusicShowSyncError(row, status, error) {
         smug_sync_error = $3,
         updated_at = NOW()
     WHERE id = $1
-    RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+    RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, stats, smug_last_synced_at, smug_sync_status, smug_sync_error
   `, [
     row.id,
     status || 'error',
@@ -10744,15 +10913,19 @@ async function updateSmugMusicShowSyncError(row, status, error) {
 async function resolveSmugMusicShowAlbum(row) {
   const sourceSelection = getSmugMusicShowSourceSelection(row);
 
-  if (sourceSelection.status === 'skipped_logo_source') {
-    const updated = await updateSmugMusicShowSyncError(row, 'skipped_logo_source', new Error('Skipped logo-style poster source; show_url is required for direct album resolution.'));
+  if (sourceSelection.status === 'skipped_venue_logo_source' || sourceSelection.status === 'skipped_logo_source') {
+    const status = sourceSelection.status;
+    const message = status === 'skipped_venue_logo_source'
+      ? 'Skipped Music Venue logo source; no SmugMug lookup attempted.'
+      : 'Skipped logo-style poster source; no SmugMug lookup attempted.';
+    const updated = await updateSmugMusicShowSyncError(row, status, new Error(message));
     return {
-      status: 'skipped_logo_source',
+      status,
       updated,
-      diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'skipped_logo_source', {
+      diagnostic: buildSmugMusicShowResolveDiagnostic(row, status, {
         source_url: sourceSelection.skipped_url,
         source_field: sourceSelection.skipped_field,
-        message: 'Skipped logo-style poster source; no SmugMug lookup attempted.'
+        message
       })
     };
   }
@@ -10776,20 +10949,33 @@ async function resolveSmugMusicShowAlbum(row) {
     return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey }) };
   }
 
-  const photoCount = await getSmugAlbumTotalPhotos({ AlbumKey: albumKey });
+  const album = await fetchSmugAlbumMetadata(albumKey);
+  const albumPhotoCount = getSmugAlbumImageCount(album);
+  const photoCount = albumPhotoCount == null ? await getSmugAlbumTotalPhotos(album || { AlbumKey: albumKey }) : albumPhotoCount;
+  const coverImageUrl = getSmugMusicShowResolvedCoverImageUrl(album, sourceUrl, row);
+  const stats = buildSmugMusicShowStatsSnapshot(row, photoCount == null ? 0 : photoCount);
   const updated = await updateSmugMusicShowSnapshot(row, {
     gallery_id: albumKey,
     album_id: albumKey,
-    cover_image_url: sourceUrl,
+    cover_image_url: coverImageUrl,
     photo_count: photoCount == null ? 0 : photoCount,
-    smug_sync_status: 'synced',
+    stats,
+    smug_sync_status: 'resolved',
     smug_sync_error: null
   });
 
   return {
-    status: 'synced',
+    status: 'resolved',
     updated,
-    diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'synced', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey, album_id: albumKey })
+    posterFallbackUsed: !!sourceSelection.poster_fallback,
+    missingCoverImage: !coverImageUrl,
+    diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'resolved', {
+      source_url: sourceUrl,
+      source_field: sourceSelection.field,
+      image_key: imageKey,
+      album_id: albumKey,
+      message: coverImageUrl ? '' : 'Album resolved, but no cover image was available from album metadata or source URL.'
+    })
   };
 }
 function buildSmugMusicShowResolveResultItem(row) {
@@ -10801,8 +10987,10 @@ function buildSmugMusicShowResolveResultItem(row) {
     album_id: row && row.album_id ? row.album_id : null,
     cover_image_url: row && row.cover_image_url ? row.cover_image_url : null,
     photo_count: toIntegerCount(row && row.photo_count),
+    stats: row && row.stats && typeof row.stats === 'object' ? row.stats : {},
     smug_last_synced_at: row && row.smug_last_synced_at ? new Date(row.smug_last_synced_at).toISOString() : null,
-    smug_sync_status: row && row.smug_sync_status ? row.smug_sync_status : ''
+    smug_sync_status: row && row.smug_sync_status ? row.smug_sync_status : '',
+    smug_sync_error: row && row.smug_sync_error ? row.smug_sync_error : null
   };
 }
 
@@ -10862,9 +11050,11 @@ async function runSmugMusicShowResolve(query = {}) {
   const candidates = await getSmugMusicShowResolveCandidates(limit, refresh);
   const unresolvedShows = [];
   const skippedLogoSources = [];
+  const skippedVenueLogoSources = [];
   const noSourceUrlShows = [];
   const noImageKeyShows = [];
   const noAlbumKeyShows = [];
+  const missingCoverImages = [];
   const failures = [];
   const updatedItems = [];
   const counters = {
@@ -10873,9 +11063,12 @@ async function runSmugMusicShowResolve(query = {}) {
     resolved: 0,
     unresolved: 0,
     skipped_logo_source: 0,
+    skipped_venue_logo_source: 0,
     no_source_url: 0,
     no_image_key: 0,
     no_album_key: 0,
+    missing_cover_image: 0,
+    poster_fallback_usage: 0,
     failed: 0,
     recordsUpdated: 0
   };
@@ -10888,32 +11081,39 @@ async function runSmugMusicShowResolve(query = {}) {
         counters.recordsUpdated += 1;
         updatedItems.push(buildSmugMusicShowResolveResultItem(result.updated));
       }
-      if (result.status === 'synced') {
+
+      const diagnostic = result.diagnostic || buildSmugMusicShowResolveDiagnostic(row, result.status);
+      if (result.status === 'resolved' || result.status === 'synced') {
         counters.resolved += 1;
-      } else {
-        const diagnostic = result.diagnostic || buildSmugMusicShowResolveDiagnostic(row, result.status);
-        if (result.status === 'skipped_logo_source') {
-          counters.skipped_logo_source += 1;
-          skippedLogoSources.push(diagnostic);
-        } else if (result.status === 'no_source_url') {
-          counters.no_source_url += 1;
-          counters.unresolved += 1;
-          noSourceUrlShows.push(diagnostic);
-          unresolvedShows.push(diagnostic);
-        } else if (result.status === 'no_image_key') {
-          counters.no_image_key += 1;
-          counters.unresolved += 1;
-          noImageKeyShows.push(diagnostic);
-          unresolvedShows.push(diagnostic);
-        } else if (result.status === 'no_album_key') {
-          counters.no_album_key += 1;
-          counters.unresolved += 1;
-          noAlbumKeyShows.push(diagnostic);
-          unresolvedShows.push(diagnostic);
-        } else {
-          counters.unresolved += 1;
-          unresolvedShows.push(diagnostic);
+        if (result.posterFallbackUsed) counters.poster_fallback_usage += 1;
+        if (result.missingCoverImage) {
+          counters.missing_cover_image += 1;
+          missingCoverImages.push(diagnostic);
         }
+      } else if (result.status === 'skipped_venue_logo_source') {
+        counters.skipped_venue_logo_source += 1;
+        skippedVenueLogoSources.push(diagnostic);
+      } else if (result.status === 'skipped_logo_source') {
+        counters.skipped_logo_source += 1;
+        skippedLogoSources.push(diagnostic);
+      } else if (result.status === 'no_source_url') {
+        counters.no_source_url += 1;
+        counters.unresolved += 1;
+        noSourceUrlShows.push(diagnostic);
+        unresolvedShows.push(diagnostic);
+      } else if (result.status === 'no_image_key') {
+        counters.no_image_key += 1;
+        counters.unresolved += 1;
+        noImageKeyShows.push(diagnostic);
+        unresolvedShows.push(diagnostic);
+      } else if (result.status === 'no_album_key') {
+        counters.no_album_key += 1;
+        counters.unresolved += 1;
+        noAlbumKeyShows.push(diagnostic);
+        unresolvedShows.push(diagnostic);
+      } else {
+        counters.unresolved += 1;
+        unresolvedShows.push(diagnostic);
       }
     } catch (err) {
       counters.failed += 1;
@@ -10940,9 +11140,12 @@ async function runSmugMusicShowResolve(query = {}) {
       showsResolved: counters.resolved,
       showsUnresolved: counters.unresolved,
       skippedLogoSource: counters.skipped_logo_source,
+      skippedVenueLogoSource: counters.skipped_venue_logo_source,
       noSourceUrl: counters.no_source_url,
       noImageKey: counters.no_image_key,
       noAlbumKey: counters.no_album_key,
+      missingCoverImage: counters.missing_cover_image,
+      posterFallbackUsage: counters.poster_fallback_usage,
       failures: counters.failed,
       recordsUpdated: counters.recordsUpdated,
       missingSource: missingSource.count
@@ -10950,16 +11153,21 @@ async function runSmugMusicShowResolve(query = {}) {
     showsResolved: counters.resolved,
     showsUnresolved: counters.unresolved,
     skippedLogoSource: counters.skipped_logo_source,
+    skippedVenueLogoSource: counters.skipped_venue_logo_source,
     noSourceUrl: counters.no_source_url,
     noImageKey: counters.no_image_key,
     noAlbumKey: counters.no_album_key,
+    missingCoverImage: counters.missing_cover_image,
+    posterFallbackUsage: counters.poster_fallback_usage,
     recordsUpdated: counters.recordsUpdated,
     diagnostics: {
       missingSource,
       skippedLogoSource: skippedLogoSources.slice(0, 25),
+      skippedVenueLogoSource: skippedVenueLogoSources.slice(0, 25),
       noSourceUrl: noSourceUrlShows.slice(0, 25),
       noImageKey: noImageKeyShows.slice(0, 25),
       noAlbumKey: noAlbumKeyShows.slice(0, 25),
+      missingCoverImage: missingCoverImages.slice(0, 25),
       unresolvedShows: unresolvedShows.slice(0, 25),
       failures: failures.slice(0, 25)
     },
