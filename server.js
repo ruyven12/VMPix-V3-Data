@@ -10840,8 +10840,6 @@ function getSmugMusicShowSourceSelection(row) {
     { field: 'raw_sheet.poster', url: getSmugMusicShowRawField(row, 'poster') }
   ];
   let skippedVenueLogoSource = null;
-  let skippedLogoSource = null;
-  let rawPhotoSource = null;
 
   const chooseCandidate = (candidate, sourceType) => {
     const url = String(candidate.url || '').trim();
@@ -10849,8 +10847,6 @@ function getSmugMusicShowSourceSelection(row) {
     const skip = getSmugMusicShowSourceSkip({ field: candidate.field, url });
     if (skip) {
       if (skip.status === 'skipped_venue_logo_source' && !skippedVenueLogoSource) skippedVenueLogoSource = skip;
-      if (skip.status === 'skipped_logo_source' && !skippedLogoSource) skippedLogoSource = skip;
-      if (skip.status === 'raw_photo_source_no_album_context' && !rawPhotoSource) rawPhotoSource = skip;
       return null;
     }
     return {
@@ -10859,9 +10855,9 @@ function getSmugMusicShowSourceSelection(row) {
       field: candidate.field,
       source_type: sourceType,
       poster_fallback: sourceType === 'poster' || isSmugMusicShowPosterField(candidate.field),
-      skipped_url: skippedVenueLogoSource ? skippedVenueLogoSource.url : (skippedLogoSource ? skippedLogoSource.url : ''),
-      skipped_field: skippedVenueLogoSource ? skippedVenueLogoSource.field : (skippedLogoSource ? skippedLogoSource.field : ''),
-      skipped_status: skippedVenueLogoSource ? skippedVenueLogoSource.status : (skippedLogoSource ? skippedLogoSource.status : '')
+      skipped_url: skippedVenueLogoSource ? skippedVenueLogoSource.url : '',
+      skipped_field: skippedVenueLogoSource ? skippedVenueLogoSource.field : '',
+      skipped_status: skippedVenueLogoSource ? skippedVenueLogoSource.status : ''
     };
   };
 
@@ -10883,30 +10879,6 @@ function getSmugMusicShowSourceSelection(row) {
       skipped_url: skippedVenueLogoSource.url,
       skipped_field: skippedVenueLogoSource.field,
       skipped_status: skippedVenueLogoSource.status,
-      poster_fallback: false
-    };
-  }
-
-  if (skippedLogoSource) {
-    return {
-      status: 'skipped_logo_source',
-      url: '',
-      field: '',
-      skipped_url: skippedLogoSource.url,
-      skipped_field: skippedLogoSource.field,
-      skipped_status: skippedLogoSource.status,
-      poster_fallback: false
-    };
-  }
-
-  if (rawPhotoSource) {
-    return {
-      status: 'raw_photo_source_no_album_context',
-      url: '',
-      field: '',
-      skipped_url: rawPhotoSource.url,
-      skipped_field: rawPhotoSource.field,
-      skipped_status: rawPhotoSource.status,
       poster_fallback: false
     };
   }
@@ -11281,7 +11253,6 @@ async function runSmugMusicShowResolve(query = {}) {
   const candidates = await getSmugMusicShowResolveCandidates(limit, refresh);
   const unresolvedShows = [];
   const skippedLogoSources = [];
-  const rawPhotoSourceNoAlbumContext = [];
   const skippedVenueLogoSources = [];
   const noSourceUrlShows = [];
   const noImageKeyShows = [];
@@ -11296,7 +11267,6 @@ async function runSmugMusicShowResolve(query = {}) {
     unresolved: 0,
     skipped_logo_source: 0,
     skipped_venue_logo_source: 0,
-    raw_photo_source_no_album_context: 0,
     no_source_url: 0,
     no_image_key: 0,
     no_album_key: 0,
@@ -11329,9 +11299,6 @@ async function runSmugMusicShowResolve(query = {}) {
       } else if (result.status === 'skipped_logo_source') {
         counters.skipped_logo_source += 1;
         skippedLogoSources.push(diagnostic);
-      } else if (result.status === 'raw_photo_source_no_album_context') {
-        counters.raw_photo_source_no_album_context += 1;
-        rawPhotoSourceNoAlbumContext.push(diagnostic);
       } else if (result.status === 'no_source_url') {
         counters.no_source_url += 1;
         counters.unresolved += 1;
@@ -11380,7 +11347,6 @@ async function runSmugMusicShowResolve(query = {}) {
       showsUnresolved: counters.unresolved,
       skippedLogoSource: counters.skipped_logo_source,
       skippedVenueLogoSource: counters.skipped_venue_logo_source,
-      rawPhotoSourceNoAlbumContext: counters.raw_photo_source_no_album_context,
       noSourceUrl: counters.no_source_url,
       noImageKey: counters.no_image_key,
       noAlbumKey: counters.no_album_key,
@@ -11394,7 +11360,6 @@ async function runSmugMusicShowResolve(query = {}) {
     showsUnresolved: counters.unresolved,
     skippedLogoSource: counters.skipped_logo_source,
     skippedVenueLogoSource: counters.skipped_venue_logo_source,
-    rawPhotoSourceNoAlbumContext: counters.raw_photo_source_no_album_context,
     noSourceUrl: counters.no_source_url,
     noImageKey: counters.no_image_key,
     noAlbumKey: counters.no_album_key,
@@ -11405,7 +11370,6 @@ async function runSmugMusicShowResolve(query = {}) {
       missingSource,
       skippedLogoSource: skippedLogoSources.slice(0, 25),
       skippedVenueLogoSource: skippedVenueLogoSources.slice(0, 25),
-      rawPhotoSourceNoAlbumContext: rawPhotoSourceNoAlbumContext.slice(0, 25),
       noSourceUrl: noSourceUrlShows.slice(0, 25),
       noImageKey: noImageKeyShows.slice(0, 25),
       noAlbumKey: noAlbumKeyShows.slice(0, 25),
