@@ -10600,13 +10600,31 @@ function getSmugMusicShowResolveLimit(value) {
 }
 
 function normalizeSmugImageKey(value) {
-  const clean = String(value || '').trim();
-  if (!clean) return '';
-  return /^i-/i.test(clean) ? clean : `i-${clean}`;
+  return String(value || '').trim();
 }
 
 function getBareSmugImageKey(value) {
   return String(value || '').trim().replace(/^i-/i, '');
+}
+
+function getSmugImageKeyCandidates(value) {
+  const clean = String(value || '').trim();
+  if (!clean) return [];
+
+  const bareKey = getBareSmugImageKey(clean);
+  const prefixedKey = bareKey ? `i-${bareKey}` : '';
+  const candidates = /^i-/i.test(clean)
+    ? [clean, bareKey]
+    : [clean, prefixedKey];
+  const seen = new Set();
+
+  return candidates
+    .map((candidate) => String(candidate || '').trim())
+    .filter((candidate) => {
+      if (!candidate || seen.has(candidate)) return false;
+      seen.add(candidate);
+      return true;
+    });
 }
 
 function buildSmugImageDetailEndpointFromSegment(segment) {
@@ -10616,18 +10634,16 @@ function buildSmugImageDetailEndpointFromSegment(segment) {
 }
 
 function buildSmugImageDetailEndpoints(imageKey) {
-  const normalizedKey = normalizeSmugImageKey(imageKey);
-  if (!normalizedKey) return [];
+  const keyCandidates = getSmugImageKeyCandidates(imageKey);
+  const endpointSegments = [];
 
-  const bareKey = getBareSmugImageKey(normalizedKey);
-  const candidates = [
-    normalizedKey,
-    `${normalizedKey}-0`,
-    bareKey ? `${bareKey}-0` : '',
-    bareKey
-  ];
+  keyCandidates.forEach((candidate) => {
+    endpointSegments.push(`${candidate}-0`);
+    endpointSegments.push(candidate);
+  });
+
   const seen = new Set();
-  return candidates
+  return endpointSegments
     .map(buildSmugImageDetailEndpointFromSegment)
     .filter((endpoint) => {
       if (!endpoint || seen.has(endpoint)) return false;
@@ -10641,21 +10657,30 @@ function buildSmugImageDetailEndpoint(imageKey) {
 }
 
 async function fetchSmugImageDetail(imageKey) {
+  const attemptedImageKeys = getSmugImageKeyCandidates(imageKey);
   const endpoints = buildSmugImageDetailEndpoints(imageKey);
   let lastError = null;
 
   for (const endpoint of endpoints) {
     try {
       const json = await fetchSmugJson(endpoint);
-      return { json, endpoint, endpoints };
+      return { json, endpoint, endpoints, attemptedImageKeys };
     } catch (err) {
       lastError = err;
-      if (!isSmugHttpStatusError(err, 404)) throw err;
+      if (!isSmugHttpStatusError(err, 404)) {
+        err.attemptedImageKeys = attemptedImageKeys;
+        err.imageEndpointAttempts = endpoints;
+        throw err;
+      }
     }
   }
 
   const message = lastError && lastError.message ? lastError.message : 'No SmugMug image detail endpoints were available.';
-  throw new Error(`${message} Tried image endpoints: ${endpoints.join(', ')}`);
+  const error = new Error(`${message} Tried image endpoints: ${endpoints.join(', ')}`);
+  error.attemptedImageKeys = attemptedImageKeys;
+  error.imageEndpointAttempts = endpoints;
+  error.cause = lastError || undefined;
+  throw error;
 }
 
 function extractSmugImageKeyFromUrl(url) {
@@ -10663,13 +10688,38 @@ function extractSmugImageKeyFromUrl(url) {
   if (!clean) return '';
 
   const direct = clean.match(/\b\/i-([A-Za-z0-9]+)\b/i);
-  if (direct && direct[1]) return normalizeSmugImageKey(direct[1]);
+  if (direct && direct[1]) return getBareSmugImageKey(direct[1]);
 
-  const fileStyle = clean.match(/\/([A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
-  if (fileStyle && fileStyle[1]) return normalizeSmugImageKey(fileStyle[1]);
+  const fileStyle = clean.match(/\/(?:i-)?([A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
+  if (fileStyle && fileStyle[1]) return getBareSmugImageKey(fileStyle[1]);
 
-  const segmentStyle = clean.match(/\/\d+-([A-Za-z0-9]+)(?:\/|$)/i);
-  if (segmentStyle && segmentStyle[1]) return normalizeSmugImageKey(segmentStyle[1]);
+  const segmentStyle = clean.match(/\/\d+-(?:i-)?([A-Za-z0-9]+)(?:\/|$)/i);
+  if (segmentStyle && segmentStyle[1]) return getBareSmugImageKey(segmentStyle[1]);
+
+  return '';
+}
+
+function extractSmugAlbumKeyFromUrl(url) {
+  const clean = String(url || '').trim();
+  if (!clean) return '';
+
+  const direct = clean.match(/\/album\/([^/?#]+)/i);
+  if (direct && direct[1]) {
+    try {
+      return decodeURIComponent(String(direct[1]).trim());
+    } catch (_) {
+      return String(direct[1]).trim();
+    }
+  }
+
+  const queryMatch = clean.match(/[?&]album(?:_id|id|key)?=([^&#]+)/i);
+  if (queryMatch && queryMatch[1]) {
+    try {
+      return decodeURIComponent(String(queryMatch[1]).trim());
+    } catch (_) {
+      return String(queryMatch[1]).trim();
+    }
+  }
 
   return '';
 }
@@ -10768,12 +10818,6 @@ function getSmugMusicShowSourceSkip(candidate) {
   if (!url) return null;
   if (isSmugMusicShowVenueLogoSourceUrl(url)) {
     return { status: 'skipped_venue_logo_source', field: candidate.field, url };
-  }
-  if (isSmugMusicShowLogoSourceUrl(url)) {
-    return { status: 'skipped_logo_source', field: candidate.field, url };
-  }
-  if (isSmugRawPhotoCdnUrl(url) && isSmugMusicShowPosterField(candidate.field)) {
-    return { status: 'raw_photo_source_no_album_context', field: candidate.field, url };
   }
   return null;
 }
@@ -10876,6 +10920,16 @@ function getSmugMusicShowSourceUrl(row) {
 function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
   const sourceSelection = getSmugMusicShowSourceSelection(row);
   const sourceUrl = extra.source_url || sourceSelection.url || sourceSelection.skipped_url || '';
+  const extractedImageKey = extra.extracted_image_key || extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '';
+  const attemptedImageKeys = Array.isArray(extra.attempted_image_keys)
+    ? extra.attempted_image_keys
+    : (extractedImageKey ? getSmugImageKeyCandidates(extractedImageKey) : []);
+  const imageEndpointAttempts = Array.isArray(extra.image_endpoint_attempts)
+    ? extra.image_endpoint_attempts
+    : Array.isArray(extra.image_endpoints)
+      ? extra.image_endpoints
+      : (extractedImageKey ? buildSmugImageDetailEndpoints(extractedImageKey) : []);
+
   return {
     show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
     name: row && row.name ? row.name : '',
@@ -10883,8 +10937,11 @@ function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
     poster: row && row.poster ? row.poster : '',
     source_url: sourceUrl,
     source_field: extra.source_field || sourceSelection.field || sourceSelection.skipped_field || '',
-    image_key: extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '',
-    image_endpoint: extra.image_endpoint || (extra.image_key ? buildSmugImageDetailEndpoint(extra.image_key) : ''),
+    image_key: extractedImageKey,
+    extracted_image_key: extractedImageKey,
+    attempted_image_keys: attemptedImageKeys,
+    image_endpoint: extra.image_endpoint || imageEndpointAttempts[0] || '',
+    image_endpoint_attempts: imageEndpointAttempts,
     album_id: extra.album_id || '',
     status,
     message: extra.message || ''
@@ -11028,13 +11085,9 @@ async function updateSmugMusicShowSyncError(row, status, error) {
 async function resolveSmugMusicShowAlbum(row) {
   const sourceSelection = getSmugMusicShowSourceSelection(row);
 
-  if (sourceSelection.status === 'skipped_venue_logo_source' || sourceSelection.status === 'skipped_logo_source' || sourceSelection.status === 'raw_photo_source_no_album_context') {
+  if (sourceSelection.status === 'skipped_venue_logo_source') {
     const status = sourceSelection.status;
-    const message = status === 'skipped_venue_logo_source'
-      ? 'Skipped Music Venue logo source; no SmugMug lookup attempted.'
-      : status === 'raw_photo_source_no_album_context'
-        ? 'Skipped raw poster CDN image source; poster is display media only. Add show_url to resolve the album.'
-        : 'Skipped logo-style poster source; no SmugMug lookup attempted.';
+    const message = 'Skipped Music Venue logo source; no SmugMug lookup attempted.';
     const updated = await updateSmugMusicShowSyncError(row, status, new Error(message));
     return {
       status,
@@ -11053,19 +11106,74 @@ async function resolveSmugMusicShowAlbum(row) {
   }
 
   const sourceUrl = sourceSelection.url;
-  const imageKey = extractSmugImageKeyFromUrl(sourceUrl);
-  if (!imageKey) {
-    const updated = await updateSmugMusicShowSyncError(row, 'no_image_key', new Error('Unable to extract SmugMug ImageKey from show_url/poster_url.'));
-    return { status: 'no_image_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_image_key', { source_url: sourceUrl, source_field: sourceSelection.field }) };
-  }
+  let albumKey = extractSmugAlbumKeyFromUrl(sourceUrl);
+  let imageKey = '';
+  let attemptedImageKeys = [];
+  let imageEndpoint = '';
+  let imageEndpoints = [];
 
-  const imageDetail = await fetchSmugImageDetail(imageKey);
-  const imageEndpoint = imageDetail.endpoint;
-  const imageJson = imageDetail.json;
-  const albumKey = extractSmugAlbumKeyFromImageDetail(imageJson);
   if (!albumKey) {
-    const updated = await updateSmugMusicShowSyncError(row, 'no_album_key', new Error('SmugMug image detail did not include a parent AlbumKey.'));
-    return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey, image_endpoint: imageEndpoint, image_endpoints: imageDetail.endpoints }) };
+    imageKey = extractSmugImageKeyFromUrl(sourceUrl);
+    attemptedImageKeys = imageKey ? getSmugImageKeyCandidates(imageKey) : [];
+    imageEndpoints = imageKey ? buildSmugImageDetailEndpoints(imageKey) : [];
+
+    if (!imageKey) {
+      const updated = await updateSmugMusicShowSyncError(row, 'no_image_key', new Error('Unable to extract SmugMug ImageKey from show_url/poster_url.'));
+      return {
+        status: 'no_image_key',
+        updated,
+        diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_image_key', {
+          source_url: sourceUrl,
+          source_field: sourceSelection.field,
+          image_endpoint_attempts: imageEndpoints,
+          attempted_image_keys: attemptedImageKeys
+        })
+      };
+    }
+
+    let imageDetail;
+    try {
+      imageDetail = await fetchSmugImageDetail(imageKey);
+    } catch (err) {
+      const endpointAttempts = Array.isArray(err.imageEndpointAttempts) ? err.imageEndpointAttempts : imageEndpoints;
+      const keyAttempts = Array.isArray(err.attemptedImageKeys) ? err.attemptedImageKeys : attemptedImageKeys;
+      const updated = await updateSmugMusicShowSyncError(row, 'error', err);
+      return {
+        status: 'error',
+        updated,
+        diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'error', {
+          source_url: sourceUrl,
+          source_field: sourceSelection.field,
+          image_key: imageKey,
+          extracted_image_key: imageKey,
+          attempted_image_keys: keyAttempts,
+          image_endpoint_attempts: endpointAttempts,
+          image_endpoint: endpointAttempts[0] || '',
+          message: getSafeErrorMessage(err)
+        })
+      };
+    }
+
+    imageEndpoint = imageDetail.endpoint;
+    imageEndpoints = imageDetail.endpoints || imageEndpoints;
+    attemptedImageKeys = imageDetail.attemptedImageKeys || attemptedImageKeys;
+    albumKey = extractSmugAlbumKeyFromImageDetail(imageDetail.json);
+    if (!albumKey) {
+      const updated = await updateSmugMusicShowSyncError(row, 'no_album_key', new Error('SmugMug image detail did not include a parent AlbumKey.'));
+      return {
+        status: 'no_album_key',
+        updated,
+        diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', {
+          source_url: sourceUrl,
+          source_field: sourceSelection.field,
+          image_key: imageKey,
+          extracted_image_key: imageKey,
+          attempted_image_keys: attemptedImageKeys,
+          image_endpoint: imageEndpoint,
+          image_endpoint_attempts: imageEndpoints
+        })
+      };
+    }
   }
 
   const album = await fetchSmugAlbumMetadata(albumKey);
@@ -11092,6 +11200,10 @@ async function resolveSmugMusicShowAlbum(row) {
       source_url: sourceUrl,
       source_field: sourceSelection.field,
       image_key: imageKey,
+      extracted_image_key: imageKey,
+      attempted_image_keys: attemptedImageKeys,
+      image_endpoint: imageEndpoint,
+      image_endpoint_attempts: imageEndpoints,
       album_id: albumKey,
       message: coverImageUrl ? '' : 'Album resolved, but no cover image was available from album metadata or source URL.'
     })
@@ -11235,6 +11347,9 @@ async function runSmugMusicShowResolve(query = {}) {
         counters.unresolved += 1;
         noAlbumKeyShows.push(diagnostic);
         unresolvedShows.push(diagnostic);
+      } else if (result.status === 'error') {
+        counters.failed += 1;
+        failures.push(diagnostic);
       } else {
         counters.unresolved += 1;
         unresolvedShows.push(diagnostic);
