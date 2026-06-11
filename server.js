@@ -10575,6 +10575,12 @@ function normalizeSmugImageKey(value) {
   return /^i-/i.test(clean) ? clean : `i-${clean}`;
 }
 
+function buildSmugImageDetailEndpoint(imageKey) {
+  const normalizedKey = normalizeSmugImageKey(imageKey);
+  if (!normalizedKey) return '';
+  return `/image/${encodeURIComponent(normalizedKey)}-0?_accept=application/json&_verbosity=1&_expand=Image`;
+}
+
 function extractSmugImageKeyFromUrl(url) {
   const clean = String(url || '').trim();
   if (!clean) return '';
@@ -10778,6 +10784,7 @@ function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
     source_url: sourceUrl,
     source_field: extra.source_field || sourceSelection.field || sourceSelection.skipped_field || '',
     image_key: extra.image_key || extractSmugImageKeyFromUrl(sourceUrl) || '',
+    image_endpoint: extra.image_endpoint || (extra.image_key ? buildSmugImageDetailEndpoint(extra.image_key) : ''),
     album_id: extra.album_id || '',
     status,
     message: extra.message || ''
@@ -10948,11 +10955,12 @@ async function resolveSmugMusicShowAlbum(row) {
     return { status: 'no_image_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_image_key', { source_url: sourceUrl, source_field: sourceSelection.field }) };
   }
 
-  const imageJson = await fetchSmugJson(`/image/${encodeURIComponent(imageKey)}-0?_accept=application/json&_verbosity=1&_expand=Image`);
+  const imageEndpoint = buildSmugImageDetailEndpoint(imageKey);
+  const imageJson = await fetchSmugJson(imageEndpoint);
   const albumKey = extractSmugAlbumKeyFromImageDetail(imageJson);
   if (!albumKey) {
     const updated = await updateSmugMusicShowSyncError(row, 'no_album_key', new Error('SmugMug image detail did not include a parent AlbumKey.'));
-    return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey }) };
+    return { status: 'no_album_key', updated, diagnostic: buildSmugMusicShowResolveDiagnostic(row, 'no_album_key', { source_url: sourceUrl, source_field: sourceSelection.field, image_key: imageKey, image_endpoint: imageEndpoint }) };
   }
 
   const album = await fetchSmugAlbumMetadata(albumKey);
