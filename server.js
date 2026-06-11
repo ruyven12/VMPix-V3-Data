@@ -506,6 +506,11 @@ function buildSmugApiUrl(endpoint) {
   return url.toString();
 }
 
+function buildSmugApiDebugUrl(endpoint) {
+  const cleanEndpoint = normalizeSmugEndpoint(endpoint);
+  return `${SMUG_API_BASE_URL}${cleanEndpoint}`;
+}
+
 function getSmugSafeEndpointLabel(endpoint) {
   try {
     const cleanEndpoint = normalizeSmugEndpoint(endpoint);
@@ -10608,25 +10613,9 @@ function getBareSmugImageKey(value) {
 }
 
 function getSmugImageKeyCandidates(value) {
-  const clean = String(value || '').trim();
-  if (!clean) return [];
-
-  const bareKey = getBareSmugImageKey(clean);
-  const prefixedKey = bareKey ? `i-${bareKey}` : '';
-  const candidates = /^i-/i.test(clean)
-    ? [clean, bareKey]
-    : [clean, prefixedKey];
-  const seen = new Set();
-
-  return candidates
-    .map((candidate) => String(candidate || '').trim())
-    .filter((candidate) => {
-      if (!candidate || seen.has(candidate)) return false;
-      seen.add(candidate);
-      return true;
-    });
+  const bareKey = getBareSmugImageKey(value);
+  return bareKey ? [bareKey] : [];
 }
-
 function buildSmugImageDetailEndpointFromSegment(segment) {
   const clean = String(segment || '').trim();
   if (!clean) return '';
@@ -10686,18 +10675,17 @@ function extractSmugImageKeyFromUrl(url) {
   const clean = String(url || '').trim();
   if (!clean) return '';
 
-  const direct = clean.match(/\b\/(i-[A-Za-z0-9]+)\b/i);
+  const direct = clean.match(/\b\/i-([A-Za-z0-9]+)\b/i);
   if (direct && direct[1]) return String(direct[1]).trim();
 
-  const fileStyle = clean.match(/\/((?:i-)?[A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
+  const fileStyle = clean.match(/\/(?:i-)?([A-Za-z0-9]+)-[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)(?:\?|#|$)/i);
   if (fileStyle && fileStyle[1]) return String(fileStyle[1]).trim();
 
-  const segmentStyle = clean.match(/\/\d+-((?:i-)?[A-Za-z0-9]+)(?:\/|$)/i);
+  const segmentStyle = clean.match(/\/\d+-(?:i-)?([A-Za-z0-9]+)(?:\/|$)/i);
   if (segmentStyle && segmentStyle[1]) return String(segmentStyle[1]).trim();
 
   return '';
 }
-
 function extractSmugAlbumKeyFromUrl(url) {
   const clean = String(url || '').trim();
   if (!clean) return '';
@@ -10900,6 +10888,7 @@ function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
     : Array.isArray(extra.image_endpoints)
       ? extra.image_endpoints
       : (extractedImageKey ? buildSmugImageDetailEndpoints(extractedImageKey) : []);
+  const imageApiUrlAttemptsBeforeApiKey = imageEndpointAttempts.map((endpoint) => buildSmugApiDebugUrl(endpoint));
 
   return {
     show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
@@ -10913,6 +10902,8 @@ function buildSmugMusicShowResolveDiagnostic(row, status, extra = {}) {
     attempted_image_keys: attemptedImageKeys,
     image_endpoint: extra.image_endpoint || imageEndpointAttempts[0] || '',
     image_endpoint_attempts: imageEndpointAttempts,
+    image_api_url_before_api_key: extra.image_api_url_before_api_key || imageApiUrlAttemptsBeforeApiKey[0] || '',
+    image_api_url_attempts_before_api_key: imageApiUrlAttemptsBeforeApiKey,
     album_id: extra.album_id || '',
     status,
     message: extra.message || ''
