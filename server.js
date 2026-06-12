@@ -711,13 +711,75 @@ function getSmugAlbumPhotoUrl(image, fieldNames) {
   return getSmugImageUrlFromObject(image) || '';
 }
 
+const SMUG_IMAGE_SIZE_RANK = {
+  TI: 0,
+  TH: 1,
+  S: 2,
+  M: 3,
+  L: 4,
+  XL: 5,
+  X2: 6,
+  X3: 7,
+  X4: 8,
+  X5: 9,
+  O: 10
+};
+const SMUG_IMAGE_SIZE_PATTERN = 'Ti|Th|S|M|L|XL|X2|X3|X4|X5|O';
+
+function normalizeSmugImageSizeCode(value) {
+  const code = String(value || '').trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(SMUG_IMAGE_SIZE_RANK, code) ? code : '';
+}
+
+function getSmugImageUrlSizeCode(sourceUrl) {
+  const url = String(sourceUrl || '').trim();
+  if (!url || !/photos\.smugmug\.com/i.test(url)) return '';
+
+  const match = url.match(new RegExp(`/(${SMUG_IMAGE_SIZE_PATTERN})/[^/?#]+?-(${SMUG_IMAGE_SIZE_PATTERN})(?:\\.[a-z0-9]+)(?:[?#].*)?$`, 'i'));
+  if (!match) return '';
+
+  const folderCode = normalizeSmugImageSizeCode(match[1]);
+  const fileCode = normalizeSmugImageSizeCode(match[2]);
+  return folderCode && folderCode === fileCode ? folderCode : '';
+}
+
+function buildSmugImageSizeVariantUrl(sourceUrl, sizeCode) {
+  const url = String(sourceUrl || '').trim();
+  const normalizedSizeCode = normalizeSmugImageSizeCode(sizeCode);
+  if (!url || !normalizedSizeCode || !/photos\.smugmug\.com/i.test(url)) return '';
+
+  const sizeUrlPattern = new RegExp(`/(${SMUG_IMAGE_SIZE_PATTERN})/([^/?#]+?)-(${SMUG_IMAGE_SIZE_PATTERN})(\\.[a-z0-9]+)([?#].*)?$`, 'i');
+  if (!sizeUrlPattern.test(url)) return '';
+
+  return url.replace(sizeUrlPattern, `/${normalizedSizeCode}/$2-${normalizedSizeCode}$4$5`);
+}
+
+function getSmugAlbumPhotoSizedUrl(image, fieldNames, sizeCode, fallbackUrl = '') {
+  const direct = getSmugNestedField(image, fieldNames);
+  const requestedSizeCode = normalizeSmugImageSizeCode(sizeCode);
+  const requestedRank = SMUG_IMAGE_SIZE_RANK[requestedSizeCode];
+  const directSizeCode = getSmugImageUrlSizeCode(direct);
+
+  if (direct && (!directSizeCode || SMUG_IMAGE_SIZE_RANK[directSizeCode] >= requestedRank)) {
+    return direct;
+  }
+
+  const fallback = String(fallbackUrl || '').trim() || getSmugImageUrlFromObject(image) || '';
+  const variant = buildSmugImageSizeVariantUrl(direct || fallback, requestedSizeCode);
+  if (variant) return variant;
+
+  return direct || fallback;
+}
+
 function buildSmugAlbumPhotoItem(image) {
+  const thumbnailUrl = getSmugAlbumPhotoUrl(image, ['ThumbnailUrl', 'ThumbnailURL', 'ThumbUrl', 'ThumbURL', 'TinyUrl', 'TinyURL']);
+
   return {
     image_key: getSmugAlbumPhotoImageKey(image),
-    thumbnail_url: getSmugAlbumPhotoUrl(image, ['ThumbnailUrl', 'ThumbnailURL', 'ThumbUrl', 'ThumbURL', 'TinyUrl', 'TinyURL']),
-    small_url: getSmugAlbumPhotoUrl(image, ['SmallUrl', 'SmallURL', 'ThumbnailUrl', 'ThumbnailURL']),
-    medium_url: getSmugAlbumPhotoUrl(image, ['MediumUrl', 'MediumURL', 'LargeUrl', 'LargeURL']),
-    large_url: getSmugAlbumPhotoUrl(image, ['LargeUrl', 'LargeURL', 'XLargeUrl', 'XLargeURL', 'X2LargeUrl', 'X2LargeURL', 'OriginalUrl', 'OriginalURL', 'ImageUrl', 'ImageURL']),
+    thumbnail_url: thumbnailUrl,
+    small_url: getSmugAlbumPhotoSizedUrl(image, ['SmallUrl', 'SmallURL', 'ThumbnailUrl', 'ThumbnailURL'], 'S', thumbnailUrl),
+    medium_url: getSmugAlbumPhotoSizedUrl(image, ['MediumUrl', 'MediumURL', 'LargeUrl', 'LargeURL'], 'M', thumbnailUrl),
+    large_url: getSmugAlbumPhotoSizedUrl(image, ['LargeUrl', 'LargeURL', 'XLargeUrl', 'XLargeURL', 'X2LargeUrl', 'X2LargeURL', 'OriginalUrl', 'OriginalURL', 'ImageUrl', 'ImageURL'], 'L', thumbnailUrl),
     caption: getSmugImageCaption(image)
   };
 }
