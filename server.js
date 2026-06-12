@@ -64,12 +64,16 @@ const SMUG_ALBUM_PHOTOS_CACHE_TTL_MS = Math.max(
 const SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT = 12;
 const SMUG_ALBUM_PHOTOS_MAX_LIMIT = 25;
 const SMUG_ALBUM_PHOTOS_CACHE_VERSION = 'album_photos:v2';
+const SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT = getIntegerEnv('SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT', 200, 1, 200);
+const SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM = getIntegerEnv('SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM', 100, 1, 500);
 const cache = new Map();
 const smugTotalPhotosCache = new Map();
 const smugTotalPhotosInFlight = new Map();
 const smugPeoplePhotoCountCache = new Map();
 const smugPeoplePhotoCountInFlight = new Map();
 const smugAlbumPhotosCache = new Map();
+const smugBandArchiveCoverageCache = new Map();
+const smugBandArchiveCoverageInFlight = new Map();
 
 const ROUTES = {
   '/api/music/bands': { label: 'Music-Bands', gidEnv: 'GID_MUSIC_BANDS' },
@@ -1213,6 +1217,305 @@ async function fetchMusicBandTotalPhotos(row, forceRefresh) {
   return run;
 }
 
+const MUSIC_BAND_ARCHIVE_COVERAGE_KEYS = Object.freeze([
+  'years_covered',
+  'first_capture_year',
+  'last_capture_year',
+  'most_active_year',
+  'most_active_year_photo_count',
+  'latest_seen',
+  'last_updated'
+]);
+
+function createEmptyMusicBandArchiveCoverage() {
+  return {
+    years_covered: null,
+    first_capture_year: null,
+    last_capture_year: null,
+    most_active_year: null,
+    most_active_year_photo_count: null,
+    latest_seen: null,
+    last_updated: null
+  };
+}
+
+function getMusicBandArchiveCoverageFromStats(stats) {
+  const source = stats && typeof stats === 'object' ? stats : {};
+  const coverage = {};
+
+  MUSIC_BAND_ARCHIVE_COVERAGE_KEYS.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      coverage[key] = source[key];
+    }
+  });
+
+  return coverage;
+}
+
+function addMusicBandArchiveCoverageFields(target, coverage) {
+  if (!target || typeof target !== 'object' || !coverage || typeof coverage !== 'object') return target;
+
+  MUSIC_BAND_ARCHIVE_COVERAGE_KEYS.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(coverage, key)) {
+      target[key] = coverage[key];
+    }
+  });
+
+  return target;
+}
+
+function normalizeMusicBandCoverageLookupKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function buildMusicBandArchiveCoverageLookup(rows) {
+  if (!String(process.env.DATABASE_URL || '').trim()) return new Map();
+
+  const bandIds = Array.from(new Set((Array.isArray(rows) ? rows : [])
+    .map((row) => String(row && row.band_id || '').trim())
+    .filter(Boolean)));
+  const bandNames = Array.from(new Set((Array.isArray(rows) ? rows : [])
+    .map((row) => getMusicBandName(row))
+    .map(normalizeMusicBandCoverageLookupKey)
+    .filter(Boolean)));
+  if (!bandIds.length && !bandNames.length) return new Map();
+
+  try {
+    const result = await dbPool.query(
+      `SELECT band_id, band, stats
+       FROM music_bands
+       WHERE band_id = ANY($1::text[])
+          OR lower(trim(band)) = ANY($2::text[])`,
+      [bandIds, bandNames]
+    );
+    const lookup = new Map();
+
+    (result.rows || []).forEach((row) => {
+      const coverage = getMusicBandArchiveCoverageFromStats(row.stats);
+      if (Object.keys(coverage).length > 0) {
+        lookup.set(normalizeMusicBandCoverageLookupKey(row.band_id), coverage);
+        lookup.set(normalizeMusicBandCoverageLookupKey(row.band), coverage);
+      }
+    });
+
+    return lookup;
+  } catch (err) {
+    console.warn('Music-Bands archive coverage lookup failed:', err && err.message ? err.message : String(err));
+    return new Map();
+  }
+}
+
+function getMusicBandArchiveCoverageForRow(row, coverageLookup) {
+  if (!coverageLookup || typeof coverageLookup.get !== 'function') return {};
+  return coverageLookup.get(normalizeMusicBandCoverageLookupKey(row && row.band_id)) ||
+    coverageLookup.get(normalizeMusicBandCoverageLookupKey(getMusicBandName(row))) ||
+    {};
+}
+
+function normalizeSmugCoverageDateValue(value) {
+  const clean = String(value || '').trim();
+  if (!clean || /^0{4}[:/-]0{1,2}[:/-]0{1,2}/.test(clean)) return null;
+
+  let match = clean.match(/^(\d{4})[:/-](\d{1,2})[:/-](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const hour = Number(match[4] || 0);
+    const minute = Number(match[5] || 0);
+    const second = Number(match[6] || 0);
+    if (year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return {
+        year,
+        month,
+        day,
+        time: Date.UTC(year, month - 1, day, hour, minute, second)
+      };
+    }
+  }
+
+  match = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (match) {
+    const month = Number(match[1]);
+    const day = Number(match[2]);
+    const shortYear = String(match[3]);
+    const year = shortYear.length === 2 ? Number(`20${shortYear}`) : Number(shortYear);
+    const hour = Number(match[4] || 0);
+    const minute = Number(match[5] || 0);
+    const second = Number(match[6] || 0);
+    if (year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return {
+        year,
+        month,
+        day,
+        time: Date.UTC(year, month - 1, day, hour, minute, second)
+      };
+    }
+  }
+
+  const parsed = Date.parse(clean);
+  if (Number.isNaN(parsed)) return null;
+  const date = new Date(parsed);
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    time: parsed
+  };
+}
+
+function formatMusicBandCoverageDate(dateInfo) {
+  if (!dateInfo) return null;
+  return `${String(dateInfo.month).padStart(2, '0')}/${String(dateInfo.day).padStart(2, '0')}/${dateInfo.year}`;
+}
+
+function getSmugArchiveCoverageField(image, fieldName, depth = 0, seen = new Set()) {
+  if (!image || typeof image !== 'object' || depth > 8 || seen.has(image)) return '';
+  seen.add(image);
+
+  const camelField = fieldName.charAt(0).toLowerCase() + fieldName.slice(1);
+  for (const key of [fieldName, camelField]) {
+    const value = image[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+
+  for (const value of Object.values(image)) {
+    if (value && typeof value === 'object') {
+      const nested = getSmugArchiveCoverageField(value, fieldName, depth + 1, seen);
+      if (nested) return nested;
+    }
+  }
+
+  return '';
+}
+
+function createSmugBandArchiveCoverageAccumulator() {
+  return {
+    firstOriginal: null,
+    latestOriginal: null,
+    latestUpdated: null,
+    yearCounts: new Map()
+  };
+}
+
+function addSmugImageToBandArchiveCoverage(accumulator, image) {
+  const dateTimeOriginal = normalizeSmugCoverageDateValue(getSmugArchiveCoverageField(image, 'DateTimeOriginal'));
+  if (dateTimeOriginal) {
+    if (!accumulator.firstOriginal || dateTimeOriginal.time < accumulator.firstOriginal.time) {
+      accumulator.firstOriginal = dateTimeOriginal;
+    }
+    if (!accumulator.latestOriginal || dateTimeOriginal.time > accumulator.latestOriginal.time) {
+      accumulator.latestOriginal = dateTimeOriginal;
+    }
+    accumulator.yearCounts.set(dateTimeOriginal.year, (accumulator.yearCounts.get(dateTimeOriginal.year) || 0) + 1);
+  }
+
+  const lastUpdated = normalizeSmugCoverageDateValue(getSmugArchiveCoverageField(image, 'LastUpdated'));
+  if (lastUpdated && (!accumulator.latestUpdated || lastUpdated.time > accumulator.latestUpdated.time)) {
+    accumulator.latestUpdated = lastUpdated;
+  }
+}
+
+function finalizeSmugBandArchiveCoverage(accumulator) {
+  if (!accumulator || !accumulator.firstOriginal) {
+    return createEmptyMusicBandArchiveCoverage();
+  }
+
+  let mostActiveYear = null;
+  let mostActiveYearPhotoCount = 0;
+  Array.from(accumulator.yearCounts.entries())
+    .sort(([yearA, countA], [yearB, countB]) => countB - countA || yearA - yearB)
+    .forEach(([year, count], index) => {
+      if (index === 0) {
+        mostActiveYear = year;
+        mostActiveYearPhotoCount = count;
+      }
+    });
+
+  const firstYear = accumulator.firstOriginal.year;
+  const lastYear = accumulator.latestOriginal.year;
+  return {
+    years_covered: firstYear === lastYear ? String(firstYear) : `${firstYear}-${lastYear}`,
+    first_capture_year: firstYear,
+    last_capture_year: lastYear,
+    most_active_year: mostActiveYear,
+    most_active_year_photo_count: mostActiveYearPhotoCount,
+    latest_seen: formatMusicBandCoverageDate(accumulator.latestOriginal),
+    last_updated: formatMusicBandCoverageDate(accumulator.latestUpdated)
+  };
+}
+
+async function addSmugAlbumImagesToBandArchiveCoverage(album, accumulator) {
+  const albumId = getSmugAlbumKey(album);
+  if (!albumId) return;
+
+  let start = 1;
+  let page = 0;
+  while (page < SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM) {
+    const json = await fetchSmugJson(`/album/${encodeURIComponent(albumId)}!images?count=${SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT}&start=${start}&_accept=application/json&_expand=Image`);
+    const images = getSmugAlbumImages(json);
+    if (!images.length) break;
+
+    images.forEach((image) => addSmugImageToBandArchiveCoverage(accumulator, image));
+
+    const pageCount = getSmugPageCount(json);
+    if (!hasSmugNextPage(json) || pageCount == null || pageCount <= 0) break;
+    start += pageCount;
+    page += 1;
+  }
+}
+
+async function buildSmugMusicBandArchiveCoverage(albums) {
+  const accumulator = createSmugBandArchiveCoverageAccumulator();
+  const albumList = Array.isArray(albums) ? albums : [];
+
+  await mapWithConcurrency(albumList, SMUG_REQUEST_CONCURRENCY, async (album) => {
+    try {
+      await addSmugAlbumImagesToBandArchiveCoverage(album, accumulator);
+    } catch (err) {
+      console.warn(`Music-Bands SmugMug archive coverage failed for album ${getSmugAlbumKey(album) || 'unknown'}:`, err && err.message ? err.message : String(err));
+    }
+  });
+
+  return finalizeSmugBandArchiveCoverage(accumulator);
+}
+
+async function fetchMusicBandArchiveCoverage(row, albums, forceRefresh) {
+  if (!SMUG_API_KEY) return createEmptyMusicBandArchiveCoverage();
+
+  const target = getMusicBandSmugTarget(row);
+  if (!target) return createEmptyMusicBandArchiveCoverage();
+
+  const cacheKey = `${target.region}/${target.folder}`;
+  const hit = smugBandArchiveCoverageCache.get(cacheKey);
+  if (!forceRefresh && hit && Date.now() - hit.fetchedAt < SMUG_TOTAL_PHOTOS_CACHE_TTL_MS) {
+    return hit.coverage;
+  }
+
+  if (smugBandArchiveCoverageInFlight.has(cacheKey)) {
+    return smugBandArchiveCoverageInFlight.get(cacheKey);
+  }
+
+  const run = (async () => {
+    try {
+      const coverage = await buildSmugMusicBandArchiveCoverage(albums);
+      smugBandArchiveCoverageCache.set(cacheKey, { coverage, fetchedAt: Date.now() });
+      return coverage;
+    } catch (err) {
+      console.warn(`Music-Bands SmugMug archive coverage failed for ${cacheKey}:`, err && err.message ? err.message : String(err));
+      const coverage = createEmptyMusicBandArchiveCoverage();
+      smugBandArchiveCoverageCache.set(cacheKey, { coverage, fetchedAt: Date.now() });
+      return coverage;
+    } finally {
+      smugBandArchiveCoverageInFlight.delete(cacheKey);
+    }
+  })();
+
+  smugBandArchiveCoverageInFlight.set(cacheKey, run);
+  return run;
+}
+
 async function mapWithConcurrency(items, limit, mapper) {
   const list = Array.isArray(items) ? items : [];
   const results = new Array(list.length);
@@ -1639,7 +1942,7 @@ function getMusicBandLetter(row) {
   return firstChar >= 'A' && firstChar <= 'Z' ? firstChar : '#';
 }
 
-async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
+async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup, archiveCoverageLookup) {
   const band = getMusicBandName(row);
   const bandId = String(row.band_id || '').trim();
   const personnel = {};
@@ -1647,6 +1950,7 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
   const members = peopleMembers.length ? peopleMembers : parsePersonnelString(row.members);
   const pastMembers = parsePersonnelString(row.past_members);
   const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh);
+  const archiveCoverage = getMusicBandArchiveCoverageForRow(row, archiveCoverageLookup);
   const general = compactJsonFields({
     name: band,
     smug_folder: row.smug_folder || row.slug_folder,
@@ -1664,6 +1968,7 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
     total_sets: row.total_sets,
     country: row.country
   });
+  addMusicBandArchiveCoverageFields(stats, archiveCoverage);
   const galleryId = row.smug_folder || row.slug_folder;
   const coverImageUrl = row.logo_url;
   addMusicCanonicalAliases(general, {
@@ -1688,6 +1993,7 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
     set_count: row.total_sets,
     member_count: members.length
   });
+  addMusicBandArchiveCoverageFields(item, archiveCoverage);
   if (hasJsonFields(general)) item.general = general;
   if (hasJsonFields(personnel)) item.personnel = personnel;
   if (hasJsonFields(stats)) item.stats = stats;
@@ -1695,7 +2001,7 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup) {
   return item;
 }
 
-async function groupMusicBandsByLetter(rows, forceRefresh, peoplePersonnelLookup) {
+async function groupMusicBandsByLetter(rows, forceRefresh, peoplePersonnelLookup, archiveCoverageLookup) {
   const groups = new Map();
   const stats = createMusicBandsStats();
   const sortedRows = rows.slice().sort((a, b) => {
@@ -1711,7 +2017,7 @@ async function groupMusicBandsByLetter(rows, forceRefresh, peoplePersonnelLookup
 
   const items = await mapWithConcurrency(sortedRows, 4, async (row) => ({
     row,
-    item: await buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup)
+    item: await buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup, archiveCoverageLookup)
   }));
   addMusicBandItemRanks(items);
 
@@ -1740,7 +2046,8 @@ async function buildMusicBandsResponse(payload, forceRefresh) {
   } catch (err) {
     console.warn('Music-Bands People personnel lookup failed:', err && err.message ? err.message : String(err));
   }
-  const bands = await groupMusicBandsByLetter(payload.rows, forceRefresh, peoplePersonnelLookup);
+  const archiveCoverageLookup = await buildMusicBandArchiveCoverageLookup(payload.rows);
+  const bands = await groupMusicBandsByLetter(payload.rows, forceRefresh, peoplePersonnelLookup, archiveCoverageLookup);
   await addStatsSheetPhotoProgress(bands.stats, forceRefresh);
   const source = { name: payload.source };
   if (hasJsonFields(bands.data)) source.data = bands.data;
@@ -4219,6 +4526,7 @@ function buildMusicBandDbApiItem(row) {
   const personnel = row.personnel && typeof row.personnel === 'object' ? row.personnel : {};
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   const members = Array.isArray(personnel.members) ? personnel.members : [];
+  const archiveCoverage = getMusicBandArchiveCoverageFromStats(stats);
   const galleryId = general.smug_folder || row.smug_folder;
   const coverImageUrl = general.cover_image_url || general.logo_url || row.logo_url;
   addMusicCanonicalAliases(general, {
@@ -4231,6 +4539,7 @@ function buildMusicBandDbApiItem(row) {
     set_count: getMusicStatsNumber(stats, ['set_count', 'total_sets', 'setCount']),
     member_count: members.length
   });
+  addMusicBandArchiveCoverageFields(stats, archiveCoverage);
 
   const item = {
     band: row.band,
@@ -4247,6 +4556,7 @@ function buildMusicBandDbApiItem(row) {
     album_id: null,
     cover_image_url: coverImageUrl
   });
+  addMusicBandArchiveCoverageFields(item, archiveCoverage);
   return item;
 }
 
@@ -10648,9 +10958,10 @@ async function updateSmugMusicBandSnapshot(row, snapshot) {
         smug_last_synced_at = NOW(),
         smug_sync_status = $6,
         smug_sync_error = $7,
+        stats = coalesce(stats, '{}'::jsonb) || $8::jsonb,
         updated_at = NOW()
     WHERE id = $1
-    RETURNING id, band_id, band, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error
+    RETURNING id, band_id, band, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error, stats
   `, [
     row.id,
     snapshot.gallery_id || null,
@@ -10658,7 +10969,8 @@ async function updateSmugMusicBandSnapshot(row, snapshot) {
     snapshot.cover_image_url || null,
     toIntegerCount(snapshot.photo_count),
     snapshot.smug_sync_status || 'synced',
-    snapshot.smug_sync_error || null
+    snapshot.smug_sync_error || null,
+    stringifyDbJson(snapshot.archive_coverage || {})
   ]);
   return result.rows && result.rows[0] ? result.rows[0] : null;
 }
@@ -10677,7 +10989,7 @@ async function updateSmugMusicBandSyncError(row, status, error) {
   return result.rows && result.rows[0] ? result.rows[0] : null;
 }
 
-async function discoverSmugMusicBand(row) {
+async function discoverSmugMusicBand(row, forceRefresh = false) {
   const target = getMusicBandSmugTarget(row);
   if (!target) {
     const status = String(row.smug_folder || '').trim() ? 'missing_region' : 'missing_smug_folder';
@@ -10707,6 +11019,7 @@ async function discoverSmugMusicBand(row) {
       album_id: null,
       cover_image_url: row.cover_image_url || row.logo_url || null,
       photo_count: 0,
+      archive_coverage: createEmptyMusicBandArchiveCoverage(),
       smug_sync_status: 'folder_not_found',
       smug_sync_error: message
     });
@@ -10741,6 +11054,7 @@ async function discoverSmugMusicBand(row) {
       album_id: null,
       cover_image_url: row.cover_image_url || row.logo_url || null,
       photo_count: 0,
+      archive_coverage: createEmptyMusicBandArchiveCoverage(),
       smug_sync_status: 'folder_exists_no_child_albums',
       smug_sync_error: message
     });
@@ -10758,6 +11072,7 @@ async function discoverSmugMusicBand(row) {
 
   const albumIds = getSmugAlbumIds(albums);
   const photoCount = await sumSmugAlbumImageCounts(albums);
+  const archiveCoverage = await fetchMusicBandArchiveCoverage(row, albums, forceRefresh);
   const coverImageUrl = albums.map(getSmugAlbumCoverImageUrl).find(Boolean) || row.cover_image_url || row.logo_url || null;
   const duplicateMatch = albums.length > 1;
   const updated = await updateSmugMusicBandSnapshot(row, {
@@ -10765,6 +11080,7 @@ async function discoverSmugMusicBand(row) {
     album_id: albumIds.join(';') || null,
     cover_image_url: coverImageUrl,
     photo_count: photoCount == null ? 0 : photoCount,
+    archive_coverage: archiveCoverage,
     smug_sync_status: duplicateMatch ? 'duplicate_match' : 'synced',
     smug_sync_error: duplicateMatch ? `Multiple SmugMug albums found for ${galleryId}.` : null
   });
@@ -10776,6 +11092,7 @@ async function discoverSmugMusicBand(row) {
   };
 }
 function buildSmugMusicBandDiscoverResultItem(row) {
+  const archiveCoverage = getMusicBandArchiveCoverageFromStats(row && row.stats);
   return {
     band_id: row && row.band_id ? row.band_id : '',
     band: row && row.band ? row.band : '',
@@ -10783,6 +11100,7 @@ function buildSmugMusicBandDiscoverResultItem(row) {
     album_id: row && row.album_id ? row.album_id : null,
     cover_image_url: row && row.cover_image_url ? row.cover_image_url : null,
     photo_count: toIntegerCount(row && row.photo_count),
+    archive_coverage: Object.keys(archiveCoverage).length ? archiveCoverage : createEmptyMusicBandArchiveCoverage(),
     smug_last_synced_at: row && row.smug_last_synced_at ? new Date(row.smug_last_synced_at).toISOString() : null,
     smug_sync_status: row && row.smug_sync_status ? row.smug_sync_status : ''
   };
@@ -10864,7 +11182,7 @@ async function runSmugMusicBandDiscover(query = {}) {
   const results = await mapWithConcurrency(candidates.rows, SMUG_REQUEST_CONCURRENCY, async (row) => {
     counters.attempted += 1;
     try {
-      const result = await discoverSmugMusicBand(row);
+      const result = await discoverSmugMusicBand(row, refresh);
       if (result.updated) {
         counters.recordsUpdated += 1;
         updatedItems.push(buildSmugMusicBandDiscoverResultItem(result.updated));
