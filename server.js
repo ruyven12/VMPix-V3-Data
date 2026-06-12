@@ -662,6 +662,12 @@ function clampSmugAlbumPhotoLimit(value) {
   return Math.min(SMUG_ALBUM_PHOTOS_MAX_LIMIT, Math.max(1, parsed));
 }
 
+function clampSmugAlbumPhotoStart(value) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.max(1, parsed);
+}
+
 function getSmugNestedField(source, fieldNames, depth = 0) {
   if (!source || typeof source !== 'object' || depth > 5) return '';
 
@@ -716,12 +722,12 @@ function buildSmugAlbumPhotoItem(image) {
   };
 }
 
-function getSmugAlbumPhotosCacheKey(albumId, limit) {
-  return `${albumId}:${limit}`;
+function getSmugAlbumPhotosCacheKey(albumId, limit, start) {
+  return `${albumId}:${limit}:${start}`;
 }
 
-function getCachedSmugAlbumPhotos(albumId, limit) {
-  const cacheKey = getSmugAlbumPhotosCacheKey(albumId, limit);
+function getCachedSmugAlbumPhotos(albumId, limit, start) {
+  const cacheKey = getSmugAlbumPhotosCacheKey(albumId, limit, start);
   const hit = smugAlbumPhotosCache.get(cacheKey);
   if (!hit) return null;
 
@@ -733,16 +739,53 @@ function getCachedSmugAlbumPhotos(albumId, limit) {
   return hit.response;
 }
 
-function setCachedSmugAlbumPhotos(albumId, limit, response) {
-  smugAlbumPhotosCache.set(getSmugAlbumPhotosCacheKey(albumId, limit), {
+function setCachedSmugAlbumPhotos(albumId, limit, start, response) {
+  smugAlbumPhotosCache.set(getSmugAlbumPhotosCacheKey(albumId, limit, start), {
     fetchedAt: Date.now(),
     response
   });
 }
 
+function getSmugAlbumPhotosTotal(json, returnedCount, start, hasMore) {
+  const pageTotal = getSmugPageTotal(json);
+  if (pageTotal != null) return pageTotal;
+
+  const resp = json && json.Response ? json.Response : json;
+  const candidates = [
+    resp && resp.Total,
+    resp && resp.total,
+    resp && resp.Album && getSmugAlbumImageCount(resp.Album),
+    json && json.Album && getSmugAlbumImageCount(json.Album)
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === '') continue;
+    const total = Number(candidate);
+    if (Number.isFinite(total) && total >= 0) return total;
+  }
+
+  const currentLast = start + Math.max(0, returnedCount) - 1;
+  return hasMore ? currentLast + 1 : Math.max(0, currentLast);
+}
+
+function buildSmugAlbumPhotosPagination(json, photos, limit, start) {
+  const returnedCount = Array.isArray(photos) ? photos.length : 0;
+  const totalFromPayload = getSmugAlbumPhotosTotal(json, returnedCount, start, hasSmugNextPage(json));
+  const hasMore = totalFromPayload != null
+    ? start + returnedCount - 1 < totalFromPayload
+    : hasSmugNextPage(json) || returnedCount >= limit;
+
+  return {
+    total: totalFromPayload,
+    has_more: !!hasMore,
+    next_start: hasMore && returnedCount > 0 ? start + returnedCount : null
+  };
+}
+
 async function handleMusicSmugAlbumPhotosRequest(req, res) {
   const albumId = String(req.params.album_id || '').trim();
   const limit = clampSmugAlbumPhotoLimit(req.query.limit);
+  const start = clampSmugAlbumPhotoStart(req.query.start);
   const generatedAt = new Date().toISOString();
 
   if (!albumId) {
@@ -755,24 +798,29 @@ async function handleMusicSmugAlbumPhotosRequest(req, res) {
     });
   }
 
-  const cached = getCachedSmugAlbumPhotos(albumId, limit);
+  const cached = getCachedSmugAlbumPhotos(albumId, limit, start);
   if (cached) {
     return res.json({ ...cached, cache: { hit: true } });
   }
 
   try {
-    const endpoint = `/album/${encodeURIComponent(albumId)}!images?count=${limit}&start=1&_accept=application/json&_expand=Image`;
+    const endpoint = `/album/${encodeURIComponent(albumId)}!images?count=${limit}&start=${start}&_accept=application/json&_expand=Image`;
     const json = await fetchSmugJson(endpoint);
     const photos = getSmugAlbumImages(json).slice(0, limit).map(buildSmugAlbumPhotoItem);
+    const pagination = buildSmugAlbumPhotosPagination(json, photos, limit, start);
     const response = {
       ok: true,
       album_id: albumId,
       count: photos.length,
       limit,
+      start,
+      total: pagination.total,
+      has_more: pagination.has_more,
+      next_start: pagination.next_start,
       photos
     };
 
-    setCachedSmugAlbumPhotos(albumId, limit, response);
+    setCachedSmugAlbumPhotos(albumId, limit, start, response);
     return res.json({ ...response, cache: { hit: false } });
   } catch (err) {
     return res.status(502).json({
