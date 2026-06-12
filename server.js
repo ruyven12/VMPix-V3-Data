@@ -1312,6 +1312,140 @@ function getMusicBandArchiveCoverageForRow(row, coverageLookup) {
     {};
 }
 
+function hasMusicBandArchiveCoverageData(coverage) {
+  if (!coverage || typeof coverage !== 'object') return false;
+  return MUSIC_BAND_ARCHIVE_COVERAGE_KEYS.some((key) => {
+    const value = coverage[key];
+    return value != null && String(value).trim() !== '';
+  });
+}
+
+function hasRequiredMusicBandArchiveCoverageData(coverage) {
+  if (!coverage || typeof coverage !== 'object') return false;
+  return ['years_covered', 'most_active_year', 'latest_seen', 'last_updated'].every((key) => {
+    const value = coverage[key];
+    return value != null && String(value).trim() !== '';
+  });
+}
+
+function getMusicBandArchiveCoverageRequestRef(query) {
+  const params = query && typeof query === 'object' ? query : {};
+  const mode = String(params.coverage || params.archive_coverage || '').trim().toLowerCase();
+  if (!['1', 'true', 'archive', 'archive_coverage'].includes(mode)) return '';
+
+  return String(params.band_id || params.bandId || params.band || params.id || '').trim();
+}
+
+function getMusicBandArchiveCoverageRowKeys(row) {
+  const bandName = getMusicBandName(row);
+  return [
+    row && row.band_id,
+    row && row.bandId,
+    row && row.id,
+    row && row.slug,
+    bandName,
+    slugifyMusicBandId(bandName),
+    row && row.smug_folder,
+    row && row.slug_folder
+  ]
+    .map(normalizeMusicBandCoverageLookupKey)
+    .filter(Boolean);
+}
+
+function findMusicBandArchiveCoverageRow(rows, bandRef) {
+  const requestedKeys = new Set([
+    normalizeMusicBandCoverageLookupKey(bandRef),
+    normalizeMusicBandCoverageLookupKey(slugifyMusicBandId(bandRef))
+  ].filter(Boolean));
+
+  return (Array.isArray(rows) ? rows : []).find((row) => {
+    return getMusicBandArchiveCoverageRowKeys(row).some((key) => requestedKeys.has(key));
+  }) || null;
+}
+
+async function buildMusicBandArchiveCoverageForRow(row, forceRefresh) {
+  const dbLookup = await buildMusicBandArchiveCoverageLookup([row]);
+  const dbCoverage = getMusicBandArchiveCoverageForRow(row, dbLookup);
+  if (!forceRefresh && hasRequiredMusicBandArchiveCoverageData(dbCoverage)) {
+    return {
+      sourceType: 'database',
+      albumCount: null,
+      coverage: dbCoverage
+    };
+  }
+
+  const target = getMusicBandSmugTarget(row);
+  if (!target || !SMUG_API_KEY) {
+    return {
+      sourceType: target ? 'smugmug_unavailable' : 'missing_smugmug_target',
+      albumCount: null,
+      coverage: hasMusicBandArchiveCoverageData(dbCoverage)
+        ? dbCoverage
+        : createEmptyMusicBandArchiveCoverage()
+    };
+  }
+
+  try {
+    const json = await fetchSmugJson(buildMusicBandAlbumsEndpoint(target));
+    const albums = getSmugAlbums(json);
+    const coverage = await fetchMusicBandArchiveCoverage(row, albums, forceRefresh);
+    return {
+      sourceType: 'smugmug',
+      albumCount: albums.length,
+      coverage
+    };
+  } catch (err) {
+    console.warn(`Music-Bands archive coverage request failed for ${target.region}/${target.folder}:`, err && err.message ? err.message : String(err));
+    return {
+      sourceType: 'smugmug_error',
+      albumCount: null,
+      coverage: hasMusicBandArchiveCoverageData(dbCoverage)
+        ? dbCoverage
+        : createEmptyMusicBandArchiveCoverage()
+    };
+  }
+}
+
+async function buildMusicBandArchiveCoverageResponse(payload, bandRef, forceRefresh) {
+  const row = findMusicBandArchiveCoverageRow(payload && payload.rows, bandRef);
+  if (!row) {
+    return {
+      ok: false,
+      route: '/api/music/bands',
+      type: 'music_band_archive_coverage',
+      error: 'BAND_NOT_FOUND',
+      band_ref: bandRef,
+      archive_coverage: createEmptyMusicBandArchiveCoverage()
+    };
+  }
+
+  const bandName = getMusicBandName(row);
+  const bandId = String(row.band_id || '').trim() || slugifyMusicBandId(bandName);
+  const result = await buildMusicBandArchiveCoverageForRow(row, forceRefresh);
+  const coverage = {
+    ...createEmptyMusicBandArchiveCoverage(),
+    ...(result.coverage && typeof result.coverage === 'object' ? result.coverage : {})
+  };
+  const stats = {};
+  addMusicBandArchiveCoverageFields(stats, coverage);
+
+  return {
+    ok: true,
+    route: '/api/music/bands',
+    type: 'music_band_archive_coverage',
+    band_id: bandId,
+    band: bandName,
+    source: {
+      name: payload && payload.source ? payload.source : 'Music-Bands',
+      type: result.sourceType,
+      album_count: result.albumCount
+    },
+    archive_coverage: coverage,
+    stats,
+    ...coverage
+  };
+}
+
 function normalizeSmugCoverageDateValue(value) {
   const clean = String(value || '').trim();
   if (!clean || /^0{4}[:/-]0{1,2}[:/-]0{1,2}/.test(clean)) return null;
@@ -16031,6 +16165,10 @@ for (const [routePath, cfg] of Object.entries(ROUTES)) {
       const payload = await fetchCsvForRoute(routePath, cfg, forceRefresh);
       res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
       if (routePath === '/api/music/bands') {
+        const archiveCoverageBandRef = getMusicBandArchiveCoverageRequestRef(req.query);
+        if (archiveCoverageBandRef) {
+          return res.json(await buildMusicBandArchiveCoverageResponse(payload, archiveCoverageBandRef, forceRefresh));
+        }
         return res.json(await buildMusicBandsResponse(payload, forceRefresh));
       }
       if (routePath === '/api/music/shows') {
