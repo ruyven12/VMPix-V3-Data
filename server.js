@@ -11255,6 +11255,8 @@ async function updateSmugMusicShowSyncError(row, status, error, smugAlbums = nul
         smug_albums = COALESCE($4::jsonb, smug_albums),
         updated_at = NOW()
     WHERE id = $1
+      AND trim(coalesce(album_id, '')) = ''
+      AND trim(coalesce(gallery_id, '')) = ''
     RETURNING id, show_id, name, date, poster, gallery_id, album_id, cover_image_url, photo_count, stats, smug_albums, smug_last_synced_at, smug_sync_status, smug_sync_error
   `, [
     row.id,
@@ -11629,6 +11631,17 @@ async function runSmugMusicShowResolve(query = {}) {
       noImageKey: noImageKeyShows.slice(0, 25),
       noAlbumKey: noAlbumKeyShows.slice(0, 25),
       missingCoverImage: missingCoverImages.slice(0, 25),
+      deterministicAlbumResolution: {
+        strategy: 'band_date_region_album_path',
+        resolvedMappings: resolvedMappings.slice(0, 25),
+        unresolvedMappings: unresolvedMappings.slice(0, 25)
+      },
+      fallbackImageResolver: {
+        enabled: false,
+        attempted: 0,
+        failures: [],
+        note: 'Poster/image-key fallback is not used after deterministic album-path resolution.'
+      },
       resolvedMappings: resolvedMappings.slice(0, 25),
       unresolvedMappings: unresolvedMappings.slice(0, 25),
       unresolvedShows: unresolvedShows.slice(0, 25),
