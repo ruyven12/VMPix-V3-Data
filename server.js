@@ -63,6 +63,7 @@ const SMUG_ALBUM_PHOTOS_CACHE_TTL_MS = Math.max(
 );
 const SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT = 12;
 const SMUG_ALBUM_PHOTOS_MAX_LIMIT = 25;
+const SMUG_ALBUM_PHOTOS_CACHE_VERSION = 'album_photos:v2';
 const cache = new Map();
 const smugTotalPhotosCache = new Map();
 const smugTotalPhotosInFlight = new Map();
@@ -705,11 +706,16 @@ function getSmugAlbumPhotoImageKey(image) {
   return looseMatch && looseMatch[1] ? `i-${looseMatch[1]}` : '';
 }
 
-function getSmugAlbumPhotoUrl(image, fieldNames) {
-  const direct = getSmugNestedField(image, fieldNames);
-  if (direct) return direct;
-  return getSmugImageUrlFromObject(image) || '';
-}
+const SMUG_ALBUM_PHOTO_URL_FIELDS = Object.freeze({
+  thumbnail: ['ThumbnailUrl', 'ThumbnailURL', 'ThumbUrl', 'ThumbURL', 'TinyUrl', 'TinyURL'],
+  small: ['SmallUrl', 'SmallURL'],
+  medium: ['MediumUrl', 'MediumURL'],
+  large: [
+    'LargestUrl', 'LargestURL', 'X5LargeUrl', 'X5LargeURL', 'X4LargeUrl', 'X4LargeURL',
+    'X3LargeUrl', 'X3LargeURL', 'X2LargeUrl', 'X2LargeURL', 'XLargeUrl', 'XLargeURL',
+    'LargeUrl', 'LargeURL', 'OriginalUrl', 'OriginalURL', 'ImageUrl', 'ImageURL'
+  ]
+});
 
 const SMUG_IMAGE_SIZE_RANK = {
   TI: 0,
@@ -743,6 +749,14 @@ function getSmugImageUrlSizeCode(sourceUrl) {
   return folderCode && folderCode === fileCode ? folderCode : '';
 }
 
+function isSmugImageUrlAtLeast(sourceUrl, minimumSizeCode) {
+  const sizeCode = getSmugImageUrlSizeCode(sourceUrl);
+  const minimumCode = normalizeSmugImageSizeCode(minimumSizeCode);
+  if (!sourceUrl || !minimumCode) return false;
+  if (!sizeCode) return true;
+  return SMUG_IMAGE_SIZE_RANK[sizeCode] >= SMUG_IMAGE_SIZE_RANK[minimumCode];
+}
+
 function buildSmugImageSizeVariantUrl(sourceUrl, sizeCode) {
   const url = String(sourceUrl || '').trim();
   const normalizedSizeCode = normalizeSmugImageSizeCode(sizeCode);
@@ -754,38 +768,168 @@ function buildSmugImageSizeVariantUrl(sourceUrl, sizeCode) {
   return url.replace(sizeUrlPattern, `/${normalizedSizeCode}/$2-${normalizedSizeCode}$4$5`);
 }
 
-function getSmugAlbumPhotoSizedUrl(image, fieldNames, sizeCode, fallbackUrl = '') {
-  const direct = getSmugNestedField(image, fieldNames);
-  const requestedSizeCode = normalizeSmugImageSizeCode(sizeCode);
-  const requestedRank = SMUG_IMAGE_SIZE_RANK[requestedSizeCode];
-  const directSizeCode = getSmugImageUrlSizeCode(direct);
-
-  if (direct && (!directSizeCode || SMUG_IMAGE_SIZE_RANK[directSizeCode] >= requestedRank)) {
-    return direct;
+function buildFirstSmugImageSizeVariantUrl(sourceUrl, sizeCodes) {
+  for (const sizeCode of sizeCodes) {
+    const variant = buildSmugImageSizeVariantUrl(sourceUrl, sizeCode);
+    if (variant) return variant;
   }
-
-  const fallback = String(fallbackUrl || '').trim() || getSmugImageUrlFromObject(image) || '';
-  const variant = buildSmugImageSizeVariantUrl(direct || fallback, requestedSizeCode);
-  if (variant) return variant;
-
-  return direct || fallback;
+  return '';
 }
 
-function buildSmugAlbumPhotoItem(image) {
-  const thumbnailUrl = getSmugAlbumPhotoUrl(image, ['ThumbnailUrl', 'ThumbnailURL', 'ThumbUrl', 'ThumbURL', 'TinyUrl', 'TinyURL']);
+function getSmugAlbumPhotoDirectUrl(image, fieldNames) {
+  return getSmugNestedField(image, fieldNames) || '';
+}
+
+function getSmugAlbumPhotoBaseUrl(image) {
+  return getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.large)
+    || getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.medium)
+    || getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.small)
+    || getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.thumbnail)
+    || getSmugImageUrlFromObject(image)
+    || '';
+}
+
+function getSmugAlbumPhotoUrls(image) {
+  const baseUrl = getSmugAlbumPhotoBaseUrl(image);
+  const thumbnailDirect = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.thumbnail);
+  const thumbnailUrl = thumbnailDirect || buildFirstSmugImageSizeVariantUrl(baseUrl, ['Th', 'Ti']) || baseUrl;
+
+  const smallDirect = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.small);
+  const smallUrl = smallDirect || buildFirstSmugImageSizeVariantUrl(baseUrl || thumbnailUrl, ['S']) || thumbnailUrl;
+
+  const mediumDirect = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.medium);
+  const mediumUrl = mediumDirect && isSmugImageUrlAtLeast(mediumDirect, 'M')
+    ? mediumDirect
+    : buildFirstSmugImageSizeVariantUrl(mediumDirect || smallUrl || thumbnailUrl || baseUrl, ['M']) || smallUrl || thumbnailUrl;
+
+  const largeDirect = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.large);
+  const largeUrl = largeDirect && isSmugImageUrlAtLeast(largeDirect, 'L')
+    ? largeDirect
+    : buildFirstSmugImageSizeVariantUrl(largeDirect || mediumUrl || smallUrl || thumbnailUrl || baseUrl, ['X3', 'X2', 'XL', 'L']) || mediumUrl || smallUrl || thumbnailUrl;
 
   return {
-    image_key: getSmugAlbumPhotoImageKey(image),
-    thumbnail_url: thumbnailUrl,
-    small_url: getSmugAlbumPhotoSizedUrl(image, ['SmallUrl', 'SmallURL', 'ThumbnailUrl', 'ThumbnailURL'], 'S', thumbnailUrl),
-    medium_url: getSmugAlbumPhotoSizedUrl(image, ['MediumUrl', 'MediumURL', 'LargeUrl', 'LargeURL'], 'M', thumbnailUrl),
-    large_url: getSmugAlbumPhotoSizedUrl(image, ['LargeUrl', 'LargeURL', 'XLargeUrl', 'XLargeURL', 'X2LargeUrl', 'X2LargeURL', 'OriginalUrl', 'OriginalURL', 'ImageUrl', 'ImageURL'], 'L', thumbnailUrl),
-    caption: getSmugImageCaption(image)
+    thumbnail_url: thumbnailUrl || '',
+    small_url: smallUrl || '',
+    medium_url: mediumUrl || '',
+    large_url: largeUrl || ''
   };
 }
 
+function collectSmugAlbumPhotoAvailableUrlKeys(source, keys = new Set(), depth = 0) {
+  if (!source || typeof source !== 'object' || depth > 5) return keys;
+
+  Object.entries(source).forEach(([key, value]) => {
+    if (typeof value === 'string') {
+      if (isLikelySmugImageUrl(value)) keys.add(key);
+      return;
+    }
+
+    if (value && typeof value === 'object' && /image|uri|url|thumb|small|medium|large|original|size/i.test(key)) {
+      collectSmugAlbumPhotoAvailableUrlKeys(value, keys, depth + 1);
+    }
+  });
+
+  return keys;
+}
+
+function getSmugAlbumPhotoAvailableUrlKeys(image) {
+  return Array.from(collectSmugAlbumPhotoAvailableUrlKeys(image)).sort();
+}
+
+function hasSmugAlbumPhotoExplicitLargerUrl(image) {
+  const smallUrl = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.small);
+  const mediumUrl = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.medium);
+  const largeUrl = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.large);
+
+  return !!(
+    (smallUrl && isSmugImageUrlAtLeast(smallUrl, 'S'))
+    || (mediumUrl && isSmugImageUrlAtLeast(mediumUrl, 'M'))
+    || (largeUrl && isSmugImageUrlAtLeast(largeUrl, 'L'))
+  );
+}
+
+function getSmugImageObjectFromDetail(json) {
+  const resp = json && json.Response ? json.Response : json;
+  const image = resp && (resp.Image || resp.AlbumImage || resp.Images || resp.AlbumImages || resp.image || resp.images);
+  if (Array.isArray(image)) return image[0] && typeof image[0] === 'object' ? image[0] : null;
+  return image && typeof image === 'object' ? image : null;
+}
+
+function mergeSmugAlbumPhotoDetail(image, detailImage) {
+  if (!detailImage || typeof detailImage !== 'object') return image;
+
+  const existingImage = image && image.Image && typeof image.Image === 'object' ? image.Image : {};
+  return {
+    ...image,
+    Image: {
+      ...existingImage,
+      ...detailImage
+    },
+    DetailImage: detailImage
+  };
+}
+
+async function hydrateSmugAlbumPhotoImage(image) {
+  const imageKey = getSmugAlbumPhotoImageKey(image);
+  if (!imageKey) return { image, hydrated: false, error: 'missing_image_key' };
+
+  try {
+    const detail = await fetchSmugImageDetail(imageKey);
+    const detailImage = getSmugImageObjectFromDetail(detail.json);
+    return {
+      image: mergeSmugAlbumPhotoDetail(image, detailImage),
+      hydrated: !!detailImage,
+      endpoint: detail.endpoint || ''
+    };
+  } catch (err) {
+    return {
+      image,
+      hydrated: false,
+      error: err && err.message ? err.message : String(err)
+    };
+  }
+}
+
+function buildSmugAlbumPhotoItem(image, options = {}) {
+  const urls = getSmugAlbumPhotoUrls(image);
+  const item = {
+    image_key: getSmugAlbumPhotoImageKey(image),
+    thumbnail_url: urls.thumbnail_url,
+    small_url: urls.small_url,
+    medium_url: urls.medium_url,
+    large_url: urls.large_url,
+    caption: getSmugImageCaption(image)
+  };
+
+  if (options.debug) {
+    item.available_url_keys = getSmugAlbumPhotoAvailableUrlKeys(image);
+    item.hydrated = !!options.hydrated;
+    if (options.hydration_endpoint) item.hydration_endpoint = options.hydration_endpoint;
+    if (options.hydration_error) item.hydration_error = options.hydration_error;
+  }
+
+  return item;
+}
+
+async function buildSmugAlbumPhotoItemForResponse(image, debug = false) {
+  if (hasSmugAlbumPhotoExplicitLargerUrl(image)) {
+    return buildSmugAlbumPhotoItem(image, { debug, hydrated: false });
+  }
+
+  const hydrated = await hydrateSmugAlbumPhotoImage(image);
+  return buildSmugAlbumPhotoItem(hydrated.image, {
+    debug,
+    hydrated: hydrated.hydrated,
+    hydration_endpoint: hydrated.endpoint || '',
+    hydration_error: hydrated.error || ''
+  });
+}
+
+async function buildSmugAlbumPhotoItemsForResponse(images, debug = false) {
+  return mapWithConcurrency(images, SMUG_REQUEST_CONCURRENCY, (image) => buildSmugAlbumPhotoItemForResponse(image, debug));
+}
 function getSmugAlbumPhotosCacheKey(albumId, limit, start) {
-  return `${albumId}:${limit}:${start}`;
+  return `${SMUG_ALBUM_PHOTOS_CACHE_VERSION}:${albumId}:${limit}:${start}`;
 }
 
 function getCachedSmugAlbumPhotos(albumId, limit, start) {
@@ -860,7 +1004,8 @@ async function handleMusicSmugAlbumPhotosRequest(req, res) {
     });
   }
 
-  const cached = getCachedSmugAlbumPhotos(albumId, limit, start);
+  const debug = req.query.debug === '1';
+  const cached = debug ? null : getCachedSmugAlbumPhotos(albumId, limit, start);
   if (cached) {
     return res.json({ ...cached, cache: { hit: true } });
   }
@@ -868,7 +1013,7 @@ async function handleMusicSmugAlbumPhotosRequest(req, res) {
   try {
     const endpoint = `/album/${encodeURIComponent(albumId)}!images?count=${limit}&start=${start}&_accept=application/json&_expand=Image`;
     const json = await fetchSmugJson(endpoint);
-    const photos = getSmugAlbumImages(json).slice(0, limit).map(buildSmugAlbumPhotoItem);
+    const photos = await buildSmugAlbumPhotoItemsForResponse(getSmugAlbumImages(json).slice(0, limit), debug);
     const pagination = buildSmugAlbumPhotosPagination(json, photos, limit, start);
     const response = {
       ok: true,
@@ -882,7 +1027,7 @@ async function handleMusicSmugAlbumPhotosRequest(req, res) {
       photos
     };
 
-    setCachedSmugAlbumPhotos(albumId, limit, start, response);
+    if (!debug) setCachedSmugAlbumPhotos(albumId, limit, start, response);
     return res.json({ ...response, cache: { hit: false } });
   } catch (err) {
     return res.status(502).json({
