@@ -4279,11 +4279,38 @@ function buildMusicShowVenueDetailsSummary(venueDetails) {
 }
 
 
+function findMusicShowLineupBandForAlbum(album, bands) {
+  const list = Array.isArray(bands) ? bands : [];
+  const slot = album && album.slot != null ? toIntegerCount(album.slot) : null;
+  if (slot != null) {
+    const bySlot = list.find((item) => item && item.slot != null && toIntegerCount(item.slot) === slot);
+    if (bySlot) return bySlot;
+  }
+
+  const bandKey = normalizeMusicLookupKey(album && album.band);
+  if (!bandKey) return null;
+  return list.find((item) => normalizeMusicLookupKey(item && item.band) === bandKey) || null;
+}
+
+function enrichMusicShowSmugAlbumsWithLineup(smugAlbums, bands) {
+  return (Array.isArray(smugAlbums) ? smugAlbums : []).map((album) => {
+    const item = album && typeof album === 'object' && !Array.isArray(album) ? { ...album } : {};
+    const lineup = findMusicShowLineupBandForAlbum(item, bands);
+    if (!lineup) return item;
+
+    if (lineup.bandViewCount != null) item.bandViewCount = toIntegerCount(lineup.bandViewCount);
+    if (lineup.band) item.lineupBand = lineup.band;
+    if (lineup.slot != null) item.lineupSlot = toIntegerCount(lineup.slot);
+    return item;
+  });
+}
 function buildMusicShowDbApiItem(row, venueDetailsMap) {
   const venueId = row.venue_id || '';
   const fullVenueDetails = venueId ? (venueDetailsMap.get(normalizeMusicLookupKey(venueId)) || null) : null;
   const venueDetails = buildMusicShowVenueDetailsSummary(fullVenueDetails);
+  // bands[] is show lineup compatibility data; smug_albums[] is resolved SmugMug archive/media album mappings.
   const bands = Array.isArray(row.bands) ? row.bands : [];
+  const smugAlbums = enrichMusicShowSmugAlbumsWithLineup(row.smug_albums, bands);
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   addMusicCanonicalAliases(stats, {
     event_count: 1,
@@ -4317,7 +4344,7 @@ function buildMusicShowDbApiItem(row, venueDetailsMap) {
     smug_sync_status: getCanonicalNullableString(row.smug_sync_status),
     smug_last_synced_at: formatMusicShowSyncTimestamp(row.smug_last_synced_at),
     smug_sync_error: getCanonicalNullableString(row.smug_sync_error),
-    smug_albums: Array.isArray(row.smug_albums) ? row.smug_albums : []
+    smug_albums: smugAlbums
   };
 
   return item;
@@ -5625,7 +5652,9 @@ async function buildWrestlingVenuesDbStatsResponse() {
 }
 
 function buildMusicPersonDbApiItem(row) {
+  // bands[] is show lineup compatibility data; smug_albums[] is resolved SmugMug archive/media album mappings.
   const bands = Array.isArray(row.bands) ? row.bands : [];
+  const smugAlbums = enrichMusicShowSmugAlbumsWithLineup(row.smug_albums, bands);
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   addMusicCanonicalAliases(stats, {
     photo_count: getMusicStatsNumber(stats, ['photo_count', 'photoCount']),
@@ -11313,13 +11342,19 @@ async function resolveSmugMusicShowAlbum(row, bandLookup = new Map()) {
     };
   }
 
+  // bands[] is show lineup compatibility data; smug_albums[] is resolved SmugMug archive/media album mappings.
+  const lineupBands = Array.isArray(row && row.bands) ? row.bands : [];
   const mappings = [];
   for (const candidate of candidates) {
+    const lineup = findMusicShowLineupBandForAlbum(candidate, lineupBands);
     const resolved = await resolveSmugAlbumByPath(candidate.smug_path);
     mappings.push({
       band: candidate.band,
       band_id: candidate.band_id || '',
       slot: candidate.slot,
+      bandViewCount: lineup && lineup.bandViewCount != null ? toIntegerCount(lineup.bandViewCount) : null,
+      lineupBand: lineup && lineup.band ? lineup.band : '',
+      lineupSlot: lineup && lineup.slot != null ? toIntegerCount(lineup.slot) : null,
       region: candidate.region,
       region_source: candidate.region_source,
       band_folder: candidate.band_folder,
