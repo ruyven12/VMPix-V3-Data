@@ -57,11 +57,18 @@ const SMUG_TOTAL_PHOTOS_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.SMUG_TOTAL_PHOTOS_CACHE_TTL_MS || 1000 * 60 * 60 * 12) || 1000 * 60 * 60 * 12
 );
+const SMUG_ALBUM_PHOTOS_CACHE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.SMUG_ALBUM_PHOTOS_CACHE_TTL_MS || 1000 * 60 * 10) || 1000 * 60 * 10
+);
+const SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT = 12;
+const SMUG_ALBUM_PHOTOS_MAX_LIMIT = 25;
 const cache = new Map();
 const smugTotalPhotosCache = new Map();
 const smugTotalPhotosInFlight = new Map();
 const smugPeoplePhotoCountCache = new Map();
 const smugPeoplePhotoCountInFlight = new Map();
+const smugAlbumPhotosCache = new Map();
 
 const ROUTES = {
   '/api/music/bands': { label: 'Music-Bands', gidEnv: 'GID_MUSIC_BANDS' },
@@ -647,6 +654,135 @@ function getSmugImageCaption(image) {
 
   const nested = image && image.Image && (image.Image.Caption || image.Image.CaptionText || image.Image.caption || image.Image.captionText);
   return typeof nested === 'string' ? nested.trim() : '';
+}
+
+function clampSmugAlbumPhotoLimit(value) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isFinite(parsed)) return SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT;
+  return Math.min(SMUG_ALBUM_PHOTOS_MAX_LIMIT, Math.max(1, parsed));
+}
+
+function getSmugNestedField(source, fieldNames, depth = 0) {
+  if (!source || typeof source !== 'object' || depth > 5) return '';
+
+  for (const fieldName of fieldNames) {
+    const value = source[fieldName];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+
+  const nestedKeys = ['Image', 'AlbumImage', 'Uris', 'UrisBySize', 'Thumbnail', 'Small', 'Medium', 'Large', 'XLarge', 'LargestImage'];
+  for (const nestedKey of nestedKeys) {
+    const nested = source[nestedKey];
+    if (nested && typeof nested === 'object') {
+      const value = getSmugNestedField(nested, fieldNames, depth + 1);
+      if (value) return value;
+    }
+  }
+
+  return '';
+}
+
+function getSmugAlbumPhotoImageKey(image) {
+  const direct = getSmugNestedField(image, ['ImageKey', 'imageKey', 'Key', 'key']);
+  if (direct) return direct;
+
+  const uri = getSmugNestedField(image, ['Uri', 'URI', 'ImageUri', 'ImageURI', 'Url', 'URL', 'WebUri', 'WebURI']);
+  const uriMatch = uri.match(/\/image\/([^/?#]+)/i);
+  if (uriMatch && uriMatch[1]) return uriMatch[1].replace(/-0$/i, '');
+
+  const url = getSmugImageUrlFromObject(image);
+  const photoMatch = String(url || '').match(/\/photos\/(i-[A-Za-z0-9]+)/i);
+  if (photoMatch && photoMatch[1]) return photoMatch[1];
+
+  const looseMatch = String(url || '').match(/\bi-([A-Za-z0-9]+)\b/i);
+  return looseMatch && looseMatch[1] ? `i-${looseMatch[1]}` : '';
+}
+
+function getSmugAlbumPhotoUrl(image, fieldNames) {
+  const direct = getSmugNestedField(image, fieldNames);
+  if (direct) return direct;
+  return getSmugImageUrlFromObject(image) || '';
+}
+
+function buildSmugAlbumPhotoItem(image) {
+  return {
+    image_key: getSmugAlbumPhotoImageKey(image),
+    thumbnail_url: getSmugAlbumPhotoUrl(image, ['ThumbnailUrl', 'ThumbnailURL', 'ThumbUrl', 'ThumbURL', 'TinyUrl', 'TinyURL']),
+    small_url: getSmugAlbumPhotoUrl(image, ['SmallUrl', 'SmallURL', 'ThumbnailUrl', 'ThumbnailURL']),
+    medium_url: getSmugAlbumPhotoUrl(image, ['MediumUrl', 'MediumURL', 'LargeUrl', 'LargeURL']),
+    large_url: getSmugAlbumPhotoUrl(image, ['LargeUrl', 'LargeURL', 'XLargeUrl', 'XLargeURL', 'X2LargeUrl', 'X2LargeURL', 'OriginalUrl', 'OriginalURL', 'ImageUrl', 'ImageURL']),
+    caption: getSmugImageCaption(image)
+  };
+}
+
+function getSmugAlbumPhotosCacheKey(albumId, limit) {
+  return `${albumId}:${limit}`;
+}
+
+function getCachedSmugAlbumPhotos(albumId, limit) {
+  const cacheKey = getSmugAlbumPhotosCacheKey(albumId, limit);
+  const hit = smugAlbumPhotosCache.get(cacheKey);
+  if (!hit) return null;
+
+  if (Date.now() - hit.fetchedAt > SMUG_ALBUM_PHOTOS_CACHE_TTL_MS) {
+    smugAlbumPhotosCache.delete(cacheKey);
+    return null;
+  }
+
+  return hit.response;
+}
+
+function setCachedSmugAlbumPhotos(albumId, limit, response) {
+  smugAlbumPhotosCache.set(getSmugAlbumPhotosCacheKey(albumId, limit), {
+    fetchedAt: Date.now(),
+    response
+  });
+}
+
+async function handleMusicSmugAlbumPhotosRequest(req, res) {
+  const albumId = String(req.params.album_id || '').trim();
+  const limit = clampSmugAlbumPhotoLimit(req.query.limit);
+  const generatedAt = new Date().toISOString();
+
+  if (!albumId) {
+    return res.status(400).json({
+      ok: false,
+      error: 'album photos unavailable',
+      message: 'Missing album_id.',
+      album_id: '',
+      generatedAt
+    });
+  }
+
+  const cached = getCachedSmugAlbumPhotos(albumId, limit);
+  if (cached) {
+    return res.json({ ...cached, cache: { hit: true } });
+  }
+
+  try {
+    const endpoint = `/album/${encodeURIComponent(albumId)}!images?count=${limit}&start=1&_accept=application/json&_expand=Image`;
+    const json = await fetchSmugJson(endpoint);
+    const photos = getSmugAlbumImages(json).slice(0, limit).map(buildSmugAlbumPhotoItem);
+    const response = {
+      ok: true,
+      album_id: albumId,
+      count: photos.length,
+      limit,
+      photos
+    };
+
+    setCachedSmugAlbumPhotos(albumId, limit, response);
+    return res.json({ ...response, cache: { hit: false } });
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: 'album photos unavailable',
+      album_id: albumId,
+      generatedAt,
+      message: err && err.message ? err.message : String(err)
+    });
+  }
 }
 
 function normalizePersonCaptionText(value) {
@@ -15159,6 +15295,10 @@ app.get('/api/music/bands/stats', async (req, res) => {
       error: err && err.message ? err.message : String(err)
     });
   }
+});
+
+app.get('/api/music/smugmug/albums/:album_id/photos', async (req, res) => {
+  return handleMusicSmugAlbumPhotosRequest(req, res);
 });
 
 app.get('/api/music/shows/db', async (req, res) => {
