@@ -68,8 +68,9 @@ const MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS || 1000 * 60 * 60 * 6) || 1000 * 60 * 60 * 6
 );
-const MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS', 200, 1, 1000);
-const MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM', 20, 1, 200);
+const MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS', 2500, 0, 15000);
+const MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS', 50, 1, 1000);
+const MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM', 8, 1, 200);
 const SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT = getIntegerEnv('SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT', 200, 1, 200);
 const SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM = getIntegerEnv('SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM', 100, 1, 500);
 const cache = new Map();
@@ -1402,6 +1403,34 @@ async function buildMusicPeopleArchiveRelationships() {
   });
 
   return smugMusicPeopleArchiveRelationshipInFlight;
+}
+
+function getCachedMusicPeopleArchiveRelationships() {
+  if (
+    smugMusicPeopleArchiveRelationshipCache &&
+    Date.now() - smugMusicPeopleArchiveRelationshipCache.fetchedAt < MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS
+  ) {
+    return smugMusicPeopleArchiveRelationshipCache.relationships;
+  }
+  return null;
+}
+
+async function getMusicPeopleArchiveRelationshipsForRequest() {
+  const cached = getCachedMusicPeopleArchiveRelationships();
+  if (cached) return cached;
+
+  const relationshipBuild = buildMusicPeopleArchiveRelationships();
+  if (!MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS) {
+    relationshipBuild.catch(() => {});
+    return new Map();
+  }
+
+  return Promise.race([
+    relationshipBuild,
+    new Promise((resolve) => {
+      setTimeout(() => resolve(new Map()), MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS);
+    })
+  ]);
 }
 
 function getMusicBandSmugTarget(row) {
@@ -2815,7 +2844,7 @@ async function buildMusicPeoplePublicDbResponse() {
     ORDER BY name ASC, person_id ASC
     LIMIT 1000
   `);
-  const archiveRelationships = await buildMusicPeopleArchiveRelationships();
+  const archiveRelationships = await getMusicPeopleArchiveRelationshipsForRequest();
   const data = (result.rows || []).map((row) => buildMusicPersonDbApiItem(row, archiveRelationships));
 
   return {
@@ -6928,7 +6957,7 @@ async function handleMusicPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const archiveRelationships = await buildMusicPeopleArchiveRelationships();
+    const archiveRelationships = await getMusicPeopleArchiveRelationshipsForRequest();
     const data = result.rows.map((row) => buildMusicPersonDbApiItem(row, archiveRelationships));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
