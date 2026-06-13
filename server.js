@@ -64,6 +64,12 @@ const SMUG_ALBUM_PHOTOS_CACHE_TTL_MS = Math.max(
 const SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT = 12;
 const SMUG_ALBUM_PHOTOS_MAX_LIMIT = 25;
 const SMUG_ALBUM_PHOTOS_CACHE_VERSION = 'album_photos:v2';
+const MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS || 1000 * 60 * 60 * 6) || 1000 * 60 * 60 * 6
+);
+const MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS', 200, 1, 1000);
+const MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM = getIntegerEnv('MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM', 20, 1, 200);
 const SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT = getIntegerEnv('SMUG_BAND_COVERAGE_PHOTOS_PAGE_LIMIT', 200, 1, 200);
 const SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM = getIntegerEnv('SMUG_BAND_COVERAGE_MAX_PAGES_PER_ALBUM', 100, 1, 500);
 const cache = new Map();
@@ -72,6 +78,10 @@ const smugTotalPhotosInFlight = new Map();
 const smugPeoplePhotoCountCache = new Map();
 const smugPeoplePhotoCountInFlight = new Map();
 const smugAlbumPhotosCache = new Map();
+const smugMusicPeopleArchiveAlbumPhotosCache = new Map();
+const smugMusicPeopleArchiveAlbumPhotosInFlight = new Map();
+let smugMusicPeopleArchiveRelationshipCache = null;
+let smugMusicPeopleArchiveRelationshipInFlight = null;
 const smugBandArchiveCoverageCache = new Map();
 const smugBandArchiveCoverageInFlight = new Map();
 
@@ -661,6 +671,20 @@ function getSmugImageCaption(image) {
   return typeof nested === 'string' ? nested.trim() : '';
 }
 
+function getSmugImageDateTimeOriginal(image) {
+  return getSmugNestedField(image, [
+    'DateTimeOriginal',
+    'DateTime',
+    'DateTaken',
+    'DateCreated',
+    'OriginalDate',
+    'date_time_original',
+    'dateTimeOriginal',
+    'date_taken',
+    'dateTaken'
+  ]);
+}
+
 function clampSmugAlbumPhotoLimit(value) {
   const parsed = Number.parseInt(String(value || ''), 10);
   if (!Number.isFinite(parsed)) return SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT;
@@ -902,7 +926,8 @@ function buildSmugAlbumPhotoItem(image, options = {}) {
     small_url: urls.small_url,
     medium_url: urls.medium_url,
     large_url: urls.large_url,
-    caption: getSmugImageCaption(image)
+    caption: getSmugImageCaption(image),
+    date_time_original: getSmugImageDateTimeOriginal(image) || null
   };
 
   if (options.debug) {
@@ -1122,6 +1147,261 @@ async function fetchMusicPersonPhotoCount(personName, forceRefresh) {
 
   smugPeoplePhotoCountInFlight.set(cacheKey, run);
   return run;
+}
+
+function createEmptyMusicPeopleArchiveRelationship() {
+  return {
+    photoKeys: new Set(),
+    setKeys: new Set(),
+    showKeys: new Set(),
+    photo_count: 0,
+    set_count: 0,
+    show_count: 0,
+    event_count: 0,
+    gallery_id: null,
+    album_id: null,
+    cover_image_url: null,
+    latestPhotoTime: 0
+  };
+}
+
+function splitMusicPeopleArchiveAliases(value) {
+  if (Array.isArray(value)) return value.flatMap(splitMusicPeopleArchiveAliases);
+  if (value && typeof value === 'object') {
+    return [value.alias, value.name, value.title, value.label, value.value].flatMap(splitMusicPeopleArchiveAliases);
+  }
+  return splitMusicDelimitedList(value);
+}
+
+function getMusicPeopleArchiveMatchNames(row) {
+  const values = [
+    row && row.name,
+    ...splitMusicPeopleArchiveAliases(row && row.aliases)
+  ];
+  const seen = new Set();
+  return values
+    .map(normalizePersonCaptionText)
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function createMusicPeopleArchivePersonMatchers(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      person_id: String(row && row.person_id != null ? row.person_id : '').trim(),
+      name: row && row.name ? row.name : '',
+      matchNames: getMusicPeopleArchiveMatchNames(row)
+    }))
+    .filter((person) => person.person_id && person.matchNames.length > 0);
+}
+
+function getMusicPeopleArchiveAlbumKey(album) {
+  return String(album && (album.album_id || album.albumId || album.gallery_id || album.galleryId || '') || '').trim();
+}
+
+function getMusicPeopleArchiveShowKey(show) {
+  return String(show && (show.show_id || show.id || show.name || '') || '').trim();
+}
+
+function getMusicPeopleArchiveShowTime(show) {
+  const dateValue = String(show && (show.show_date || show.date || '') || '').trim();
+  const parsed = dateValue ? Date.parse(dateValue) : NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function collectMusicPeopleArchiveShowAlbums(show) {
+  const albums = [];
+  const sourceAlbums = Array.isArray(show && show.smug_albums) ? show.smug_albums : [];
+  sourceAlbums.forEach((album) => {
+    const albumId = getMusicPeopleArchiveAlbumKey(album);
+    if (!albumId) return;
+    albums.push({
+      album_id: albumId,
+      gallery_id: String(album && (album.gallery_id || album.galleryId || albumId) || '').trim(),
+      cover_image_url: String(album && album.cover_image_url || '').trim(),
+      show
+    });
+  });
+
+  const directAlbumId = String(show && (show.album_id || show.gallery_id) || '').trim();
+  if (directAlbumId && !albums.some((album) => album.album_id === directAlbumId)) {
+    albums.push({
+      album_id: directAlbumId,
+      gallery_id: String(show && (show.gallery_id || directAlbumId) || '').trim(),
+      cover_image_url: String(show && show.cover_image_url || '').trim(),
+      show
+    });
+  }
+
+  return albums;
+}
+
+async function fetchMusicPeopleArchiveAlbumPhotos(albumId) {
+  const cacheKey = String(albumId || '').trim();
+  if (!cacheKey || !SMUG_API_KEY) return [];
+
+  const hit = smugMusicPeopleArchiveAlbumPhotosCache.get(cacheKey);
+  if (hit && Date.now() - hit.fetchedAt < MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS) {
+    return hit.photos;
+  }
+
+  if (smugMusicPeopleArchiveAlbumPhotosInFlight.has(cacheKey)) {
+    return smugMusicPeopleArchiveAlbumPhotosInFlight.get(cacheKey);
+  }
+
+  const run = (async () => {
+    const photos = [];
+    let start = 1;
+    for (let page = 0; page < MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM; page += 1) {
+      const endpoint = `/album/${encodeURIComponent(cacheKey)}!images?count=${SMUG_ALBUM_PHOTOS_MAX_LIMIT}&start=${start}&_accept=application/json&_expand=Image`;
+      const json = await fetchSmugJson(endpoint);
+      const images = getSmugAlbumImages(json).slice(0, SMUG_ALBUM_PHOTOS_MAX_LIMIT);
+      if (!images.length) break;
+      photos.push(...images.map((image) => buildSmugAlbumPhotoItem(image)));
+
+      const pagination = buildSmugAlbumPhotosPagination(json, images, SMUG_ALBUM_PHOTOS_MAX_LIMIT, start);
+      if (!pagination.has_more || !pagination.next_start) break;
+      start = pagination.next_start;
+    }
+
+    smugMusicPeopleArchiveAlbumPhotosCache.set(cacheKey, { fetchedAt: Date.now(), photos });
+    return photos;
+  })().catch((err) => {
+    console.warn(`Music-People archive album caption scan failed for ${cacheKey}:`, err && err.message ? err.message : String(err));
+    smugMusicPeopleArchiveAlbumPhotosCache.set(cacheKey, { fetchedAt: Date.now(), photos: [] });
+    return [];
+  }).finally(() => {
+    smugMusicPeopleArchiveAlbumPhotosInFlight.delete(cacheKey);
+  });
+
+  smugMusicPeopleArchiveAlbumPhotosInFlight.set(cacheKey, run);
+  return run;
+}
+
+function addMusicPeopleArchiveMatch(relationships, personId, album, photo) {
+  if (!relationships.has(personId)) {
+    relationships.set(personId, createEmptyMusicPeopleArchiveRelationship());
+  }
+
+  const relationship = relationships.get(personId);
+  const albumId = album.album_id || '';
+  const showKey = getMusicPeopleArchiveShowKey(album.show);
+  const imageKey = String(photo && photo.image_key || '').trim();
+  const photoKey = imageKey || `${albumId}:${relationship.photoKeys.size + 1}`;
+
+  if (!relationship.photoKeys.has(photoKey)) {
+    relationship.photoKeys.add(photoKey);
+    relationship.photo_count = relationship.photoKeys.size;
+  }
+  if (albumId) {
+    relationship.setKeys.add(albumId);
+    relationship.set_count = relationship.setKeys.size;
+  }
+  if (showKey) {
+    relationship.showKeys.add(showKey);
+    relationship.show_count = relationship.showKeys.size;
+    relationship.event_count = relationship.show_count;
+  }
+
+  const photoTime = Date.parse(photo && photo.date_time_original || '') || getMusicPeopleArchiveShowTime(album.show);
+  const coverUrl = String(photo && (photo.small_url || photo.thumbnail_url || photo.medium_url || photo.large_url) || album.cover_image_url || '').trim();
+  if (coverUrl && (!relationship.cover_image_url || photoTime >= relationship.latestPhotoTime)) {
+    relationship.latestPhotoTime = photoTime || relationship.latestPhotoTime;
+    relationship.gallery_id = album.gallery_id || albumId || null;
+    relationship.album_id = albumId || null;
+    relationship.cover_image_url = coverUrl;
+  }
+}
+
+async function buildMusicPeopleArchiveRelationships() {
+  if (!SMUG_API_KEY || !String(process.env.DATABASE_URL || '').trim()) {
+    return new Map();
+  }
+
+  const now = Date.now();
+  if (
+    smugMusicPeopleArchiveRelationshipCache &&
+    now - smugMusicPeopleArchiveRelationshipCache.fetchedAt < MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS
+  ) {
+    return smugMusicPeopleArchiveRelationshipCache.relationships;
+  }
+
+  if (smugMusicPeopleArchiveRelationshipInFlight) {
+    return smugMusicPeopleArchiveRelationshipInFlight;
+  }
+
+  smugMusicPeopleArchiveRelationshipInFlight = (async () => {
+    const peopleResult = await dbPool.query(`
+      SELECT person_id, name, aliases
+      FROM music_people
+      WHERE trim(coalesce(name, '')) <> ''
+      ORDER BY name ASC, person_id ASC
+    `);
+    const people = createMusicPeopleArchivePersonMatchers(peopleResult.rows || []);
+    if (!people.length) return new Map();
+
+    const showsResult = await dbPool.query(`
+      SELECT id, show_id, name, date, show_date, gallery_id, album_id, cover_image_url, smug_albums
+      FROM music_shows
+      WHERE (
+        (jsonb_typeof(smug_albums) = 'array' AND jsonb_array_length(smug_albums) > 0)
+        OR trim(coalesce(album_id, '')) <> ''
+        OR trim(coalesce(gallery_id, '')) <> ''
+      )
+      ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST, id DESC
+    `);
+
+    const albumMap = new Map();
+    (showsResult.rows || []).forEach((show) => {
+      collectMusicPeopleArchiveShowAlbums(show).forEach((album) => {
+        if (!album.album_id || albumMap.has(album.album_id)) return;
+        albumMap.set(album.album_id, album);
+      });
+    });
+
+    const albums = Array.from(albumMap.values()).slice(0, MUSIC_PEOPLE_ARCHIVE_MAX_ALBUMS);
+    const relationships = new Map();
+    await mapWithConcurrency(albums, SMUG_REQUEST_CONCURRENCY, async (album) => {
+      const photos = await fetchMusicPeopleArchiveAlbumPhotos(album.album_id);
+      photos.forEach((photo) => {
+        const caption = photo && photo.caption;
+        if (!caption) return;
+        people.forEach((person) => {
+          if (person.matchNames.some((name) => captionMatchesPersonName(caption, name))) {
+            addMusicPeopleArchiveMatch(relationships, person.person_id, album, photo);
+          }
+        });
+      });
+    });
+
+    const finalized = new Map();
+    relationships.forEach((relationship, personId) => {
+      finalized.set(personId, {
+        photo_count: toIntegerCount(relationship.photo_count),
+        set_count: toIntegerCount(relationship.set_count),
+        show_count: toIntegerCount(relationship.show_count),
+        event_count: toIntegerCount(relationship.event_count),
+        gallery_id: relationship.gallery_id || null,
+        album_id: relationship.album_id || null,
+        cover_image_url: relationship.cover_image_url || null
+      });
+    });
+
+    smugMusicPeopleArchiveRelationshipCache = { fetchedAt: Date.now(), relationships: finalized };
+    return finalized;
+  })().catch((err) => {
+    console.warn('Music-People archive relationship scan failed:', err && err.message ? err.message : String(err));
+    return new Map();
+  }).finally(() => {
+    smugMusicPeopleArchiveRelationshipInFlight = null;
+  });
+
+  return smugMusicPeopleArchiveRelationshipInFlight;
 }
 
 function getMusicBandSmugTarget(row) {
@@ -2535,7 +2815,8 @@ async function buildMusicPeoplePublicDbResponse() {
     ORDER BY name ASC, person_id ASC
     LIMIT 1000
   `);
-  const data = (result.rows || []).map(buildMusicPersonDbApiItem);
+  const archiveRelationships = await buildMusicPeopleArchiveRelationships();
+  const data = (result.rows || []).map((row) => buildMusicPersonDbApiItem(row, archiveRelationships));
 
   return {
     ok: true,
@@ -6486,20 +6767,19 @@ async function buildWrestlingVenuesDbStatsResponse() {
   };
 }
 
-function buildMusicPersonDbApiItem(row) {
-  // bands[] is show lineup compatibility data; smug_albums[] is resolved SmugMug archive/media album mappings.
+function buildMusicPersonDbApiItem(row, archiveRelationships = new Map()) {
   const bands = Array.isArray(row.bands) ? row.bands : [];
-  const smugAlbums = enrichMusicShowSmugAlbumsWithLineup(row.smug_albums, bands);
+  const archive = archiveRelationships.get(String(row.person_id || '').trim()) || {};
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   addMusicCanonicalAliases(stats, {
-    photo_count: getMusicStatsNumber(stats, ['photo_count', 'photoCount']),
+    photo_count: archive.photo_count != null ? archive.photo_count : getMusicStatsNumber(stats, ['photo_count', 'photoCount']),
     band_count: bands.length,
     artist_count: bands.length,
     people_count: 1,
     member_count: 0,
-    event_count: 0,
-    show_count: 0,
-    set_count: 0,
+    event_count: archive.event_count || 0,
+    show_count: archive.show_count || 0,
+    set_count: archive.set_count || 0,
     venue_count: 0
   });
   const item = {
@@ -6517,13 +6797,13 @@ function buildMusicPersonDbApiItem(row) {
     artist_count: bands.length,
     people_count: 1,
     member_count: 0,
-    event_count: 0,
-    show_count: 0,
-    set_count: 0,
+    event_count: archive.event_count || 0,
+    show_count: archive.show_count || 0,
+    set_count: archive.set_count || 0,
     venue_count: 0,
-    gallery_id: null,
-    album_id: null,
-    cover_image_url: null
+    gallery_id: archive.gallery_id || null,
+    album_id: archive.album_id || null,
+    cover_image_url: archive.cover_image_url || null
   });
   return item;
 }
@@ -6648,7 +6928,8 @@ async function handleMusicPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const data = result.rows.map(buildMusicPersonDbApiItem);
+    const archiveRelationships = await buildMusicPeopleArchiveRelationships();
+    const data = result.rows.map((row) => buildMusicPersonDbApiItem(row, archiveRelationships));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
