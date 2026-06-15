@@ -4,7 +4,7 @@
   "description": "Unified VMPix V3 data backend for archive tabs.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node server-runtime.js",
     "dev": "node server.js",
     "smoke:api": "node scripts/smoke-api.js"
   },
