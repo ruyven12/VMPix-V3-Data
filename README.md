@@ -42,6 +42,7 @@ Do not log or commit real token/API key values.
 /api/music/bands
 /api/music/shows
 /api/music/people
+/api/music/people/db/:personId
 /api/music/venues
 /api/wrestling/shows
 /api/wrestling/people
