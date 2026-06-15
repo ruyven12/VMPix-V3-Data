@@ -70,7 +70,7 @@ const SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS || 1000 * 60 * 10) || 1000 * 60 * 10
 );
-const SMUG_WRESTLING_MATCH_PHOTOS_CACHE_VERSION = 'wrestling_match_photos:v1';
+const SMUG_WRESTLING_MATCH_PHOTOS_CACHE_VERSION = 'wrestling_match_photos:v2';
 const MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS || 1000 * 60 * 60 * 6) || 1000 * 60 * 60 * 6
@@ -6234,6 +6234,12 @@ function isLikelySmugAlbumKeyCandidate(value) {
   return /^[A-Za-z0-9]{4,}$/.test(String(value || '').trim());
 }
 
+function getWrestlingSmugPromotionSegment(value) {
+  const clean = normalizeWrestlingSmugPathSegment(value);
+  if (!clean) return '';
+  return clean.replace(/\s+Wrestling$/i, '').trim() || clean;
+}
+
 function getWrestlingMatchAlbumPathCandidates(match, row, item) {
   const paths = [];
   const sourceValues = getWrestlingMatchAlbumSourceValues(match);
@@ -6257,6 +6263,7 @@ function getWrestlingMatchAlbumPathCandidates(match, row, item) {
   if (!matchSegments.length) return uniqueWrestlingSmugSourceValues(paths);
 
   const dateParts = getWrestlingShowDateParts(row, item);
+  const promotionShort = getWrestlingSmugPromotionSegment((row && row.promotion) || (item && item.promotion));
   const promotionSegments = getWrestlingSmugPathSegmentVariants((row && row.promotion) || (item && item.promotion));
   const showSegments = getWrestlingSmugPathSegmentVariants((row && row.show_name) || (item && item.show_name));
   const showKeySegments = getWrestlingSmugPathSegmentVariants((row && row.show_key) || (item && item.show_key));
@@ -6270,6 +6277,10 @@ function getWrestlingMatchAlbumPathCandidates(match, row, item) {
   ];
 
   matchSegments.forEach((matchSegment) => {
+    if (promotionShort && dateParts.dateFolder) {
+      addWrestlingMatchAlbumPathCandidate(paths, ['Wrestling', promotionShort, dateParts.dateFolder, matchSegment]);
+    }
+
     roots.forEach((root) => {
       showKeySegments.forEach((showKeySegment) => {
         addWrestlingMatchAlbumPathCandidate(paths, [root, showKeySegment, matchSegment]);
@@ -6460,7 +6471,7 @@ async function resolveSmugWrestlingShowAlbumId(row) {
   return '';
 }
 
-async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
+async function resolveSmugWrestlingMatchAlbum(match, row, item) {
   const sourceValues = getWrestlingMatchAlbumSourceValues(match);
   const dateParts = getWrestlingShowDateParts(row, item);
   const cacheKey = uniqueWrestlingSmugSourceValues([
@@ -6470,10 +6481,10 @@ async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
     ...sourceValues
   ]).join('|');
 
-  if (!cacheKey || !isSmugMugConfigured()) return '';
+  if (!cacheKey || !isSmugMugConfigured()) return { albumId: '', path: '', source: '' };
 
   const cached = getCachedSmugWrestlingAlbumId(`match:${cacheKey}`);
-  if (cached != null) return cached;
+  if (cached != null) return { albumId: cached, path: '', source: cached ? 'cache' : '' };
   if (smugWrestlingAlbumIdInFlight.has(`match:${cacheKey}`)) {
     return smugWrestlingAlbumIdInFlight.get(`match:${cacheKey}`);
   }
@@ -6486,7 +6497,7 @@ async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
       const albumIdFromUrl = extractSmugAlbumKeyFromUrl(cleanSource);
       if (albumIdFromUrl) {
         setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, albumIdFromUrl);
-        return albumIdFromUrl;
+        return { albumId: albumIdFromUrl, path: '', source: 'source_url' };
       }
 
       if (!/^https?:\/\//i.test(cleanSource) && isLikelySmugAlbumKeyCandidate(cleanSource)) {
@@ -6495,7 +6506,7 @@ async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
           const albumId = getSmugAlbumKey(metadata) || cleanSource;
           if (albumId) {
             setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, albumId);
-            return albumId;
+            return { albumId, path: '', source: 'direct_album_id' };
           }
         } catch (err) {
           if (!isSmugHttpStatusError(err, 404)) throw err;
@@ -6508,22 +6519,27 @@ async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
       const albumId = await resolveSmugWrestlingAlbumIdFromPathCandidate(pathCandidate);
       if (albumId) {
         setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, albumId);
-        return albumId;
+        return { albumId, path: pathCandidate, source: 'path_candidate' };
       }
     }
 
     setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, '');
-    return '';
+    return { albumId: '', path: '', source: '' };
   })().catch((err) => {
     console.warn(`Wrestling match SmugMug album resolution failed for ${cacheKey}:`, err && err.message ? err.message : String(err));
     setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, '');
-    return '';
+    return { albumId: '', path: '', source: 'error' };
   }).finally(() => {
     smugWrestlingAlbumIdInFlight.delete(`match:${cacheKey}`);
   });
 
   smugWrestlingAlbumIdInFlight.set(`match:${cacheKey}`, run);
   return run;
+}
+
+async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
+  const resolved = await resolveSmugWrestlingMatchAlbum(match, row, item);
+  return resolved.albumId || '';
 }
 
 function getCachedSmugWrestlingAlbumPhotos(albumId) {
@@ -6641,7 +6657,8 @@ async function enrichWrestlingShowItemWithMatchPhotos(item, row) {
     let showPhotoCount = 0;
 
     item.matches = await mapWithConcurrency(item.matches, SMUG_REQUEST_CONCURRENCY, async (match) => {
-      const albumId = await resolveSmugWrestlingMatchAlbumId(match, row, item);
+      const resolvedAlbum = await resolveSmugWrestlingMatchAlbum(match, row, item);
+      const albumId = resolvedAlbum.albumId || '';
       if (!albumId) return match;
 
       const matchedPhotos = await fetchSmugWrestlingAlbumPhotos(albumId);
@@ -6650,6 +6667,10 @@ async function enrichWrestlingShowItemWithMatchPhotos(item, row) {
       showPhotoCount += matchedPhotos.length;
       return {
         ...match,
+        album_id: albumId,
+        gallery_id: albumId,
+        smug_path: resolvedAlbum.path || '',
+        smug_match_album_source: resolvedAlbum.source || '',
         photos: matchedPhotos,
         match_photos: matchedPhotos,
         photo_count: matchedPhotos.length,
