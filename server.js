@@ -675,14 +675,8 @@ function getSmugImageCaption(image) {
 function getSmugImageDateTimeOriginal(image) {
   return getSmugNestedField(image, [
     'DateTimeOriginal',
-    'DateTime',
-    'DateTaken',
-    'DateCreated',
-    'OriginalDate',
     'date_time_original',
-    'dateTimeOriginal',
-    'date_taken',
-    'dateTaken'
+    'dateTimeOriginal'
   ]);
 }
 
@@ -1084,13 +1078,10 @@ function captionMatchesPersonName(caption, personName) {
   if (!cleanCaption || !cleanName) return false;
 
   const captionParts = cleanCaption
-    .replace(/[\uFF1B\u037E]/g, ';')
-    .split(/\s*;\s*/g)
+    .split(';')
     .map((part) => normalizePersonCaptionText(part).toLowerCase())
     .filter(Boolean);
-  if (captionParts.includes(cleanName.toLowerCase())) return true;
-
-  return new RegExp(`(^|[^a-z0-9])${escapeRegExp(cleanName)}([^a-z0-9]|$)`, 'i').test(cleanCaption);
+  return captionParts.includes(cleanName.toLowerCase());
 }
 
 async function searchSmugCaptionPhotoCount(personName) {
@@ -1155,6 +1146,8 @@ function createEmptyMusicPeopleArchiveRelationship() {
     photoKeys: new Set(),
     setKeys: new Set(),
     showKeys: new Set(),
+    matchedPhotos: [],
+    showMatches: new Map(),
     photo_count: 0,
     set_count: 0,
     show_count: 0,
@@ -1162,7 +1155,13 @@ function createEmptyMusicPeopleArchiveRelationship() {
     gallery_id: null,
     album_id: null,
     cover_image_url: null,
-    latestPhotoTime: 0
+    latestPhotoTime: 0,
+    firstSeenTime: 0,
+    first_seen: null,
+    first_seen_display: null,
+    latestSeenTime: 0,
+    latest_seen: null,
+    latest_seen_display: null
   };
 }
 
@@ -1213,6 +1212,54 @@ function getMusicPeopleArchiveShowTime(show) {
   const dateValue = String(show && (show.show_date || show.date || '') || '').trim();
   const parsed = dateValue ? Date.parse(dateValue) : NaN;
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getMusicPeopleArchiveDateTimeOriginalTime(value) {
+  const parsed = Date.parse(String(value || '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatMusicPeopleArchiveSeenDate(value) {
+  const time = getMusicPeopleArchiveDateTimeOriginalTime(value);
+  if (!time) return null;
+  const date = new Date(time);
+  return [
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+    String(date.getUTCFullYear())
+  ].join('/');
+}
+
+function getMusicPeopleArchivePhotoUrl(photo) {
+  return String(photo && (photo.thumbnail_url || photo.small_url || photo.medium_url || photo.large_url) || '').trim();
+}
+
+function buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey) {
+  const show = album && album.show ? album.show : {};
+  const albumId = String(album && album.album_id || '').trim();
+  return {
+    image_key: String(photo && photo.image_key || photoKey || '').trim(),
+    caption: String(photo && photo.caption || '').trim(),
+    date_time_original: String(photo && photo.date_time_original || '').trim() || null,
+    thumbnail_url: String(photo && photo.thumbnail_url || '').trim() || null,
+    small_url: String(photo && photo.small_url || '').trim() || null,
+    medium_url: String(photo && photo.medium_url || '').trim() || null,
+    large_url: String(photo && photo.large_url || '').trim() || null,
+    album_id: albumId || null,
+    gallery_id: String(album && (album.gallery_id || albumId) || '').trim() || null,
+    show_id: String(show && (show.show_id || show.id) || '').trim() || null,
+    show_name: String(show && (show.name || show.title) || '').trim() || null,
+    show_date: String(show && (show.show_date || show.date) || '').trim() || null,
+    venue: String(show && show.venue || '').trim() || null,
+    location: [show && show.city, show && show.state].map((part) => String(part || '').trim()).filter(Boolean).join(', ') || null
+  };
+}
+
+function compareMusicPeopleArchiveMatchedPhotos(a, b) {
+  const bTime = getMusicPeopleArchiveDateTimeOriginalTime(b && b.date_time_original);
+  const aTime = getMusicPeopleArchiveDateTimeOriginalTime(a && a.date_time_original);
+  if (bTime !== aTime) return bTime - aTime;
+  return String(b && b.image_key || '').localeCompare(String(a && a.image_key || ''));
 }
 
 function collectMusicPeopleArchiveShowAlbums(show) {
@@ -1295,10 +1342,8 @@ function addMusicPeopleArchiveMatch(relationships, personId, album, photo) {
   const imageKey = String(photo && photo.image_key || '').trim();
   const photoKey = imageKey || `${albumId}:${relationship.photoKeys.size + 1}`;
 
-  if (!relationship.photoKeys.has(photoKey)) {
-    relationship.photoKeys.add(photoKey);
-    relationship.photo_count = relationship.photoKeys.size;
-  }
+  const isNewPhoto = !relationship.photoKeys.has(photoKey);
+  if (isNewPhoto) relationship.photoKeys.add(photoKey);
   if (albumId) {
     relationship.setKeys.add(albumId);
     relationship.set_count = relationship.setKeys.size;
@@ -1309,9 +1354,43 @@ function addMusicPeopleArchiveMatch(relationships, personId, album, photo) {
     relationship.event_count = relationship.show_count;
   }
 
-  const photoTime = Date.parse(photo && photo.date_time_original || '') || getMusicPeopleArchiveShowTime(album.show);
-  const coverUrl = String(photo && (photo.small_url || photo.thumbnail_url || photo.medium_url || photo.large_url) || album.cover_image_url || '').trim();
-  if (coverUrl && (!relationship.cover_image_url || photoTime >= relationship.latestPhotoTime)) {
+  if (isNewPhoto) {
+    const matchedPhoto = buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey);
+    relationship.matchedPhotos.push(matchedPhoto);
+    relationship.photo_count = relationship.photoKeys.size;
+
+    const dateTimeOriginal = matchedPhoto.date_time_original || '';
+    const originalTime = getMusicPeopleArchiveDateTimeOriginalTime(dateTimeOriginal);
+    if (originalTime && (!relationship.firstSeenTime || originalTime < relationship.firstSeenTime)) {
+      relationship.firstSeenTime = originalTime;
+      relationship.first_seen = dateTimeOriginal;
+      relationship.first_seen_display = formatMusicPeopleArchiveSeenDate(dateTimeOriginal);
+    }
+    if (originalTime && originalTime >= relationship.latestSeenTime) {
+      relationship.latestSeenTime = originalTime;
+      relationship.latest_seen = dateTimeOriginal;
+      relationship.latest_seen_display = formatMusicPeopleArchiveSeenDate(dateTimeOriginal);
+    }
+
+    const groupKey = showKey || albumId || photoKey;
+    if (!relationship.showMatches.has(groupKey)) {
+      relationship.showMatches.set(groupKey, {
+        show_id: matchedPhoto.show_id,
+        album_id: matchedPhoto.album_id,
+        gallery_id: matchedPhoto.gallery_id,
+        title: matchedPhoto.show_name || `Tagged Set ${relationship.showMatches.size + 1}`,
+        date: matchedPhoto.show_date,
+        venue: matchedPhoto.venue,
+        location: matchedPhoto.location,
+        matched_photos: []
+      });
+    }
+    relationship.showMatches.get(groupKey).matched_photos.push(matchedPhoto);
+  }
+
+  const photoTime = getMusicPeopleArchiveDateTimeOriginalTime(photo && photo.date_time_original);
+  const coverUrl = getMusicPeopleArchivePhotoUrl(photo) || String(album && album.cover_image_url || '').trim();
+  if (coverUrl && (!relationship.cover_image_url || (photoTime && photoTime >= relationship.latestPhotoTime))) {
     relationship.latestPhotoTime = photoTime || relationship.latestPhotoTime;
     relationship.gallery_id = album.gallery_id || albumId || null;
     relationship.album_id = albumId || null;
@@ -1347,7 +1426,7 @@ async function buildMusicPeopleArchiveRelationships() {
     if (!people.length) return new Map();
 
     const showsResult = await dbPool.query(`
-      SELECT id, show_id, name, date, show_date, gallery_id, album_id, cover_image_url, smug_albums
+      SELECT id, show_id, name, date, show_date, venue, city, state, gallery_id, album_id, cover_image_url, smug_albums
       FROM music_shows
       WHERE (
         (jsonb_typeof(smug_albums) = 'array' AND jsonb_array_length(smug_albums) > 0)
@@ -1382,6 +1461,23 @@ async function buildMusicPeopleArchiveRelationships() {
 
     const finalized = new Map();
     relationships.forEach((relationship, personId) => {
+      const matchedPhotos = relationship.matchedPhotos
+        .slice()
+        .sort(compareMusicPeopleArchiveMatchedPhotos);
+      const taggedShows = Array.from(relationship.showMatches.values())
+        .map((show) => {
+          const showPhotos = Array.isArray(show.matched_photos) ? show.matched_photos.slice().sort(compareMusicPeopleArchiveMatchedPhotos) : [];
+          return {
+            ...show,
+            tagged_photo_count: showPhotos.length,
+            matched_photos: showPhotos.slice(0, 4)
+          };
+        })
+        .sort((a, b) => {
+          const bTime = Math.max(0, ...(Array.isArray(b.matched_photos) ? b.matched_photos : []).map((photo) => getMusicPeopleArchiveDateTimeOriginalTime(photo.date_time_original)));
+          const aTime = Math.max(0, ...(Array.isArray(a.matched_photos) ? a.matched_photos : []).map((photo) => getMusicPeopleArchiveDateTimeOriginalTime(photo.date_time_original)));
+          return bTime - aTime;
+        });
       finalized.set(personId, {
         photo_count: toIntegerCount(relationship.photo_count),
         set_count: toIntegerCount(relationship.set_count),
@@ -1389,7 +1485,13 @@ async function buildMusicPeopleArchiveRelationships() {
         event_count: toIntegerCount(relationship.event_count),
         gallery_id: relationship.gallery_id || null,
         album_id: relationship.album_id || null,
-        cover_image_url: relationship.cover_image_url || null
+        cover_image_url: relationship.cover_image_url || null,
+        first_seen: relationship.first_seen || null,
+        first_seen_display: relationship.first_seen_display || null,
+        latest_seen: relationship.latest_seen || null,
+        latest_seen_display: relationship.latest_seen_display || null,
+        matched_photos: matchedPhotos.slice(0, 24),
+        tagged_shows: taggedShows
       });
     });
 
@@ -6811,6 +6913,12 @@ function buildMusicPersonDbApiItem(row, archiveRelationships = new Map()) {
     set_count: archive.set_count || 0,
     venue_count: 0
   });
+  stats.first_seen = archive.first_seen || stats.first_seen || null;
+  stats.first_seen_display = archive.first_seen_display || stats.first_seen_display || null;
+  stats.latest_seen = archive.latest_seen || stats.latest_seen || null;
+  stats.latest_seen_display = archive.latest_seen_display || stats.latest_seen_display || null;
+  stats.matched_photos = Array.isArray(archive.matched_photos) ? archive.matched_photos : [];
+  stats.tagged_shows = Array.isArray(archive.tagged_shows) ? archive.tagged_shows : [];
   const item = {
     person_id: toIntegerCount(row.person_id),
     name: row.name || '',
@@ -6820,6 +6928,12 @@ function buildMusicPersonDbApiItem(row, archiveRelationships = new Map()) {
     associations: Array.isArray(row.associations) ? row.associations : [],
     stats
   };
+  item.first_seen = archive.first_seen || null;
+  item.first_seen_display = archive.first_seen_display || null;
+  item.latest_seen = archive.latest_seen || null;
+  item.latest_seen_display = archive.latest_seen_display || null;
+  item.matched_photos = Array.isArray(archive.matched_photos) ? archive.matched_photos : [];
+  item.tagged_shows = Array.isArray(archive.tagged_shows) ? archive.tagged_shows : [];
   addMusicCanonicalAliases(item, {
     photo_count: stats.photo_count,
     band_count: bands.length,
