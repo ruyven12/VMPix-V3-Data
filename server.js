@@ -7236,6 +7236,7 @@ async function handleMusicPersonDbDetailRequest(req, res) {
     }
 
     const rawPersonId = String(req.params.personId || '').trim();
+    const lowerPersonId = rawPersonId.toLowerCase();
     const personSlug = slugifyMusicBandId(rawPersonId);
     if (!personSlug) {
       res.status(400).json({
@@ -7250,10 +7251,11 @@ async function handleMusicPersonDbDetailRequest(req, res) {
       `SELECT person_id, name, category, aliases, bands, associations, stats
        FROM music_people
        WHERE person_id::text = $1
-          OR lower(regexp_replace(trim(coalesce(name, '')), '[^a-z0-9]+', '-', 'g')) = $1
+          OR lower(trim(person_id::text)) = $2
+          OR lower(regexp_replace(trim(coalesce(name, '')), '[^a-z0-9]+', '-', 'g')) = $3
        ORDER BY person_id ASC
        LIMIT 1`,
-      [personSlug]
+      [rawPersonId, lowerPersonId, personSlug]
     );
     const row = result.rows && result.rows[0];
     if (!row) {
@@ -16698,12 +16700,12 @@ app.get('/api/wrestling/venues/stats', async (req, res) => {
   }
 });
 
-app.get('/api/music/people/db', async (req, res) => {
-  return handleMusicPeopleDbRequest(req, res);
-});
-
 app.get('/api/music/people/db/:personId', async (req, res) => {
   return handleMusicPersonDbDetailRequest(req, res);
+});
+
+app.get('/api/music/people/db', async (req, res) => {
+  return handleMusicPeopleDbRequest(req, res);
 });
 
 app.get('/api/music/people/stats', async (req, res) => {
