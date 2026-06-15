@@ -90,6 +90,8 @@ const smugWrestlingMatchPhotosCache = new Map();
 const smugWrestlingMatchPhotosInFlight = new Map();
 const smugWrestlingAlbumIdCache = new Map();
 const smugWrestlingAlbumIdInFlight = new Map();
+const smugWrestlingFolderAlbumsCache = new Map();
+const smugWrestlingFolderAlbumsInFlight = new Map();
 const smugMusicPeopleArchiveAlbumPhotosCache = new Map();
 const smugMusicPeopleArchiveAlbumPhotosInFlight = new Map();
 const smugMusicPersonArchiveRelationshipCache = new Map();
@@ -6128,6 +6130,190 @@ function getWrestlingShowPhotoSourceUrls(row) {
   ]).filter((value) => /^https?:\/\//i.test(value));
 }
 
+function getSmugAlbumPathFromUrl(value) {
+  const clean = String(value || '').trim();
+  if (!/^https?:\/\//i.test(clean)) return '';
+
+  try {
+    const parsed = new URL(clean);
+    let segments = parsed.pathname
+      .split('/')
+      .map((segment) => decodeSmugPathSegment(segment))
+      .filter(Boolean);
+
+    if (segments[0] === 'app' && segments[1] === 'organize') {
+      segments = segments.slice(2);
+    }
+
+    const imageIndex = segments.findIndex((segment) => /^i-[A-Za-z0-9]+$/i.test(segment));
+    if (imageIndex > -1) segments = segments.slice(0, imageIndex);
+
+    const photosIndex = segments.findIndex((segment) => /^photos$/i.test(segment));
+    if (photosIndex > -1) segments = segments.slice(0, photosIndex);
+
+    return getSmugPathSegments(segments.join('/')).join('/');
+  } catch (_) {
+    return '';
+  }
+}
+
+function normalizeWrestlingSmugPathSegment(value) {
+  return String(value || '').trim().replace(/^\/+|\/+$/g, '').replace(/\s+/g, ' ');
+}
+
+function getWrestlingSmugPathSegmentVariants(value) {
+  const clean = normalizeWrestlingSmugPathSegment(value);
+  if (!clean) return [];
+
+  const hyphenated = clean
+    .replace(/[\u2019']/g, '')
+    .replace(/&/g, 'and')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const slug = slugifyMusicBandId(clean);
+
+  return uniqueWrestlingSmugSourceValues([clean, hyphenated, slug]);
+}
+
+function getWrestlingShowDateParts(row, item) {
+  const dateValue = row && row.date ? row.date : item && item.date;
+  const parsed = parseMusicShowDate(dateValue);
+  if (!parsed || !parsed.iso) {
+    return {
+      dateFolder: '',
+      iso: '',
+      year: '',
+      dateSegments: getWrestlingSmugPathSegmentVariants(dateValue)
+    };
+  }
+
+  const [year, month, day] = parsed.iso.split('-');
+  const dateFolder = `${month}${day}${String(year || '').slice(-2)}`;
+
+  return {
+    dateFolder,
+    iso: parsed.iso,
+    year,
+    dateSegments: uniqueWrestlingSmugSourceValues([
+      dateFolder,
+      parsed.iso,
+      `${month}-${day}-${String(year || '').slice(-2)}`,
+      `${month}-${day}-${year}`,
+      ...getWrestlingSmugPathSegmentVariants(dateValue)
+    ])
+  };
+}
+
+function addWrestlingMatchAlbumPathCandidate(paths, segments) {
+  const path = (segments || [])
+    .flat()
+    .map(normalizeWrestlingSmugPathSegment)
+    .filter(Boolean)
+    .join('/');
+
+  if (path) paths.push(path);
+}
+
+function getWrestlingMatchAlbumSourceValues(match) {
+  return uniqueWrestlingSmugSourceValues([
+    match && match.match_url,
+    match && match.matchUrl,
+    match && match.album_url,
+    match && match.albumUrl,
+    match && match.gallery_url,
+    match && match.galleryUrl,
+    match && match.album_id,
+    match && match.albumId,
+    match && match.gallery_id,
+    match && match.galleryId
+  ]);
+}
+
+function isLikelySmugAlbumKeyCandidate(value) {
+  return /^[A-Za-z0-9]{4,}$/.test(String(value || '').trim());
+}
+
+function getWrestlingMatchAlbumPathCandidates(match, row, item) {
+  const paths = [];
+  const sourceValues = getWrestlingMatchAlbumSourceValues(match);
+
+  sourceValues.forEach((sourceValue) => {
+    const sourcePath = getSmugAlbumPathFromUrl(sourceValue);
+    if (sourcePath) addWrestlingMatchAlbumPathCandidate(paths, [sourcePath]);
+
+    const cleanSource = String(sourceValue || '').trim();
+    if (cleanSource && !/^https?:\/\//i.test(cleanSource) && cleanSource.includes('/')) {
+      addWrestlingMatchAlbumPathCandidate(paths, [cleanSource]);
+    }
+  });
+
+  const matchSegments = uniqueWrestlingSmugSourceValues(
+    sourceValues
+      .filter((sourceValue) => !/^https?:\/\//i.test(String(sourceValue || '').trim()))
+      .filter((sourceValue) => !String(sourceValue || '').includes('/'))
+      .flatMap(getWrestlingSmugPathSegmentVariants)
+  );
+  if (!matchSegments.length) return uniqueWrestlingSmugSourceValues(paths);
+
+  const dateParts = getWrestlingShowDateParts(row, item);
+  const promotionSegments = getWrestlingSmugPathSegmentVariants((row && row.promotion) || (item && item.promotion));
+  const showSegments = getWrestlingSmugPathSegmentVariants((row && row.show_name) || (item && item.show_name));
+  const showKeySegments = getWrestlingSmugPathSegmentVariants((row && row.show_key) || (item && item.show_key));
+  const roots = [
+    ['Wrestling'],
+    ['Wrestling', 'Archives'],
+    ['Wrestling', 'Shows'],
+    ['Wrestling', 'Archives', 'Shows'],
+    ['Wrestling', 'Events'],
+    ['Wrestling', 'Archives', 'Events']
+  ];
+
+  matchSegments.forEach((matchSegment) => {
+    roots.forEach((root) => {
+      showKeySegments.forEach((showKeySegment) => {
+        addWrestlingMatchAlbumPathCandidate(paths, [root, showKeySegment, matchSegment]);
+      });
+
+      promotionSegments.forEach((promotionSegment) => {
+        showSegments.forEach((showSegment) => {
+          dateParts.dateSegments.forEach((dateSegment) => {
+            addWrestlingMatchAlbumPathCandidate(paths, [root, promotionSegment, showSegment, dateSegment, matchSegment]);
+            addWrestlingMatchAlbumPathCandidate(paths, [root, promotionSegment, dateSegment, showSegment, matchSegment]);
+          });
+
+          addWrestlingMatchAlbumPathCandidate(paths, [root, promotionSegment, showSegment, matchSegment]);
+
+          if (dateParts.year) {
+            addWrestlingMatchAlbumPathCandidate(paths, [root, dateParts.year, promotionSegment, showSegment, matchSegment]);
+            addWrestlingMatchAlbumPathCandidate(paths, [root, promotionSegment, dateParts.year, showSegment, matchSegment]);
+          }
+        });
+
+        dateParts.dateSegments.forEach((dateSegment) => {
+          addWrestlingMatchAlbumPathCandidate(paths, [root, promotionSegment, dateSegment, matchSegment]);
+        });
+
+        addWrestlingMatchAlbumPathCandidate(paths, [root, promotionSegment, matchSegment]);
+      });
+
+      dateParts.dateSegments.forEach((dateSegment) => {
+        addWrestlingMatchAlbumPathCandidate(paths, [root, dateSegment, matchSegment]);
+      });
+
+      if (dateParts.year) {
+        dateParts.dateSegments.forEach((dateSegment) => {
+          addWrestlingMatchAlbumPathCandidate(paths, [root, dateParts.year, dateSegment, matchSegment]);
+        });
+      }
+
+      addWrestlingMatchAlbumPathCandidate(paths, [root, matchSegment]);
+    });
+  });
+
+  return uniqueWrestlingSmugSourceValues(paths).slice(0, 120);
+}
+
 function getCachedSmugWrestlingAlbumId(sourceUrl) {
   const key = String(sourceUrl || '').trim();
   const hit = key ? smugWrestlingAlbumIdCache.get(key) : null;
@@ -6146,6 +6332,87 @@ function setCachedSmugWrestlingAlbumId(sourceUrl, albumId) {
     fetchedAt: Date.now(),
     albumId: String(albumId || '').trim()
   });
+}
+
+function getCachedSmugWrestlingFolderAlbums(parentPath) {
+  const key = `${SMUG_WRESTLING_MATCH_PHOTOS_CACHE_VERSION}:folder:${String(parentPath || '').trim()}`;
+  const hit = parentPath ? smugWrestlingFolderAlbumsCache.get(key) : null;
+  if (!hit) return null;
+  if (Date.now() - hit.fetchedAt > SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS) {
+    smugWrestlingFolderAlbumsCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function setCachedSmugWrestlingFolderAlbums(parentPath, payload) {
+  const cleanParentPath = String(parentPath || '').trim();
+  if (!cleanParentPath) return;
+  const key = `${SMUG_WRESTLING_MATCH_PHOTOS_CACHE_VERSION}:folder:${cleanParentPath}`;
+  smugWrestlingFolderAlbumsCache.set(key, {
+    fetchedAt: Date.now(),
+    albums: Array.isArray(payload && payload.albums) ? payload.albums : [],
+    endpoint: payload && payload.endpoint ? payload.endpoint : '',
+    api_url_before_api_key: payload && payload.api_url_before_api_key ? payload.api_url_before_api_key : ''
+  });
+}
+
+async function fetchSmugWrestlingFolderAlbums(parentPath) {
+  const cleanParentPath = getSmugPathSegments(parentPath).join('/');
+  if (!cleanParentPath || !isSmugMugConfigured()) return { albums: [] };
+
+  const cached = getCachedSmugWrestlingFolderAlbums(cleanParentPath);
+  if (cached) return cached;
+  if (smugWrestlingFolderAlbumsInFlight.has(cleanParentPath)) {
+    return smugWrestlingFolderAlbumsInFlight.get(cleanParentPath);
+  }
+
+  const endpoint = buildSmugFolderAlbumsEndpointFromPath(cleanParentPath);
+  const run = (async () => {
+    const payload = {
+      endpoint,
+      api_url_before_api_key: buildSmugApiDebugUrl(endpoint),
+      albums: []
+    };
+
+    try {
+      const json = await fetchSmugJson(endpoint);
+      payload.albums = getSmugAlbums(json);
+    } catch (err) {
+      if (!isSmugHttpStatusError(err, 404)) throw err;
+    }
+
+    setCachedSmugWrestlingFolderAlbums(cleanParentPath, payload);
+    return payload;
+  })().finally(() => {
+    smugWrestlingFolderAlbumsInFlight.delete(cleanParentPath);
+  });
+
+  smugWrestlingFolderAlbumsInFlight.set(cleanParentPath, run);
+  return run;
+}
+
+async function resolveSmugWrestlingAlbumIdFromPathCandidate(smugPath) {
+  const segments = getSmugPathSegments(smugPath);
+  const albumSegment = segments[segments.length - 1] || '';
+  const parentPath = segments.slice(0, -1).join('/');
+  if (!albumSegment || !parentPath) return '';
+
+  const cacheKey = `match-path:${segments.join('/')}`;
+  const cachedPathAlbumId = getCachedSmugWrestlingAlbumId(cacheKey);
+  if (cachedPathAlbumId != null) return cachedPathAlbumId;
+
+  try {
+    const { albums } = await fetchSmugWrestlingFolderAlbums(parentPath);
+    const match = albums.find((album) => albumMatchesSmugMusicShowPath(album, segments.join('/')));
+    const albumId = match ? getSmugAlbumKey(match) : '';
+    setCachedSmugWrestlingAlbumId(cacheKey, albumId);
+    return albumId || '';
+  } catch (err) {
+    console.warn(`Wrestling SmugMug folder album lookup failed for ${smugPath}:`, err && err.message ? err.message : String(err));
+    setCachedSmugWrestlingAlbumId(cacheKey, '');
+    return '';
+  }
 }
 
 async function resolveSmugWrestlingAlbumIdFromSourceUrl(sourceUrl) {
@@ -6191,6 +6458,72 @@ async function resolveSmugWrestlingShowAlbumId(row) {
     if (albumId) return albumId;
   }
   return '';
+}
+
+async function resolveSmugWrestlingMatchAlbumId(match, row, item) {
+  const sourceValues = getWrestlingMatchAlbumSourceValues(match);
+  const dateParts = getWrestlingShowDateParts(row, item);
+  const cacheKey = uniqueWrestlingSmugSourceValues([
+    row && row.show_key,
+    item && item.show_key,
+    dateParts.dateFolder,
+    ...sourceValues
+  ]).join('|');
+
+  if (!cacheKey || !isSmugMugConfigured()) return '';
+
+  const cached = getCachedSmugWrestlingAlbumId(`match:${cacheKey}`);
+  if (cached != null) return cached;
+  if (smugWrestlingAlbumIdInFlight.has(`match:${cacheKey}`)) {
+    return smugWrestlingAlbumIdInFlight.get(`match:${cacheKey}`);
+  }
+
+  const run = (async () => {
+    for (const sourceValue of sourceValues) {
+      const cleanSource = String(sourceValue || '').trim();
+      if (!cleanSource) continue;
+
+      const albumIdFromUrl = extractSmugAlbumKeyFromUrl(cleanSource);
+      if (albumIdFromUrl) {
+        setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, albumIdFromUrl);
+        return albumIdFromUrl;
+      }
+
+      if (!/^https?:\/\//i.test(cleanSource) && isLikelySmugAlbumKeyCandidate(cleanSource)) {
+        try {
+          const metadata = await fetchSmugAlbumMetadata(cleanSource);
+          const albumId = getSmugAlbumKey(metadata) || cleanSource;
+          if (albumId) {
+            setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, albumId);
+            return albumId;
+          }
+        } catch (err) {
+          if (!isSmugHttpStatusError(err, 404)) throw err;
+        }
+      }
+    }
+
+    const pathCandidates = getWrestlingMatchAlbumPathCandidates(match, row, item);
+    for (const pathCandidate of pathCandidates) {
+      const albumId = await resolveSmugWrestlingAlbumIdFromPathCandidate(pathCandidate);
+      if (albumId) {
+        setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, albumId);
+        return albumId;
+      }
+    }
+
+    setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, '');
+    return '';
+  })().catch((err) => {
+    console.warn(`Wrestling match SmugMug album resolution failed for ${cacheKey}:`, err && err.message ? err.message : String(err));
+    setCachedSmugWrestlingAlbumId(`match:${cacheKey}`, '');
+    return '';
+  }).finally(() => {
+    smugWrestlingAlbumIdInFlight.delete(`match:${cacheKey}`);
+  });
+
+  smugWrestlingAlbumIdInFlight.set(`match:${cacheKey}`, run);
+  return run;
 }
 
 function getCachedSmugWrestlingAlbumPhotos(albumId) {
@@ -6304,21 +6637,17 @@ function doesWrestlingAlbumPhotoMatchMatch(photo, match) {
 }
 
 async function enrichWrestlingShowItemWithMatchPhotos(item, row) {
-  const albumId = await resolveSmugWrestlingShowAlbumId(row);
-  if (!albumId) return item;
-
-  const albumPhotos = await fetchSmugWrestlingAlbumPhotos(albumId);
-  if (!albumPhotos.length) return item;
-
-  item.album_id = albumId;
-  item.gallery_id = albumId;
-  item.photo_count = albumPhotos.length;
-  item.cover_image_url = item.cover_image_url || item.poster || albumPhotos.find((photo) => photo.large_url || photo.medium_url || photo.small_url || photo.thumbnail_url)?.large_url || '';
-
   if (Array.isArray(item.matches)) {
-    item.matches = item.matches.map((match) => {
-      const matchedPhotos = albumPhotos.filter((photo) => doesWrestlingAlbumPhotoMatchMatch(photo, match));
+    let showPhotoCount = 0;
+
+    item.matches = await mapWithConcurrency(item.matches, SMUG_REQUEST_CONCURRENCY, async (match) => {
+      const albumId = await resolveSmugWrestlingMatchAlbumId(match, row, item);
+      if (!albumId) return match;
+
+      const matchedPhotos = await fetchSmugWrestlingAlbumPhotos(albumId);
       if (!matchedPhotos.length) return match;
+
+      showPhotoCount += matchedPhotos.length;
       return {
         ...match,
         photos: matchedPhotos,
@@ -6332,6 +6661,13 @@ async function enrichWrestlingShowItemWithMatchPhotos(item, row) {
         }
       };
     });
+
+    if (showPhotoCount > 0) {
+      item.photo_count = showPhotoCount;
+      item.cover_image_url = item.cover_image_url || item.poster || item.matches
+        .flatMap((match) => Array.isArray(match.photos) ? match.photos : [])
+        .find((photo) => photo.large_url || photo.medium_url || photo.small_url || photo.thumbnail_url)?.large_url || '';
+    }
   }
 
   return item;
@@ -6665,7 +7001,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
         ...buildListMeta({ route: '/api/wrestling/shows/db', source: 'PostgreSQL:wrestling_shows', pagination, filters: options.filters, sort: options.sort }),
         payload: {
           matchPhotos: includePhotos ? 'data[].matches[].photos' : 'omitted unless include_photos=1',
-          matchPhotoSource: 'SmugMug album photos matched by existing match_url token'
+          matchPhotoSource: 'SmugMug album photos resolved from matches[].match_url'
         }
       },
       stats: {
