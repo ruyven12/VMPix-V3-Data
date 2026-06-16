@@ -7313,7 +7313,13 @@ async function buildWrestlingShowsDbStatsResponse() {
   };
 }
 
-function buildWrestlingPersonDbApiItem(row) {
+function normalizeWrestlingPersonExactMatchKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function buildWrestlingPersonDbApiItem(row, appearanceCounts = new Map()) {
+  const counts = appearanceCounts.get(normalizeWrestlingPersonExactMatchKey(row && row.name)) || {};
+
   return {
     id: toIntegerCount(row.id),
     slug: row.slug || '',
@@ -7321,10 +7327,70 @@ function buildWrestlingPersonDbApiItem(row) {
     category: row.category || '',
     aliases: Array.isArray(row.aliases) ? row.aliases : [],
     teams: Array.isArray(row.teams) ? row.teams : [],
-    notes: row.notes || ''
+    notes: row.notes || '',
+    event_count: toIntegerCount(counts.event_count),
+    match_count: toIntegerCount(counts.match_count)
   };
 }
 
+async function getWrestlingPeopleAppearanceCounts(names = []) {
+  const nameKeys = Array.from(new Set(
+    (Array.isArray(names) ? names : [])
+      .map(normalizeWrestlingPersonExactMatchKey)
+      .filter(Boolean)
+  ));
+  const counts = new Map();
+  if (!nameKeys.length) return counts;
+
+  const result = await dbPool.query(`
+    WITH selected_people AS (
+      SELECT unnest($1::text[]) AS name_key
+    ), match_rows AS (
+      SELECT
+        coalesce(nullif(trim(ws.show_key), ''), ws.show_id::text) AS show_identity,
+        match_row.ordinality AS match_ordinality,
+        match_row.match AS match
+      FROM wrestling_shows ws
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(ws.matches) = 'array' THEN ws.matches ELSE '[]'::jsonb END
+      ) WITH ORDINALITY AS match_row(match, ordinality)
+    ), person_match_rows AS (
+      SELECT DISTINCT
+        selected_people.name_key,
+        match_rows.show_identity,
+        match_rows.match_ordinality
+      FROM selected_people
+      JOIN match_rows ON EXISTS (
+        SELECT 1
+        FROM (
+          SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_rows.match->'participants') = 'array' THEN match_rows.match->'participants' ELSE '[]'::jsonb END) AS value
+          UNION ALL
+          SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_rows.match->'referees') = 'array' THEN match_rows.match->'referees' ELSE '[]'::jsonb END) AS value
+          UNION ALL
+          SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_rows.match->'extra_people') = 'array' THEN match_rows.match->'extra_people' ELSE '[]'::jsonb END) AS value
+          UNION ALL
+          SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(match_rows.match->'tagged_people') = 'array' THEN match_rows.match->'tagged_people' ELSE '[]'::jsonb END) AS value
+        ) AS people_values
+        WHERE lower(trim(people_values.value)) = selected_people.name_key
+      )
+    )
+    SELECT
+      name_key,
+      count(DISTINCT show_identity)::int AS event_count,
+      count(*)::int AS match_count
+    FROM person_match_rows
+    GROUP BY name_key
+  `, [nameKeys]);
+
+  result.rows.forEach((row) => {
+    counts.set(row.name_key, {
+      event_count: toIntegerCount(row.event_count),
+      match_count: toIntegerCount(row.match_count)
+    });
+  });
+
+  return counts;
+}
 function getPostgresTextArraySql(columnName) {
   return `coalesce(${columnName}, '{}'::text[])`;
 }
@@ -7424,7 +7490,8 @@ async function handleWrestlingPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const data = result.rows.map(buildWrestlingPersonDbApiItem);
+    const appearanceCounts = await getWrestlingPeopleAppearanceCounts(result.rows.map((row) => row.name));
+    const data = result.rows.map((row) => buildWrestlingPersonDbApiItem(row, appearanceCounts));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
