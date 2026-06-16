@@ -71,6 +71,11 @@ const SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS = Math.max(
   Number(process.env.SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS || 1000 * 60 * 10) || 1000 * 60 * 10
 );
 const SMUG_WRESTLING_MATCH_PHOTOS_CACHE_VERSION = 'wrestling_match_photos:v3';
+const WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS || SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS) || SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS
+);
+const WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS = getIntegerEnv('WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS', 500, 1, 2000);
 const MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS || 1000 * 60 * 60 * 6) || 1000 * 60 * 60 * 6
@@ -92,6 +97,8 @@ const smugWrestlingAlbumIdCache = new Map();
 const smugWrestlingAlbumIdInFlight = new Map();
 const smugWrestlingFolderAlbumsCache = new Map();
 const smugWrestlingFolderAlbumsInFlight = new Map();
+let smugWrestlingPeoplePhotoCountCache = null;
+let smugWrestlingPeoplePhotoCountInFlight = null;
 const smugMusicPeopleArchiveAlbumPhotosCache = new Map();
 const smugMusicPeopleArchiveAlbumPhotosInFlight = new Map();
 const smugMusicPersonArchiveRelationshipCache = new Map();
@@ -7317,8 +7324,10 @@ function normalizeWrestlingPersonExactMatchKey(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-function buildWrestlingPersonDbApiItem(row, appearanceCounts = new Map()) {
-  const counts = appearanceCounts.get(normalizeWrestlingPersonExactMatchKey(row && row.name)) || {};
+function buildWrestlingPersonDbApiItem(row, appearanceCounts = new Map(), photoCounts = new Map()) {
+  const personKey = normalizeWrestlingPersonExactMatchKey(row && row.name);
+  const counts = appearanceCounts.get(personKey) || {};
+  const photoCount = photoCounts.get(personKey) || 0;
 
   return {
     id: toIntegerCount(row.id),
@@ -7329,7 +7338,8 @@ function buildWrestlingPersonDbApiItem(row, appearanceCounts = new Map()) {
     teams: Array.isArray(row.teams) ? row.teams : [],
     notes: row.notes || '',
     event_count: toIntegerCount(counts.event_count),
-    match_count: toIntegerCount(counts.match_count)
+    match_count: toIntegerCount(counts.match_count),
+    photo_count: toIntegerCount(photoCount)
   };
 }
 
@@ -7390,6 +7400,126 @@ async function getWrestlingPeopleAppearanceCounts(names = []) {
   });
 
   return counts;
+}
+function getWrestlingPersonPhotoMatchKeys(row) {
+  const values = [
+    row && row.name,
+    ...(Array.isArray(row && row.aliases) ? row.aliases : splitWrestlingSemicolonList(row && row.aliases))
+  ];
+  return Array.from(new Set(
+    values
+      .map(normalizeWrestlingPersonExactMatchKey)
+      .filter(Boolean)
+  ));
+}
+
+function createWrestlingPeoplePhotoMatchers(people = []) {
+  return (Array.isArray(people) ? people : [])
+    .map((person) => ({
+      personKey: normalizeWrestlingPersonExactMatchKey(person && person.name),
+      matchKeys: getWrestlingPersonPhotoMatchKeys(person)
+    }))
+    .filter((person) => person.personKey && person.matchKeys.length);
+}
+
+function getWrestlingCaptionTokenKeys(caption) {
+  return String(caption || '')
+    .split(';')
+    .map(normalizeWrestlingPersonExactMatchKey)
+    .filter(Boolean);
+}
+
+function addWrestlingPeoplePhotoCountMatches(photoSets, matchers, albumId, photo) {
+  const captionTokens = new Set(getWrestlingCaptionTokenKeys(photo && photo.caption));
+  if (!captionTokens.size) return;
+
+  const imageKey = String(photo && (photo.image_key || photo.imageKey || photo.key || photo.id) || '').trim();
+  const photoKey = `${String(albumId || '').trim()}:${imageKey || photoSets.size + 1}`;
+
+  matchers.forEach((person) => {
+    if (!person.matchKeys.some((key) => captionTokens.has(key))) return;
+    if (!photoSets.has(person.personKey)) photoSets.set(person.personKey, new Set());
+    photoSets.get(person.personKey).add(photoKey);
+  });
+}
+
+async function buildWrestlingPeoplePhotoCounts() {
+  if (!isSmugMugConfigured() || !String(process.env.DATABASE_URL || '').trim()) {
+    return new Map();
+  }
+
+  const now = Date.now();
+  if (
+    smugWrestlingPeoplePhotoCountCache &&
+    now - smugWrestlingPeoplePhotoCountCache.fetchedAt < WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS
+  ) {
+    return smugWrestlingPeoplePhotoCountCache.counts;
+  }
+
+  if (smugWrestlingPeoplePhotoCountInFlight) {
+    return smugWrestlingPeoplePhotoCountInFlight;
+  }
+
+  smugWrestlingPeoplePhotoCountInFlight = (async () => {
+    const peopleResult = await dbPool.query(`
+      SELECT name, aliases
+      FROM wrestling_people
+      WHERE trim(coalesce(name, '')) <> ''
+      ORDER BY name ASC, id ASC
+    `);
+    const matchers = createWrestlingPeoplePhotoMatchers(peopleResult.rows || []);
+    if (!matchers.length) return new Map();
+
+    const showsResult = await dbPool.query(`
+      SELECT id, show_id, show_key, promotion, show_name, date, matches
+      FROM wrestling_shows
+      WHERE jsonb_typeof(matches) = 'array'
+      ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST, id DESC
+    `);
+
+    const matchAlbumTasks = [];
+    (showsResult.rows || []).forEach((row) => {
+      const item = {
+        show_id: row.show_id,
+        show_key: row.show_key || '',
+        promotion: row.promotion || '',
+        show_name: row.show_name || '',
+        date: row.date || ''
+      };
+      (Array.isArray(row.matches) ? row.matches : []).forEach((match) => {
+        if (match && typeof match === 'object') matchAlbumTasks.push({ row, item, match });
+      });
+    });
+
+    const photoSets = new Map();
+    await mapWithConcurrency(
+      matchAlbumTasks.slice(0, WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS),
+      SMUG_REQUEST_CONCURRENCY,
+      async ({ row, item, match }) => {
+        const resolved = await resolveSmugWrestlingMatchAlbum(match, row, item);
+        const albumId = resolved && resolved.albumId ? resolved.albumId : '';
+        if (!albumId) return;
+
+        const photos = await fetchSmugWrestlingAlbumPhotos(albumId);
+        photos.forEach((photo) => addWrestlingPeoplePhotoCountMatches(photoSets, matchers, albumId, photo));
+      }
+    );
+
+    const counts = new Map();
+    photoSets.forEach((photoKeys, personKey) => {
+      counts.set(personKey, photoKeys.size);
+    });
+
+    smugWrestlingPeoplePhotoCountCache = { fetchedAt: Date.now(), counts };
+    return counts;
+  })().catch((err) => {
+    console.warn('Wrestling-People SmugMug photo count scan failed:', err && err.message ? err.message : String(err));
+    return new Map();
+  }).finally(() => {
+    smugWrestlingPeoplePhotoCountInFlight = null;
+  });
+
+  return smugWrestlingPeoplePhotoCountInFlight;
 }
 function getPostgresTextArraySql(columnName) {
   return `coalesce(${columnName}, '{}'::text[])`;
@@ -7490,8 +7620,11 @@ async function handleWrestlingPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const appearanceCounts = await getWrestlingPeopleAppearanceCounts(result.rows.map((row) => row.name));
-    const data = result.rows.map((row) => buildWrestlingPersonDbApiItem(row, appearanceCounts));
+    const [appearanceCounts, photoCounts] = await Promise.all([
+      getWrestlingPeopleAppearanceCounts(result.rows.map((row) => row.name)),
+      buildWrestlingPeoplePhotoCounts()
+    ]);
+    const data = result.rows.map((row) => buildWrestlingPersonDbApiItem(row, appearanceCounts, photoCounts));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
     res.json({
