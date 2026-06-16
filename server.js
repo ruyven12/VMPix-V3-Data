@@ -7443,6 +7443,24 @@ function addWrestlingPeoplePhotoCountMatches(photoSets, matchers, albumId, photo
   });
 }
 
+function getCachedWrestlingPeoplePhotoCounts() {
+  if (
+    smugWrestlingPeoplePhotoCountCache &&
+    Date.now() - smugWrestlingPeoplePhotoCountCache.fetchedAt < WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS
+  ) {
+    return smugWrestlingPeoplePhotoCountCache.counts;
+  }
+  return null;
+}
+
+function getWrestlingPeoplePhotoCountsForRequest() {
+  const cached = getCachedWrestlingPeoplePhotoCounts();
+  if (cached) return cached;
+
+  // SmugMug caption scans are intentionally deferred so roster reads never block or fail.
+  buildWrestlingPeoplePhotoCounts().catch(() => {});
+  return new Map();
+}
 async function buildWrestlingPeoplePhotoCounts() {
   if (!isSmugMugConfigured() || !String(process.env.DATABASE_URL || '').trim()) {
     return new Map();
@@ -7620,10 +7638,8 @@ async function handleWrestlingPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
-    const [appearanceCounts, photoCounts] = await Promise.all([
-      getWrestlingPeopleAppearanceCounts(result.rows.map((row) => row.name)),
-      buildWrestlingPeoplePhotoCounts()
-    ]);
+    const appearanceCounts = await getWrestlingPeopleAppearanceCounts(result.rows.map((row) => row.name));
+    const photoCounts = getWrestlingPeoplePhotoCountsForRequest();
     const data = result.rows.map((row) => buildWrestlingPersonDbApiItem(row, appearanceCounts, photoCounts));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
