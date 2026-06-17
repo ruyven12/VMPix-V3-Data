@@ -17023,6 +17023,344 @@ async function addMusicRelationshipDiagnostics(response, existingTables, columns
   relationships.samples = samples;
 }
 
+function normalizeMusicBandDiagnosticKey(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function isMalformedMusicBandDiagnosticRecord(row = {}) {
+  const band = String(row.band || '').trim();
+  if (!isValidMusicBandName(band)) return true;
+  if (/^https?:\/\//i.test(band)) return true;
+  if (/photos\.smugmug\.com/i.test(band)) return true;
+  if (/\.(jpe?g|png|gif|webp)(\?.*)?$/i.test(band)) return true;
+
+  const normalized = normalizeMusicBandDiagnosticKey(band);
+  return ['local', 'regional', 'national', 'international'].includes(normalized);
+}
+
+function isInvalidMusicBandSmugFolder(value) {
+  const folder = String(value || '').trim();
+  if (!folder) return false;
+  if (/^https?:\/\//i.test(folder)) return true;
+  if (/photos\.smugmug\.com/i.test(folder)) return true;
+  if (/[\\]/.test(folder)) return true;
+  if (folder.includes('..')) return true;
+  if (/[\u0000-\u001f]/.test(folder)) return true;
+  if (/^[0-9]+$/.test(folder)) return true;
+
+  const normalized = normalizeImportHeaderKey(folder);
+  return new Set([
+    'archived_sets',
+    'total_sets',
+    'photo_count',
+    'total_photos',
+    'band_id',
+    'band',
+    'name',
+    'region',
+    'smug_folder',
+    'slug_folder',
+    'logo_url',
+    'status',
+    'notes',
+    'members',
+    'past_members',
+    'location',
+    'state',
+    'country'
+  ]).has(normalized);
+}
+
+function suggestMusicBandSmugFolder(value) {
+  const clean = String(value || '').trim().replace(/\s+/g, ' ');
+  if (!clean || isMalformedMusicBandDiagnosticRecord({ band: clean })) return '';
+
+  return clean
+    .replace(/[’']/g, '')
+    .replace(/&/g, ' And ')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function getMusicBandSmugFolderDiagnosticLimit(value) {
+  const number = Number(String(value || '').trim());
+  if (!Number.isInteger(number)) return 100;
+  return Math.min(500, Math.max(1, number));
+}
+
+function addMusicBandSmugFolderDetail(details, bucket, record, limit) {
+  if (!details[bucket]) details[bucket] = [];
+  if (details[bucket].length < limit) details[bucket].push(record);
+}
+
+function buildMusicBandSourceLookup(rows = []) {
+  const byBandId = new Map();
+  const byBand = new Map();
+  const normalizedRows = [];
+
+  rows.forEach((rawRow) => {
+    const row = normalizeMusicBandImportRow(rawRow || {});
+    const band = String(getMusicBandName(row) || '').trim();
+    const bandId = String(row.band_id || '').trim();
+    const generatedBandId = band ? slugifyMusicBandId(band) : '';
+    const record = {
+      band,
+      band_id: bandId,
+      generated_band_id: generatedBandId,
+      region: String(row.region || '').trim(),
+      smug_folder: String(row.smug_folder || row.slug_folder || '').trim(),
+      raw: row
+    };
+
+    normalizedRows.push(record);
+    if (bandId) byBandId.set(normalizeMusicBandDiagnosticKey(bandId), record);
+    if (generatedBandId && !byBandId.has(normalizeMusicBandDiagnosticKey(generatedBandId))) {
+      byBandId.set(normalizeMusicBandDiagnosticKey(generatedBandId), record);
+    }
+    if (band && !byBand.has(normalizeMusicBandDiagnosticKey(band))) {
+      byBand.set(normalizeMusicBandDiagnosticKey(band), record);
+    }
+  });
+
+  return { rows: normalizedRows, byBandId, byBand };
+}
+
+function findMusicBandSourceRecord(row, sourceLookup) {
+  if (!sourceLookup) return null;
+  const bandId = normalizeMusicBandDiagnosticKey(row.band_id);
+  const band = normalizeMusicBandDiagnosticKey(row.band);
+  return (bandId && sourceLookup.byBandId.get(bandId)) ||
+    (band && sourceLookup.byBand.get(band)) ||
+    null;
+}
+
+function getMusicBandSmugFolderRecommendedAction(buckets, sourceRecord, hasFolder) {
+  if (buckets.includes('malformed_band_record')) return 'Review/remove stale malformed music_bands row after source-sheet cleanup; do not generate a SmugMug folder.';
+  if (buckets.includes('stale_db_only')) return 'Confirm this row is no longer in Music-Bands source, then plan a controlled stale-row cleanup.';
+  if (buckets.includes('invalid_smug_folder')) return 'Correct the SmugMug folder value in the Music-Bands source sheet, then rerun the Music Bands import.';
+  if (buckets.includes('duplicate_smug_folder')) return 'Review duplicate folder assignments; keep only intentional aliases or correct the source sheet.';
+  if (buckets.includes('missing_source_value')) return 'Fill smug_folder in the Music-Bands source sheet after confirming the real SmugMug folder.';
+  if (!hasFolder && sourceRecord && sourceRecord.smug_folder) return 'Source has a smug_folder but DB does not; rerun /admin/import/music/bands?refresh=1 after deploy.';
+  if (!hasFolder) return 'Confirm the source row and SmugMug folder before adding a value.';
+  return 'No action needed.';
+}
+
+async function buildMusicBandSmugFolderDiagnosticsResponse(query = {}) {
+  const generated = new Date();
+  const warnings = [];
+  const limit = getMusicBandSmugFolderDiagnosticLimit(query.limit);
+  const response = buildAdminResponse({
+    route: '/api/admin/diagnostics/music/bands/smug-folder',
+    source: 'postgres:music_bands',
+    section: 'music',
+    type: 'diagnostics',
+    category: 'bands',
+    diagnostic: 'smug_folder',
+    generated,
+    source_tabs: {
+      bands: buildMusicDiagnosticSourceTabs().bands
+    },
+    readOnly: true,
+    mutated: false,
+    limit,
+    source_available: false,
+    counts: {
+      total_db_rows: 0,
+      total_source_rows: 0,
+      populated: 0,
+      missing_source_value: 0,
+      duplicate_smug_folder: 0,
+      duplicate_smug_folder_values: 0,
+      stale_db_only: 0,
+      malformed_band_record: 0,
+      invalid_smug_folder: 0,
+      unknown: 0
+    },
+    details: {
+      missing_source_value: [],
+      duplicate_smug_folder: [],
+      stale_db_only: [],
+      malformed_band_record: [],
+      invalid_smug_folder: [],
+      unknown: []
+    },
+    truncated: {},
+    warnings
+  });
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('Missing DATABASE_URL environment variable. Music Bands smug_folder diagnostics require PostgreSQL access.');
+    response.ok = false;
+    response.error = 'DATABASE_NOT_CONFIGURED';
+    return response;
+  }
+
+  let existingTables;
+  let columnsByTable;
+  try {
+    existingTables = await getExistingPublicTables(['music_bands']);
+    columnsByTable = await getExistingPublicColumns(['music_bands']);
+  } catch (err) {
+    warnings.push(`Unable to inspect music_bands table: ${getSafeErrorMessage(err)}`);
+    response.ok = false;
+    response.error = 'TABLE_INSPECTION_FAILED';
+    return response;
+  }
+
+  if (!existingTables.has('music_bands')) {
+    warnings.push('Missing table: music_bands');
+    response.ok = false;
+    response.error = 'MUSIC_BANDS_TABLE_MISSING';
+    return response;
+  }
+
+  const requiredColumns = ['id', 'band', 'band_id', 'region', 'smug_folder'];
+  const missingColumns = requiredColumns.filter((column) => !hasDiagnosticColumn(columnsByTable, 'music_bands', column));
+  if (missingColumns.length) {
+    warnings.push(`Missing columns on music_bands: ${missingColumns.join(', ')}`);
+    response.ok = false;
+    response.error = 'MUSIC_BANDS_COLUMNS_MISSING';
+    return response;
+  }
+
+  let sourceLookup = null;
+  if (SHEET_ID && normalizeSheetGid(process.env[ROUTES['/api/music/bands'].gidEnv])) {
+    try {
+      const payload = await fetchCsvForRoute('/api/music/bands', ROUTES['/api/music/bands'], query.refresh === '1');
+      sourceLookup = buildMusicBandSourceLookup(payload.rows || []);
+      response.source_available = true;
+      response.counts.total_source_rows = sourceLookup.rows.length;
+    } catch (err) {
+      warnings.push(`Unable to fetch Music-Bands source sheet for source_present comparison: ${getSafeErrorMessage(err)}`);
+    }
+  } else {
+    warnings.push('Music-Bands source sheet is not configured; source_present is null and stale/source buckets may be incomplete.');
+  }
+
+  const result = await runMusicDiagnosticQuery(
+    warnings,
+    'music bands smug_folder records',
+    `SELECT id, band, band_id, region, smug_folder
+     FROM music_bands
+     ORDER BY lower(trim(coalesce(band, ''))) ASC, id ASC`
+  );
+  const rows = diagnosticRows(result);
+  response.counts.total_db_rows = rows.length;
+
+  const folderCounts = new Map();
+  rows.forEach((row) => {
+    const folderKey = normalizeMusicBandDiagnosticKey(row.smug_folder);
+    if (!folderKey) return;
+    folderCounts.set(folderKey, (folderCounts.get(folderKey) || 0) + 1);
+  });
+  const duplicateFolderKeys = new Set(Array.from(folderCounts.entries()).filter((entry) => entry[1] > 1).map((entry) => entry[0]));
+  response.counts.duplicate_smug_folder_values = duplicateFolderKeys.size;
+
+  const detailCounts = {
+    missing_source_value: 0,
+    duplicate_smug_folder: 0,
+    stale_db_only: 0,
+    malformed_band_record: 0,
+    invalid_smug_folder: 0,
+    unknown: 0
+  };
+
+  rows.forEach((row) => {
+    const hasFolder = !!String(row.smug_folder || '').trim();
+    if (hasFolder) response.counts.populated += 1;
+
+    const sourceRecord = findMusicBandSourceRecord(row, sourceLookup);
+    const sourcePresent = sourceLookup ? !!sourceRecord : null;
+    const folderKey = normalizeMusicBandDiagnosticKey(row.smug_folder);
+    const duplicate = !!folderKey && duplicateFolderKeys.has(folderKey);
+    const malformed = isMalformedMusicBandDiagnosticRecord(row);
+    const invalidFolder = isInvalidMusicBandSmugFolder(row.smug_folder);
+    const sourceMissingFolder = !!sourceRecord && !String(sourceRecord.smug_folder || '').trim();
+    const buckets = [];
+
+    if (hasFolder && !invalidFolder) buckets.push('populated');
+    if (!hasFolder && sourceRecord && sourceMissingFolder && !malformed) buckets.push('missing_source_value');
+    if (duplicate) buckets.push('duplicate_smug_folder');
+    if (sourceLookup && !sourceRecord) buckets.push('stale_db_only');
+    if (malformed) buckets.push('malformed_band_record');
+    if (invalidFolder) buckets.push('invalid_smug_folder');
+    if (!buckets.some((bucket) => bucket !== 'populated') && !hasFolder) buckets.push('unknown');
+
+    const issueBuckets = buckets.filter((bucket) => bucket !== 'populated');
+    const detail = {
+      id: row.id,
+      band: row.band || '',
+      band_id: row.band_id || '',
+      region: row.region || '',
+      smug_folder: row.smug_folder || '',
+      source_present: sourcePresent,
+      source_smug_folder: sourceRecord ? sourceRecord.smug_folder : null,
+      suggested_smug_folder: suggestMusicBandSmugFolder(row.band),
+      buckets,
+      reason: issueBuckets.length
+        ? issueBuckets.join(', ')
+        : 'smug_folder is populated and no obvious issue was detected.',
+      recommended_action: getMusicBandSmugFolderRecommendedAction(buckets, sourceRecord, hasFolder)
+    };
+
+    if (buckets.includes('missing_source_value')) {
+      detailCounts.missing_source_value += 1;
+      addMusicBandSmugFolderDetail(response.details, 'missing_source_value', detail, limit);
+    }
+    if (buckets.includes('duplicate_smug_folder')) {
+      detailCounts.duplicate_smug_folder += 1;
+      addMusicBandSmugFolderDetail(response.details, 'duplicate_smug_folder', detail, limit);
+    }
+    if (buckets.includes('stale_db_only')) {
+      detailCounts.stale_db_only += 1;
+      addMusicBandSmugFolderDetail(response.details, 'stale_db_only', detail, limit);
+    }
+    if (buckets.includes('malformed_band_record')) {
+      detailCounts.malformed_band_record += 1;
+      addMusicBandSmugFolderDetail(response.details, 'malformed_band_record', detail, limit);
+    }
+    if (buckets.includes('invalid_smug_folder')) {
+      detailCounts.invalid_smug_folder += 1;
+      addMusicBandSmugFolderDetail(response.details, 'invalid_smug_folder', detail, limit);
+    }
+    if (buckets.includes('unknown')) {
+      detailCounts.unknown += 1;
+      addMusicBandSmugFolderDetail(response.details, 'unknown', detail, limit);
+    }
+  });
+
+  Object.assign(response.counts, detailCounts);
+  Object.entries(detailCounts).forEach(([bucket, count]) => {
+    response.truncated[bucket] = count > ((response.details[bucket] || []).length);
+  });
+
+  response.summary = {
+    needs_source_sheet_cleanup: response.counts.missing_source_value,
+    needs_duplicate_review: response.counts.duplicate_smug_folder_values,
+    needs_stale_row_review: response.counts.stale_db_only,
+    needs_malformed_row_review: response.counts.malformed_band_record,
+    invalid_populated_values: response.counts.invalid_smug_folder,
+    recommended_next_action: 'Review details, update Music-Bands source sheet for legitimate missing/duplicate smug_folder values, then rerun the existing Music Bands import manually.'
+  };
+
+  return response;
+}
+
+async function handleMusicBandSmugFolderDiagnosticsRequest(req, res) {
+  try {
+    const response = await buildMusicBandSmugFolderDiagnosticsResponse(req.query || {});
+    return res.status(200).json(response);
+  } catch (err) {
+    return res.status(500).json(buildAdminError('/api/admin/diagnostics/music/bands/smug-folder', err, {
+      source: 'postgres:music_bands',
+      section: 'music',
+      type: 'diagnostics',
+      category: 'bands',
+      error: 'MUSIC_BANDS_SMUG_FOLDER_DIAGNOSTICS_ERROR'
+    }));
+  }
+}
 async function buildMusicDiagnosticsResponse() {
   const generated = new Date();
   const warnings = [];
@@ -18368,6 +18706,10 @@ async function handleMusicDiagnosticsSectionRequest(req, res, category) {
     });
   }
 }
+
+app.get('/api/admin/diagnostics/music/bands/smug-folder', async (req, res) => {
+  return handleMusicBandSmugFolderDiagnosticsRequest(req, res);
+});
 
 app.get('/api/admin/diagnostics/music/bands', async (req, res) => {
   return handleMusicDiagnosticsSectionRequest(req, res, 'bands');
