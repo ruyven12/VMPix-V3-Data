@@ -5326,6 +5326,10 @@ function buildMusicBandDbApiItem(row) {
   const item = {
     band: row.band,
     band_id: row.band_id,
+    region: row.region || stats.region || '',
+    location: row.location || stats.location || '',
+    state: row.state || stats.state || '',
+    status: row.status || general.status || '',
     general,
     personnel,
     stats
@@ -5524,7 +5528,7 @@ async function handleMusicBandsDbRequest(req, res, routePath) {
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
       `${MUSIC_BANDS_DB_BASE_SQL}
-       SELECT band, band_id, general, personnel, stats
+       SELECT band, band_id, region, location, state, status, general, personnel, stats
        FROM filtered_bands
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
