@@ -131,6 +131,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics/music',
     '/api/admin/diagnostics/music/bands',
     '/api/admin/diagnostics/music/shows',
+    '/api/admin/diagnostics/music/smugmug-shows/classification',
     '/api/admin/diagnostics/music/people',
     '/api/admin/diagnostics/music/venues',
     '/api/admin/diagnostics/wrestling',
@@ -12364,6 +12365,298 @@ async function buildSmugMusicDiagnosticsResponse() {
   response.warnings = warnings;
   return response;
 }
+const SMUG_MUSIC_SHOW_CLASSIFICATION_BUCKETS = Object.freeze([
+  'resolved',
+  'pending_archive',
+  'awaiting_upload',
+  'resolver_error',
+  'path_mismatch',
+  'cover_missing',
+  'legacy_smugmug_error',
+  'no_candidate_album',
+  'unknown_unresolved'
+]);
+
+const SMUG_MUSIC_SHOW_CLASSIFICATION_ACTIONS = Object.freeze({
+  resolved: 'No action needed yet.',
+  pending_archive: 'Upload/archive photos when ready, then run the Music Shows SmugMug resolver.',
+  awaiting_upload: 'Upload the missing SmugMug album for the attempted band/date path, then retry resolver.',
+  resolver_error: 'Retry resolver; if it repeats, inspect the SmugMug API error and resolver code path.',
+  path_mismatch: 'Check SmugMug folder path, band region, band folder name, and show date mapping.',
+  cover_missing: 'Refresh cover metadata or inspect album highlight image availability.',
+  legacy_smugmug_error: 'Retry resolver with the current deterministic band/date resolver; old image-key errors are not archive absence proof.',
+  no_candidate_album: 'Inspect band/date mapping; resolver could not build a usable album candidate.',
+  unknown_unresolved: 'Inspect this record manually before treating it as a resolver bug.'
+});
+
+function getSmugMusicShowClassificationSampleLimit(value) {
+  const limit = Number(String(value || '').trim());
+  if (!Number.isInteger(limit)) return 10;
+  return Math.min(25, Math.max(1, limit));
+}
+
+function normalizeSmugMusicShowClassificationStatus(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getSmugMusicShowClassificationAlbums(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && typeof item === 'object');
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item === 'object') : [];
+    } catch (err) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function getUniqueSmugMusicShowClassificationValues(values) {
+  const out = [];
+  (Array.isArray(values) ? values : []).forEach((value) => {
+    const clean = String(value || '').trim();
+    if (clean && !out.includes(clean)) out.push(clean);
+  });
+  return out;
+}
+
+function getSmugMusicShowClassificationAttemptedPaths(albums) {
+  return getUniqueSmugMusicShowClassificationValues(
+    (Array.isArray(albums) ? albums : []).map((album) => album && album.smug_path)
+  );
+}
+
+function getSmugMusicShowClassificationAlbumStatuses(albums) {
+  return getUniqueSmugMusicShowClassificationValues(
+    (Array.isArray(albums) ? albums : []).map((album) => album && album.status)
+  );
+}
+
+function sanitizeSmugMusicShowClassificationError(value) {
+  const clean = String(value || '').replace(/APIKey=[^"&\s]+/gi, 'APIKey=REDACTED').replace(/\s+/g, ' ').trim();
+  return clean.length > 260 ? `${clean.slice(0, 260)}...` : clean;
+}
+
+function getSmugMusicShowClassificationAction(bucket) {
+  return SMUG_MUSIC_SHOW_CLASSIFICATION_ACTIONS[bucket] || SMUG_MUSIC_SHOW_CLASSIFICATION_ACTIONS.unknown_unresolved;
+}
+
+function classifySmugMusicShowSnapshotRow(row) {
+  const status = normalizeSmugMusicShowClassificationStatus(row && row.smug_sync_status);
+  const albums = getSmugMusicShowClassificationAlbums(row && row.smug_albums);
+  const attemptedPaths = getSmugMusicShowClassificationAttemptedPaths(albums);
+  const albumStatuses = getSmugMusicShowClassificationAlbumStatuses(albums);
+  const normalizedAlbumStatuses = albumStatuses.map((item) => normalizeSmugMusicShowClassificationStatus(item));
+  const albumId = String(row && row.album_id || '').trim();
+  const galleryId = String(row && row.gallery_id || '').trim();
+  const coverImageUrl = String(row && row.cover_image_url || '').trim();
+  const photoCount = toIntegerCount(row && row.photo_count);
+  const syncError = sanitizeSmugMusicShowClassificationError(row && row.smug_sync_error);
+  const hasResolvedArchive = !!(albumId || galleryId || photoCount > 0);
+  const hasParentFolderMiss = normalizedAlbumStatuses.some((item) => /parent_folder_not_found|folder_not_found/.test(item));
+  const hasAlbumNotFound = normalizedAlbumStatuses.some((item) => /album_not_found/.test(item));
+  const hasOnlyAlbumNotFound = hasAlbumNotFound && !hasParentFolderMiss;
+  const hasDuplicateMatch = normalizedAlbumStatuses.some((item) => /duplicate/.test(item));
+  const hasLegacyImageError = /raw_photo_source_no_album_context|no_image_key|no_album_key|\/image\//i.test(`${status} ${syncError}`);
+
+  let bucket = 'unknown_unresolved';
+  let reason = 'Unresolved state does not match a known diagnostic pattern.';
+
+  if (hasResolvedArchive) {
+    bucket = 'resolved';
+    reason = 'Album/gallery snapshot fields are populated.';
+  } else if (!status) {
+    bucket = 'pending_archive';
+    reason = 'No resolver status is stored yet; this record has not been classified by the current resolver.';
+  } else if (status === 'no_resolved_band_albums') {
+    if (!attemptedPaths.length) {
+      bucket = 'no_candidate_album';
+      reason = 'Resolver stored no candidate album paths.';
+    } else if (hasParentFolderMiss || hasDuplicateMatch) {
+      bucket = 'path_mismatch';
+      reason = 'Resolver attempted paths, but one or more parent folders or matches did not line up.';
+    } else if (hasOnlyAlbumNotFound) {
+      bucket = 'awaiting_upload';
+      reason = 'Band folders appear usable, but the specific date album was not found.';
+    } else {
+      bucket = 'unknown_unresolved';
+      reason = 'Resolver attempted album paths, but no album resolved.';
+    }
+  } else if (['missing_date_folder', 'missing_bands', 'no_source_url'].includes(status)) {
+    bucket = 'no_candidate_album';
+    reason = 'Resolver could not build a deterministic band/date album candidate.';
+  } else if (['raw_photo_source_no_album_context', 'no_image_key', 'no_album_key', 'skipped_logo_source', 'skipped_venue_logo_source'].includes(status) || hasLegacyImageError) {
+    bucket = 'legacy_smugmug_error';
+    reason = 'Stored status/error came from the older image-key/source-url resolver path.';
+  } else if (status === 'error') {
+    bucket = 'resolver_error';
+    reason = 'A resolver error is stored and no archive snapshot fields are populated.';
+  } else if (/path|folder|not_found/.test(status)) {
+    bucket = 'path_mismatch';
+    reason = 'Stored status suggests a SmugMug path or folder mismatch.';
+  }
+
+  const coverMissing = hasResolvedArchive && !coverImageUrl;
+
+  return {
+    bucket,
+    reason,
+    recommended_action: getSmugMusicShowClassificationAction(bucket),
+    cover_missing: coverMissing,
+    cover_missing_action: coverMissing ? getSmugMusicShowClassificationAction('cover_missing') : '',
+    stored_status: status,
+    attempted_paths: attemptedPaths,
+    attempted_path: attemptedPaths[0] || '',
+    album_statuses: albumStatuses,
+    sync_error: syncError,
+    photo_count: photoCount
+  };
+}
+
+function createSmugMusicShowClassificationBuckets(sampleLimit) {
+  const buckets = {};
+  SMUG_MUSIC_SHOW_CLASSIFICATION_BUCKETS.forEach((bucket) => {
+    buckets[bucket] = {
+      count: 0,
+      recommended_action: getSmugMusicShowClassificationAction(bucket),
+      samples: []
+    };
+  });
+  return buckets;
+}
+
+function buildSmugMusicShowClassificationSample(row, classification) {
+  return {
+    show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
+    name: row && row.name ? row.name : '',
+    date: row && row.date ? row.date : '',
+    bucket: classification.bucket,
+    reason: classification.reason,
+    recommended_action: classification.recommended_action,
+    stored_status: classification.stored_status,
+    album_id: row && row.album_id ? row.album_id : '',
+    gallery_id: row && row.gallery_id ? row.gallery_id : '',
+    photo_count: classification.photo_count,
+    cover_image_url_present: !!String(row && row.cover_image_url || '').trim(),
+    smug_last_synced_at: formatStatusTimestamp(row && row.smug_last_synced_at),
+    attempted_path: classification.attempted_path,
+    attempted_paths: classification.attempted_paths.slice(0, 5),
+    album_statuses: classification.album_statuses.slice(0, 5),
+    smug_sync_error: classification.sync_error
+  };
+}
+
+function getSmugMusicShowClassificationSelect(columns, columnName, fallbackExpression) {
+  return columns.has(columnName) ? columnName : `${fallbackExpression} AS ${columnName}`;
+}
+
+async function buildSmugMusicShowClassificationResponse(query = {}) {
+  const generated = new Date();
+  const route = '/api/admin/diagnostics/music/smugmug-shows/classification';
+  const warnings = [];
+  const sampleLimit = getSmugMusicShowClassificationSampleLimit(query.sample_limit || query.samples || query.limit);
+  const buckets = createSmugMusicShowClassificationBuckets(sampleLimit);
+  const response = buildAdminResponse({
+    route,
+    generated,
+    source: 'postgres',
+    section: 'music',
+    type: 'smug_show_classification',
+    readOnly: true,
+    databaseMutated: false,
+    sampleLimit,
+    summary: {
+      databaseConnected: false,
+      total_shows: 0,
+      resolved_count: 0,
+      pending_archive_count: 0,
+      awaiting_upload_count: 0,
+      pending_or_unbuilt_count: 0,
+      resolver_error_count: 0,
+      path_mismatch_count: 0,
+      cover_missing_count: 0,
+      legacy_error_count: 0,
+      no_candidate_album_count: 0,
+      unknown_unresolved_count: 0
+    },
+    buckets,
+    warnings
+  });
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    warnings.push('DATABASE_URL is not configured; Music show SmugMug classification skipped.');
+    return response;
+  }
+
+  const existingTables = await getExistingPublicTables(['music_shows']);
+  if (!existingTables.has('music_shows')) {
+    response.summary.databaseConnected = true;
+    warnings.push('Missing table for Music show SmugMug classification: music_shows');
+    return response;
+  }
+
+  const columnsByTable = await getExistingPublicColumns(['music_shows']);
+  const columns = getSmugMusicTableColumns(columnsByTable, 'music_shows');
+  const selectFields = [
+    getSmugMusicShowClassificationSelect(columns, 'id', 'NULL::int'),
+    getSmugMusicShowClassificationSelect(columns, 'show_id', 'NULL::int'),
+    getSmugMusicShowClassificationSelect(columns, 'name', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'date', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'gallery_id', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'album_id', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'cover_image_url', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'photo_count', '0::int'),
+    getSmugMusicShowClassificationSelect(columns, 'smug_last_synced_at', 'NULL::timestamptz'),
+    getSmugMusicShowClassificationSelect(columns, 'smug_sync_status', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'smug_sync_error', "''::text"),
+    getSmugMusicShowClassificationSelect(columns, 'smug_albums', "'[]'::jsonb")
+  ];
+  const orderBy = columns.has('show_id') ? 'show_id ASC NULLS LAST' : 'name ASC NULLS LAST';
+  const result = await dbPool.query(`SELECT ${selectFields.join(', ')} FROM music_shows ORDER BY ${orderBy}`);
+  const rows = result.rows || [];
+
+  response.summary.databaseConnected = true;
+  response.summary.total_shows = rows.length;
+
+  rows.forEach((row) => {
+    const classification = classifySmugMusicShowSnapshotRow(row);
+    const sample = buildSmugMusicShowClassificationSample(row, classification);
+    const bucket = buckets[classification.bucket] ? classification.bucket : 'unknown_unresolved';
+    buckets[bucket].count += 1;
+    if (buckets[bucket].samples.length < sampleLimit) buckets[bucket].samples.push(sample);
+
+    if (classification.cover_missing) {
+      buckets.cover_missing.count += 1;
+      if (buckets.cover_missing.samples.length < sampleLimit) {
+        buckets.cover_missing.samples.push({
+          ...sample,
+          bucket: 'cover_missing',
+          reason: 'Album/gallery fields are populated, but cover_image_url is missing.',
+          recommended_action: getSmugMusicShowClassificationAction('cover_missing')
+        });
+      }
+    }
+  });
+
+  response.summary.resolved_count = buckets.resolved.count;
+  response.summary.pending_archive_count = buckets.pending_archive.count;
+  response.summary.awaiting_upload_count = buckets.awaiting_upload.count;
+  response.summary.pending_or_unbuilt_count = buckets.pending_archive.count + buckets.awaiting_upload.count;
+  response.summary.resolver_error_count = buckets.resolver_error.count;
+  response.summary.path_mismatch_count = buckets.path_mismatch.count;
+  response.summary.cover_missing_count = buckets.cover_missing.count;
+  response.summary.legacy_error_count = buckets.legacy_smugmug_error.count;
+  response.summary.no_candidate_album_count = buckets.no_candidate_album.count;
+  response.summary.unknown_unresolved_count = buckets.unknown_unresolved.count;
+  response.summary.cover_missing_is_overlay = true;
+  response.summary.statusesRenamed = false;
+  response.summary.note = 'This diagnostic classifies existing rows only; it does not update smug_sync_status or write to the database.';
+  response.recommendedActions = SMUG_MUSIC_SHOW_CLASSIFICATION_ACTIONS;
+  response.warnings = warnings;
+
+  return response;
+}
 const SMUG_MUSIC_BAND_DISCOVER_DEFAULT_LIMIT = 25;
 const SMUG_MUSIC_BAND_DISCOVER_MAX_LIMIT = 100;
 
@@ -17443,6 +17736,25 @@ app.get([
   '/admin/smug/music/diagnostics',
   '/api/admin/smug/music/diagnostics'
 ], handleSmugMusicDiagnosticsRequest);
+
+async function handleSmugMusicShowClassificationRequest(req, res) {
+  try {
+    return res.json(await buildSmugMusicShowClassificationResponse(req.query || {}));
+  } catch (err) {
+    return res.status(500).json(buildAdminError(req.path || '/api/admin/diagnostics/music/smugmug-shows/classification', err, {
+      source: 'postgres',
+      section: 'music',
+      type: 'smug_show_classification',
+      error: 'SMUG_SHOW_CLASSIFICATION_ERROR'
+    }));
+  }
+}
+
+app.get([
+  '/api/admin/diagnostics/music/smugmug-shows/classification',
+  '/admin/smug/music/shows/classification',
+  '/api/admin/smug/music/shows/classification'
+], handleSmugMusicShowClassificationRequest);
 app.get('/api/admin/stats/summary', async (req, res) => {
   return handleStatsSummaryRequest(req, res);
 });
