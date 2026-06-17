@@ -8591,11 +8591,40 @@ function buildMusicVenuePhotoVenuePayload(row) {
   };
 }
 
+function getMusicVenuePhotoTotalNumber(value) {
+  if (value == null || value === '') return null;
+  const clean = String(value).replace(/,/g, '').trim();
+  if (!clean) return null;
+  const number = Number(clean);
+  return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : null;
+}
+
+function getMusicVenuePhotoTotalFromObject(source) {
+  if (!source || typeof source !== 'object') return null;
+  const fields = ['totalPhotos', 'total_photos', 'photo_count', 'photoCount', 'photosTotal', 'total_photos'];
+  for (const field of fields) {
+    const value = getMusicVenuePhotoTotalNumber(source[field]);
+    if (value != null) return value;
+  }
+  return null;
+}
+
 function getMusicVenueOfficialPhotoTotal(row) {
   const stats = row && row.stats && typeof row.stats === 'object' && !Array.isArray(row.stats)
     ? row.stats
     : getMusicDataAuditObject(row && row.stats);
-  return getMusicStatsNumber(stats, ['totalPhotos', 'photo_count', 'photoCount', 'photosTotal', 'total_photos']);
+  const normalizedVenue = buildMusicVenueDbApiItem(row || {});
+  const sources = [
+    stats,
+    normalizedVenue && normalizedVenue.stats,
+    row,
+    normalizedVenue
+  ];
+  for (const source of sources) {
+    const value = getMusicVenuePhotoTotalFromObject(source);
+    if (value != null) return value;
+  }
+  return 0;
 }
 
 function buildMusicVenuePhotoShowRef(row) {
@@ -19907,6 +19936,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
