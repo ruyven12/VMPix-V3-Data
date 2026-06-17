@@ -8502,7 +8502,7 @@ function buildMusicVenueDbApiItem(row) {
 
 
 const MUSIC_VENUE_PHOTOS_ROUTE = '/api/music/venues/:venue_id/photos';
-const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v2';
+const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v3';
 const MUSIC_VENUE_PHOTOS_CACHE_TTL_MS = 1000 * 60 * 10;
 const musicVenuePhotoAggregationCache = new Map();
 
@@ -8557,7 +8557,7 @@ async function findMusicVenueForPhotoAggregation(value) {
   if (!key) return null;
 
   const exactResult = await dbPool.query(`
-    SELECT venue_id, venue_key, venue, city, state, country, region, status, stats
+    SELECT venue_id, venue_key, venue, city, state, country, region, status, stats, raw_sheet
     FROM music_venues
     WHERE lower(trim(coalesce(venue_key, ''))) = $1
        OR lower(trim(coalesce(venue_id::text, ''))) = $1
@@ -8567,7 +8567,7 @@ async function findMusicVenueForPhotoAggregation(value) {
   if (exactResult.rows && exactResult.rows[0]) return exactResult.rows[0];
 
   const slugResult = await dbPool.query(`
-    SELECT venue_id, venue_key, venue, city, state, country, region, status, stats
+    SELECT venue_id, venue_key, venue, city, state, country, region, status, stats, raw_sheet
     FROM music_venues
     ORDER BY venue_key ASC NULLS LAST, venue ASC NULLS LAST, venue_id ASC
   `);
@@ -8599,32 +8599,80 @@ function getMusicVenuePhotoTotalNumber(value) {
   return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : null;
 }
 
-function getMusicVenuePhotoTotalFromObject(source) {
+function getMusicVenuePhotoTotalCandidate(source, pathLabel, fieldName) {
   if (!source || typeof source !== 'object') return null;
-  const fields = ['totalPhotos', 'total_photos', 'photo_count', 'photoCount', 'photosTotal', 'total_photos'];
-  for (const field of fields) {
-    const value = getMusicVenuePhotoTotalNumber(source[field]);
-    if (value != null) return value;
-  }
-  return null;
+  if (!Object.prototype.hasOwnProperty.call(source, fieldName)) return null;
+  const raw = source[fieldName];
+  const normalized = getMusicVenuePhotoTotalNumber(raw);
+  if (normalized == null) return null;
+  return {
+    value: normalized,
+    source: `${pathLabel}.${fieldName}`,
+    raw,
+    normalized
+  };
 }
 
-function getMusicVenueOfficialPhotoTotal(row) {
+function getMusicVenuePhotoTotalFromObject(source, pathLabel) {
+  const fields = ['totalPhotos', 'totalphotos', 'total_photos', 'photo_count', 'photoCount', 'photocount', 'photosTotal', 'photostotal', 'total'];
+  const zeroCandidate = { value: 0, source: '', raw: null, normalized: 0 };
+  for (const field of fields) {
+    const candidate = getMusicVenuePhotoTotalCandidate(source, pathLabel, field);
+    if (!candidate) continue;
+    if (candidate.value > 0) return candidate;
+    if (!zeroCandidate.source) Object.assign(zeroCandidate, candidate);
+  }
+  return zeroCandidate.source ? zeroCandidate : null;
+}
+
+function getMusicVenueRawSheetRows(row) {
+  const rawSheet = row && row.raw_sheet && typeof row.raw_sheet === 'object' && !Array.isArray(row.raw_sheet)
+    ? row.raw_sheet
+    : getMusicDataAuditObject(row && row.raw_sheet);
+  if (Array.isArray(rawSheet.rows)) return rawSheet.rows.filter((item) => item && typeof item === 'object');
+  return rawSheet && Object.keys(rawSheet).length ? [rawSheet] : [];
+}
+
+function getMusicVenueOfficialPhotoTotalInfo(row) {
   const stats = row && row.stats && typeof row.stats === 'object' && !Array.isArray(row.stats)
     ? row.stats
     : getMusicDataAuditObject(row && row.stats);
   const normalizedVenue = buildMusicVenueDbApiItem(row || {});
-  const sources = [
-    stats,
-    normalizedVenue && normalizedVenue.stats,
-    row,
-    normalizedVenue
+  const rawRows = getMusicVenueRawSheetRows(row);
+  const sourceObjects = [
+    { label: 'normalizedVenue.stats', value: normalizedVenue && normalizedVenue.stats },
+    { label: 'db.stats', value: stats },
+    { label: 'normalizedVenue', value: normalizedVenue },
+    { label: 'db.row', value: row }
   ];
-  for (const source of sources) {
-    const value = getMusicVenuePhotoTotalFromObject(source);
-    if (value != null) return value;
+  rawRows.forEach((rawRow, index) => {
+    const sheetItem = buildMusicVenueSheetItem(rawRow);
+    sourceObjects.push({ label: `raw_sheet.rows[${index}]`, value: rawRow });
+    sourceObjects.push({ label: `buildMusicVenueSheetItem(raw_sheet.rows[${index}])`, value: sheetItem });
+  });
+
+  let zeroCandidate = null;
+  for (const source of sourceObjects) {
+    const candidate = getMusicVenuePhotoTotalFromObject(source.value, source.label);
+    if (!candidate) continue;
+    if (candidate.value > 0) {
+      return {
+        ...candidate,
+        availableVenueRowKeys: row && typeof row === 'object' ? Object.keys(row).sort() : [],
+        normalizedVenueKeys: normalizedVenue && typeof normalizedVenue === 'object' ? Object.keys(normalizedVenue).sort() : []
+      };
+    }
+    if (!zeroCandidate) zeroCandidate = candidate;
   }
-  return 0;
+
+  return {
+    value: zeroCandidate ? zeroCandidate.value : 0,
+    source: zeroCandidate ? zeroCandidate.source : '',
+    raw: zeroCandidate ? zeroCandidate.raw : null,
+    normalized: zeroCandidate ? zeroCandidate.normalized : 0,
+    availableVenueRowKeys: row && typeof row === 'object' ? Object.keys(row).sort() : [],
+    normalizedVenueKeys: normalizedVenue && typeof normalizedVenue === 'object' ? Object.keys(normalizedVenue).sort() : []
+  };
 }
 
 function buildMusicVenuePhotoShowRef(row) {
@@ -8736,7 +8784,8 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
   const albumLimit = getMusicVenuePhotoAlbumLimit(query.album_limit);
   const photoLimitPerAlbum = getMusicVenuePhotoLimitPerAlbum(query.photo_limit_per_album);
   const venue = buildMusicVenuePhotoVenuePayload(venueRow);
-  const venueTotalPhotos = getMusicVenueOfficialPhotoTotal(venueRow);
+  const venueTotalPhotoInfo = getMusicVenueOfficialPhotoTotalInfo(venueRow);
+  const venueTotalPhotos = toIntegerCount(venueTotalPhotoInfo.value);
   const cacheKey = getMusicVenuePhotoCacheKey(venue.venue_id, albumLimit, photoLimitPerAlbum);
   const cached = debug ? null : getCachedMusicVenuePhotoAggregation(cacheKey);
   if (cached) return { ...cached, generated, cache: { hit: true, key: cacheKey } };
@@ -8781,6 +8830,9 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
   }
 
   const aggregatedPhotoCount = photos.length;
+  if (!venueTotalPhotoInfo.source) {
+    warnings.push('Official venue total photo source could not be resolved from venue normalization.');
+  }
   if (venueTotalPhotos > aggregatedPhotoCount) {
     warnings.push('Aggregated photo count is lower than the official venue total; this route is limited by linked show albums, album_limit/photo_limit_per_album, and de-dupe. It does not replace venue_total_photos.');
   }
@@ -8809,6 +8861,11 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
       skipped_shows: skippedShows,
       album_ids_used: albums.map((album) => album.album_id),
       per_album_photo_counts: perAlbum.map((album) => ({ album_id: album.album_id, count: toIntegerCount(album.count), total: album.total == null ? null : toIntegerCount(album.total), error: album.error || null })),
+      venue_total_photos_source: venueTotalPhotoInfo.source || null,
+      venue_total_photos_raw: venueTotalPhotoInfo.raw == null ? null : String(venueTotalPhotoInfo.raw),
+      venue_total_photos_normalized: toIntegerCount(venueTotalPhotoInfo.normalized),
+      available_venue_row_keys: venueTotalPhotoInfo.availableVenueRowKeys || [],
+      normalized_venue_keys: venueTotalPhotoInfo.normalizedVenueKeys || [],
       cache_key: cacheKey
     }
   };
@@ -19936,6 +19993,8 @@ async function startServer() {
 }
 
 startServer();
+
+
 
 
 
