@@ -2652,6 +2652,19 @@ function getMusicPeopleMembersForBand(bandName, peoplePersonnelLookup) {
   return Array.isArray(members) ? members.map((member) => ({ ...member })) : [];
 }
 
+function filterInferredCurrentMusicBandMembers(members, pastMembers) {
+  if (!Array.isArray(members) || !members.length) return [];
+  if (!Array.isArray(pastMembers) || !pastMembers.length) return members;
+
+  const pastKeys = new Set(
+    pastMembers
+      .map((member) => normalizeMusicLookupKey(member && member.name))
+      .filter(Boolean)
+  );
+
+  return members.filter((member) => !pastKeys.has(normalizeMusicLookupKey(member && member.name)));
+}
+
 function getMusicBandName(row) {
   const keys = ['band', 'name', 'band_name', 'artist', 'artist_name', 'performer', 'act', 'title'];
   for (const key of keys) {
@@ -2671,9 +2684,12 @@ async function buildMusicBandItem(row, forceRefresh, peoplePersonnelLookup, arch
   const band = getMusicBandName(row);
   const bandId = String(row.band_id || '').trim();
   const personnel = {};
-  const peopleMembers = getMusicPeopleMembersForBand(band, peoplePersonnelLookup);
-  const members = peopleMembers.length ? peopleMembers : parsePersonnelString(row.members);
+  const explicitMembers = parsePersonnelString(row.members);
   const pastMembers = parsePersonnelString(row.past_members);
+  const peopleMembers = getMusicPeopleMembersForBand(band, peoplePersonnelLookup);
+  // Music-People band links are historical associations, not current-member flags.
+  // If Music-Bands marks someone as past and has no explicit current entry, keep them past-only.
+  const members = explicitMembers.length ? explicitMembers : filterInferredCurrentMusicBandMembers(peopleMembers, pastMembers);
   const totalPhotos = await fetchMusicBandTotalPhotos(row, forceRefresh);
   const archiveCoverage = getMusicBandArchiveCoverageForRow(row, archiveCoverageLookup);
   const general = compactJsonFields({
