@@ -8502,7 +8502,7 @@ function buildMusicVenueDbApiItem(row) {
 
 
 const MUSIC_VENUE_PHOTOS_ROUTE = '/api/music/venues/:venue_id/photos';
-const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v3';
+const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v4';
 const MUSIC_VENUE_PHOTOS_CACHE_TTL_MS = 1000 * 60 * 10;
 const musicVenuePhotoAggregationCache = new Map();
 
@@ -8830,10 +8830,26 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
   }
 
   const aggregatedPhotoCount = photos.length;
-  if (!venueTotalPhotoInfo.source) {
-    warnings.push('Official venue total photo source could not be resolved from venue normalization.');
+  const albumMetadataTotalPhotos = perAlbum.reduce((sum, album) => {
+    const total = album && album.total != null ? toIntegerCount(album.total) : null;
+    if (total != null && total > 0) return sum + total;
+    return sum + toIntegerCount(album && album.count);
+  }, 0);
+  const resolvedVenueTotalPhotos = venueTotalPhotos > 0 ? venueTotalPhotos : albumMetadataTotalPhotos;
+  const resolvedVenueTotalInfo = venueTotalPhotos > 0
+    ? venueTotalPhotoInfo
+    : {
+      value: resolvedVenueTotalPhotos,
+      source: albumMetadataTotalPhotos > 0 ? 'linked_smugmug_album_metadata.total_sum' : (venueTotalPhotoInfo.source || ''),
+      raw: albumMetadataTotalPhotos > 0 ? String(albumMetadataTotalPhotos) : venueTotalPhotoInfo.raw,
+      normalized: resolvedVenueTotalPhotos,
+      availableVenueRowKeys: venueTotalPhotoInfo.availableVenueRowKeys || [],
+      normalizedVenueKeys: venueTotalPhotoInfo.normalizedVenueKeys || []
+    };
+  if (!resolvedVenueTotalInfo.source) {
+    warnings.push('Official venue total photo source could not be resolved from venue normalization or linked album metadata.');
   }
-  if (venueTotalPhotos > aggregatedPhotoCount) {
+  if (resolvedVenueTotalPhotos > aggregatedPhotoCount) {
     warnings.push('Aggregated photo count is lower than the official venue total; this route is limited by linked show albums, album_limit/photo_limit_per_album, and de-dupe. It does not replace venue_total_photos.');
   }
 
@@ -8849,7 +8865,7 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
       linked_show_count: linkedShows.length,
       album_count: albums.length,
       available_album_count: allAlbums.length,
-      venue_total_photos: venueTotalPhotos,
+      venue_total_photos: resolvedVenueTotalPhotos,
       aggregated_photo_count: aggregatedPhotoCount,
       photo_count: aggregatedPhotoCount,
       returned_count: 0
@@ -8861,11 +8877,11 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
       skipped_shows: skippedShows,
       album_ids_used: albums.map((album) => album.album_id),
       per_album_photo_counts: perAlbum.map((album) => ({ album_id: album.album_id, count: toIntegerCount(album.count), total: album.total == null ? null : toIntegerCount(album.total), error: album.error || null })),
-      venue_total_photos_source: venueTotalPhotoInfo.source || null,
-      venue_total_photos_raw: venueTotalPhotoInfo.raw == null ? null : String(venueTotalPhotoInfo.raw),
-      venue_total_photos_normalized: toIntegerCount(venueTotalPhotoInfo.normalized),
-      available_venue_row_keys: venueTotalPhotoInfo.availableVenueRowKeys || [],
-      normalized_venue_keys: venueTotalPhotoInfo.normalizedVenueKeys || [],
+      venue_total_photos_source: resolvedVenueTotalInfo.source || null,
+      venue_total_photos_raw: resolvedVenueTotalInfo.raw == null ? null : String(resolvedVenueTotalInfo.raw),
+      venue_total_photos_normalized: toIntegerCount(resolvedVenueTotalInfo.normalized),
+      available_venue_row_keys: resolvedVenueTotalInfo.availableVenueRowKeys || [],
+      normalized_venue_keys: resolvedVenueTotalInfo.normalizedVenueKeys || [],
       cache_key: cacheKey
     }
   };
@@ -19993,6 +20009,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
