@@ -17361,6 +17361,192 @@ async function handleMusicBandSmugFolderDiagnosticsRequest(req, res) {
     }));
   }
 }
+const MUSIC_DATA_AUDIT_ROUTE = '/api/admin/diagnostics/music/data-audit';
+const MUSIC_DATA_AUDIT_AREAS = ['bands', 'shows', 'people', 'venues', 'smugmug', 'relationships'];
+
+function getMusicDataAuditLimit(value) {
+  const number = Number(String(value || '').trim());
+  if (!Number.isInteger(number)) return 25;
+  return Math.min(100, Math.max(1, number));
+}
+
+function createMusicDataAuditCategories() {
+  const out = {};
+  MUSIC_DATA_AUDIT_AREAS.forEach((area) => {
+    out[area] = { totalIssues: 0, critical: 0, warning: 0, info: 0, issueTypes: {}, metrics: {} };
+  });
+  return out;
+}
+
+function addMusicDataAuditIssue(state, issue) {
+  const severity = ['critical', 'warning', 'info'].includes(String(issue.severity || '').toLowerCase()) ? String(issue.severity).toLowerCase() : 'warning';
+  const area = MUSIC_DATA_AUDIT_AREAS.includes(String(issue.area || '').toLowerCase()) ? String(issue.area).toLowerCase() : 'relationships';
+  const issueType = String(issue.issue_type || 'unknown').trim() || 'unknown';
+  const item = { id: issue.id || `music-audit-${++state.seq}`, severity, area, issue_type: issueType, title: issue.title || issueType, record_type: issue.record_type || area, record_id: issue.record_id == null ? '' : String(issue.record_id), record_name: issue.record_name || '', reason: issue.reason || '', recommended_action: issue.recommended_action || 'Review manually.', source_route: issue.source_route || MUSIC_DATA_AUDIT_ROUTE, status: 'open' };
+  if (issue.details != null) item.details = issue.details;
+  state.issues.push(item);
+  state.summary.totalIssues += 1;
+  state.summary[severity] += 1;
+  state.categories[area].totalIssues += 1;
+  state.categories[area][severity] += 1;
+  state.categories[area].issueTypes[issueType] = (state.categories[area].issueTypes[issueType] || 0) + 1;
+}
+
+function getMusicDataAuditArray(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && typeof item === 'object');
+  if (typeof value === 'string' && value.trim()) {
+    try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item === 'object') : []; } catch (_) { return []; }
+  }
+  return [];
+}
+
+function getMusicDataAuditObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch (_) { return {}; }
+  }
+  return {};
+}
+
+function classifyMusicDataAuditPoster(value) {
+  const poster = String(value || '').trim();
+  if (!poster) return { type: 'missing_poster', reason: 'poster is blank' };
+  let parsed;
+  try { parsed = new URL(poster); } catch (_) { return { type: 'malformed_poster_url', reason: 'poster is not an absolute URL' }; }
+  const host = String(parsed.hostname || '').toLowerCase();
+  const smug = host === 'photos.smugmug.com' || host.endsWith('.smugmug.com');
+  const imageLike = /\.(jpe?g|png|gif|webp|avif)(\?.*)?$/i.test(parsed.pathname || '') || /\/(Th|Ti|S|M|L|XL|X2|X3|O)\//i.test(parsed.pathname || '');
+  if (!['http:', 'https:'].includes(parsed.protocol)) return { type: 'malformed_poster_url', reason: 'poster uses an unsupported protocol' };
+  if (isVenueLogoUrl(poster) || (typeof isSmugMusicShowLogoSourceUrl === 'function' && isSmugMusicShowLogoSourceUrl(poster))) return { type: 'logo_poster_placeholder', reason: 'poster points to logo/non-show media' };
+  if (!smug) return { type: 'unexpected_poster_source', reason: `poster uses unexpected domain: ${host}` };
+  if (!imageLike) return { type: 'non_image_poster_url', reason: 'poster does not look like a direct image asset' };
+  return { type: 'valid_poster', reason: 'SmugMug direct image URL' };
+}
+
+function addMusicDataAuditTableMissingIssue(state, tableName, area) {
+  addMusicDataAuditIssue(state, { severity: 'critical', area, issue_type: 'table_missing', title: `${tableName} table is missing`, record_type: 'table', record_id: tableName, record_name: tableName, reason: `Required table ${tableName} is not present.`, recommended_action: 'Check database initialization/migrations before data cleanup.' });
+}
+
+function finalizeMusicDataAuditResponse(state, generated, page, limit) {
+  const severityOrder = { critical: 0, warning: 1, info: 2 };
+  const issues = state.issues.slice().sort((a, b) => (severityOrder[a.severity] - severityOrder[b.severity]) || a.area.localeCompare(b.area) || a.issue_type.localeCompare(b.issue_type) || a.record_name.localeCompare(b.record_name, undefined, { numeric: true, sensitivity: 'base' }));
+  const totalIssues = issues.length;
+  const totalPages = totalIssues ? Math.ceil(totalIssues / limit) : 0;
+  const safePage = Math.min(Math.max(1, page), Math.max(totalPages, 1));
+  const offset = (safePage - 1) * limit;
+  return buildAdminResponse({ ok: state.ok, route: MUSIC_DATA_AUDIT_ROUTE, source: 'postgres', section: 'music', type: 'data_audit', generated, readOnly: true, databaseMutated: false, summary: state.summary, categories: state.categories, pagination: { page: safePage, limit, totalIssues, totalPages, hasNextPage: safePage < totalPages, hasPrevPage: safePage > 1 && totalPages > 0 }, issues: issues.slice(offset, offset + limit), recommendedActions: state.recommendedActions, warnings: state.summary.warnings });
+}
+
+async function buildMusicDataAuditResponse(query = {}) {
+  const generated = new Date();
+  const page = getPageNumber(query.page);
+  const limit = getMusicDataAuditLimit(query.limit);
+  const state = { ok: true, seq: 0, issues: [], categories: createMusicDataAuditCategories(), summary: { databaseConnected: false, totalIssues: 0, critical: 0, warning: 0, info: 0, tables: { music_bands: false, music_shows: false, music_people: false, music_venues: false }, warnings: [] }, recommendedActions: { bands: 'Clean Music-Bands source values, then rerun existing imports manually.', shows: 'Fix Music-Shows metadata in the source sheet; do not use logo assets as show posters.', people: 'Fill missing person IDs, names, and categories in Music-People.', venues: 'Fill missing venue IDs, names, locations, and statuses in Music-Venue.', smugmug: 'Use SmugMug buckets to separate pending uploads from resolver/path issues.', relationships: 'Fix missing or unmatched IDs before building frontend drilldowns.' } };
+  if (!String(process.env.DATABASE_URL || '').trim()) { state.ok = false; state.summary.warnings.push('DATABASE_URL is not configured; Music data audit requires PostgreSQL access.'); return finalizeMusicDataAuditResponse(state, generated, page, limit); }
+  try { await dbPool.query('SELECT 1'); state.summary.databaseConnected = true; } catch (err) { state.ok = false; state.summary.warnings.push(`Database disconnected: ${getSafeErrorMessage(err)}`); return finalizeMusicDataAuditResponse(state, generated, page, limit); }
+  const existingTables = await getExistingPublicTables(MUSIC_DIAGNOSTIC_TABLES);
+  MUSIC_DIAGNOSTIC_TABLES.forEach((tableName) => { state.summary.tables[tableName] = existingTables.has(tableName); });
+  if (!existingTables.has('music_bands')) addMusicDataAuditTableMissingIssue(state, 'music_bands', 'bands');
+  if (!existingTables.has('music_shows')) addMusicDataAuditTableMissingIssue(state, 'music_shows', 'shows');
+  if (!existingTables.has('music_people')) addMusicDataAuditTableMissingIssue(state, 'music_people', 'people');
+  if (!existingTables.has('music_venues')) addMusicDataAuditTableMissingIssue(state, 'music_venues', 'venues');
+
+  if (existingTables.has('music_bands')) {
+    const folderAudit = await buildMusicBandSmugFolderDiagnosticsResponse({ limit: 500, refresh: query.refresh });
+    state.categories.bands.metrics.smug_folder = folderAudit.counts || {};
+    ['missing_source_value', 'duplicate_smug_folder', 'stale_db_only', 'malformed_band_record', 'invalid_smug_folder', 'unknown'].forEach((bucket) => {
+      const rows = folderAudit.details && Array.isArray(folderAudit.details[bucket]) ? folderAudit.details[bucket] : [];
+      rows.forEach((row) => addMusicDataAuditIssue(state, { severity: bucket === 'stale_db_only' ? 'info' : 'warning', area: 'bands', issue_type: bucket, title: `Music Band ${bucket.replace(/_/g, ' ')}`, record_type: 'music_band', record_id: row.band_id || row.id || row.band, record_name: row.band || '', reason: row.reason || bucket, recommended_action: row.recommended_action || 'Review Music-Bands source data.', source_route: '/api/admin/diagnostics/music/bands/smug-folder', details: row }));
+    });
+    const bandResult = await dbPool.query(`SELECT id, band, band_id, region, personnel FROM music_bands ORDER BY lower(trim(coalesce(band, ''))) ASC, id ASC`);
+    const allowedRegions = new Set(['local', 'regional', 'national', 'international']);
+    const bandNames = new Set();
+    let missingRegion = 0, nonCanonicalRegion = 0, personnelOverlap = 0;
+    for (const row of bandResult.rows || []) {
+      if (String(row.band || '').trim()) bandNames.add(normalizeMusicBandDiagnosticKey(row.band));
+      const region = String(row.region || '').trim();
+      if (!region) { missingRegion += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'bands', issue_type: 'missing_region', title: 'Music Band missing region', record_type: 'music_band', record_id: row.band_id || row.id, record_name: row.band || '', reason: 'region is blank; SmugMug band discovery depends on region.', recommended_action: 'Fill region using Local, Regional, National, or International.', source_route: '/api/admin/diagnostics/music/bands' }); }
+      else if (!allowedRegions.has(region.toLowerCase())) { nonCanonicalRegion += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'bands', issue_type: 'noncanonical_region', title: 'Music Band has non-canonical region', record_type: 'music_band', record_id: row.band_id || row.id, record_name: row.band || '', reason: `region is '${region}', expected Local, Regional, National, or International.`, recommended_action: 'Normalize region in Music-Bands source sheet.', source_route: '/api/admin/diagnostics/music/bands' }); }
+      const personnel = getMusicDataAuditObject(row.personnel);
+      const members = Array.isArray(personnel.members) ? personnel.members : [];
+      const past = Array.isArray(personnel.past_members) ? personnel.past_members : [];
+      const memberKeys = new Set(members.map((m) => normalizeMusicBandDiagnosticKey(m && m.name)).filter(Boolean));
+      past.forEach((m) => { const key = normalizeMusicBandDiagnosticKey(m && m.name); if (key && memberKeys.has(key)) { personnelOverlap += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'bands', issue_type: 'current_past_personnel_overlap', title: 'Music Band current/past personnel overlap', record_type: 'music_band', record_id: row.band_id || row.id, record_name: row.band || '', reason: `${m.name || key} appears in both personnel.members[] and personnel.past_members[].`, recommended_action: 'Inspect Music-Bands source fields and preserve the correct bucket.', source_route: '/api/admin/diagnostics/music/bands' }); } });
+    }
+    state.categories.bands.metrics.region = { missingRegion, nonCanonicalRegion };
+    state.categories.bands.metrics.personnel = { currentPastOverlap: personnelOverlap };
+    state._bandNames = bandNames;
+  }
+
+  let venueIds = new Set();
+  if (existingTables.has('music_venues')) {
+    const venueResult = await dbPool.query(`SELECT venue_id, venue_key, venue, city, state, status FROM music_venues ORDER BY lower(trim(coalesce(venue, ''))) ASC, venue_id ASC`);
+    const metrics = { totalVenues: 0, missingIds: 0, missingNames: 0, missingCity: 0, missingState: 0, missingStatus: 0 };
+    for (const row of venueResult.rows || []) {
+      metrics.totalVenues += 1;
+      const publicId = String(row.venue_key || row.venue_id || '').trim();
+      if (publicId) venueIds.add(normalizeMusicBandDiagnosticKey(publicId));
+      if (!publicId) { metrics.missingIds += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'venues', issue_type: 'missing_venue_id', title: 'Music Venue missing venue_id', record_type: 'music_venue', record_id: row.venue || '', record_name: row.venue || '', reason: 'venue_id/venue_key is blank.', recommended_action: 'Fill venue_id so Music Shows can join to it.', source_route: '/api/admin/diagnostics/music/venues' }); }
+      if (!String(row.venue || '').trim()) { metrics.missingNames += 1; addMusicDataAuditIssue(state, { severity: 'critical', area: 'venues', issue_type: 'missing_venue_name', title: 'Music Venue missing name', record_type: 'music_venue', record_id: publicId, record_name: '', reason: 'venue name is blank.', recommended_action: 'Fill venue name in Music-Venue source data.', source_route: '/api/admin/diagnostics/music/venues' }); }
+      if (!String(row.city || '').trim()) { metrics.missingCity += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'venues', issue_type: 'missing_venue_city', title: 'Music Venue missing city', record_type: 'music_venue', record_id: publicId, record_name: row.venue || '', reason: 'city is blank.', recommended_action: 'Fill city in Music-Venue source data.', source_route: '/api/admin/diagnostics/music/venues' }); }
+      if (!String(row.state || '').trim()) { metrics.missingState += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'venues', issue_type: 'missing_venue_state', title: 'Music Venue missing state', record_type: 'music_venue', record_id: publicId, record_name: row.venue || '', reason: 'state is blank.', recommended_action: 'Fill state in Music-Venue source data.', source_route: '/api/admin/diagnostics/music/venues' }); }
+      if (!String(row.status || '').trim()) { metrics.missingStatus += 1; addMusicDataAuditIssue(state, { severity: 'info', area: 'venues', issue_type: 'missing_venue_status', title: 'Music Venue missing status', record_type: 'music_venue', record_id: publicId, record_name: row.venue || '', reason: 'status is blank.', recommended_action: 'Fill venue status if lifecycle filtering is needed.', source_route: '/api/admin/diagnostics/music/venues' }); }
+    }
+    state.categories.venues.metrics = metrics;
+  }
+
+  if (existingTables.has('music_people')) {
+    const peopleResult = await dbPool.query(`SELECT person_id, name, category FROM music_people ORDER BY name ASC, person_id ASC`);
+    const metrics = { totalPeople: 0, missingIds: 0, missingNames: 0, missingCategory: 0 };
+    for (const row of peopleResult.rows || []) {
+      metrics.totalPeople += 1;
+      if (row.person_id == null || String(row.person_id).trim() === '') { metrics.missingIds += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'people', issue_type: 'missing_person_id', title: 'Music Person missing person_id', record_type: 'music_person', record_id: row.name || '', record_name: row.name || '', reason: 'person_id is blank.', recommended_action: 'Fill person_id in Music-People source data.', source_route: '/api/admin/diagnostics/music/people' }); }
+      if (!String(row.name || '').trim()) { metrics.missingNames += 1; addMusicDataAuditIssue(state, { severity: 'critical', area: 'people', issue_type: 'missing_person_name', title: 'Music Person missing name', record_type: 'music_person', record_id: row.person_id == null ? '' : String(row.person_id), record_name: '', reason: 'name is blank.', recommended_action: 'Fill name in Music-People source data.', source_route: '/api/admin/diagnostics/music/people' }); }
+      if (!String(row.category || '').trim()) { metrics.missingCategory += 1; addMusicDataAuditIssue(state, { severity: 'info', area: 'people', issue_type: 'missing_person_category', title: 'Music Person missing category', record_type: 'music_person', record_id: row.person_id == null ? '' : String(row.person_id), record_name: row.name || '', reason: 'category is blank.', recommended_action: 'Fill category if this person should participate in performer/fallen diagnostics.', source_route: '/api/admin/diagnostics/music/people' }); }
+    }
+    state.categories.people.metrics = metrics;
+  }
+
+  if (existingTables.has('music_shows')) {
+    const showResult = await dbPool.query(`SELECT show_id, name, date, poster, show_url, venue_id, venue, bands, gallery_id, album_id, cover_image_url, photo_count, smug_last_synced_at, smug_sync_status, smug_sync_error, smug_albums FROM music_shows ORDER BY show_id ASC NULLS LAST`);
+    const rows = showResult.rows || [];
+    const posterCounts = new Map();
+    rows.forEach((row) => { const key = normalizeMusicBandDiagnosticKey(row.poster); if (key) posterCounts.set(key, (posterCounts.get(key) || 0) + 1); });
+    const duplicatePosters = new Set(Array.from(posterCounts.entries()).filter((entry) => entry[1] > 1).map((entry) => entry[0]));
+    const showMetrics = { totalShows: rows.length, missingPoster: 0, suspiciousPoster: 0, duplicatePosterRecords: 0, missingShowUrl: 0, missingBands: 0, missingVenueId: 0, invalidVenueId: 0, unmatchedLineupBands: 0 };
+    const smugMetrics = { resolved: 0, pending_archive: 0, awaiting_upload: 0, resolver_error: 0, path_mismatch: 0, cover_missing: 0, legacy_smugmug_error: 0, no_candidate_album: 0, unknown_unresolved: 0 };
+    const bandNames = state._bandNames || new Set();
+    for (const row of rows) {
+      const rid = row.show_id == null ? row.name : row.show_id;
+      const poster = String(row.poster || '').trim();
+      const posterClass = classifyMusicDataAuditPoster(poster);
+      if (posterClass.type === 'missing_poster') { showMetrics.missingPoster += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'shows', issue_type: 'missing_poster', title: 'Music Show missing poster', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: 'poster is blank.', recommended_action: 'Add a show-source SmugMug image URL if one exists.', source_route: '/api/music/shows/db' }); }
+      else if (posterClass.type !== 'valid_poster') { showMetrics.suspiciousPoster += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'shows', issue_type: posterClass.type, title: 'Music Show suspicious poster', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: posterClass.reason, recommended_action: 'Replace poster with valid show-source SmugMug media or leave blank until known.', source_route: '/api/music/shows/db', details: { poster } }); }
+      const posterKey = normalizeMusicBandDiagnosticKey(poster);
+      if (posterKey && duplicatePosters.has(posterKey)) { showMetrics.duplicatePosterRecords += 1; addMusicDataAuditIssue(state, { severity: 'info', area: 'shows', issue_type: 'duplicate_poster', title: 'Music Show duplicate poster URL', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: 'poster URL is used by more than one show.', recommended_action: 'Review duplicate poster usage; shared multi-day posters may be intentional.', source_route: '/api/music/shows/db', details: { poster, duplicate_count: posterCounts.get(posterKey) || 0 } }); }
+      if (!String(row.show_url || '').trim()) { showMetrics.missingShowUrl += 1; addMusicDataAuditIssue(state, { severity: 'info', area: 'shows', issue_type: 'missing_show_url', title: 'Music Show missing show_url', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: 'show_url is blank.', recommended_action: 'Rerun Music Shows import after fallback generation deploy, or fill explicit show_url only when needed.', source_route: '/api/music/shows/db' }); }
+      const bands = getMusicDataAuditArray(row.bands);
+      if (!bands.length) { showMetrics.missingBands += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'shows', issue_type: 'missing_bands', title: 'Music Show missing bands[]', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: 'bands[] is empty; SmugMug show album resolver requires lineup bands.', recommended_action: 'Add structured band lineup data in Music-Shows source rows.', source_route: '/api/music/shows/db' }); }
+      bands.forEach((band) => { const bandName = String(band.band || '').trim(); if (bandName && bandNames.size && !bandNames.has(normalizeMusicBandDiagnosticKey(bandName))) { showMetrics.unmatchedLineupBands += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'relationships', issue_type: 'unmatched_show_lineup_band', title: 'Music Show lineup band is not in Music-Bands', record_type: 'music_show_band', record_id: `${rid}:${bandName}`, record_name: bandName, reason: `${bandName} is referenced by a show lineup but does not exactly match music_bands.band.`, recommended_action: 'Add/fix Music-Bands source row or correct the show lineup spelling.', source_route: '/api/admin/relationships/music', details: { show_id: row.show_id, show_name: row.name, date: row.date, slot: band.slot == null ? null : toIntegerCount(band.slot) } }); } });
+      const venueId = String(row.venue_id || '').trim();
+      if (!venueId) { showMetrics.missingVenueId += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'shows', issue_type: 'missing_venue_id', title: 'Music Show missing venue_id', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: 'venue_id is blank; venue relationship cannot be joined.', recommended_action: 'Fill venue_id in Music-Shows using Music-Venue venue_id.', source_route: '/api/admin/relationships/music' }); }
+      else if (venueIds.size && !venueIds.has(normalizeMusicBandDiagnosticKey(venueId))) { showMetrics.invalidVenueId += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'relationships', issue_type: 'invalid_venue_id', title: 'Music Show venue_id does not match Music-Venue', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: `${venueId} does not match music_venues.venue_key/venue_id.`, recommended_action: 'Import Music-Venues first, then correct venue_id in Music-Shows if still unmatched.', source_route: '/api/admin/relationships/music', details: { venue_id: venueId, venue: row.venue || '' } }); }
+      const classification = classifySmugMusicShowSnapshotRow(row);
+      smugMetrics[classification.bucket] = (smugMetrics[classification.bucket] || 0) + 1;
+      if (classification.bucket !== 'resolved') addMusicDataAuditIssue(state, { severity: classification.bucket === 'pending_archive' || classification.bucket === 'awaiting_upload' ? 'info' : (classification.bucket === 'resolver_error' ? 'critical' : 'warning'), area: 'smugmug', issue_type: classification.bucket, title: `Music Show SmugMug ${classification.bucket.replace(/_/g, ' ')}`, record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: classification.reason, recommended_action: classification.recommended_action, source_route: '/api/admin/diagnostics/music/smugmug-shows/classification', details: { date: row.date || '', stored_status: classification.stored_status, attempted_paths: classification.attempted_paths.slice(0, 5), album_statuses: classification.album_statuses.slice(0, 5), smug_sync_error: classification.sync_error } });
+      if (classification.cover_missing) { smugMetrics.cover_missing += 1; addMusicDataAuditIssue(state, { severity: 'warning', area: 'smugmug', issue_type: 'cover_missing', title: 'Music Show SmugMug cover missing', record_type: 'music_show', record_id: rid, record_name: row.name || '', reason: 'Album/gallery fields are populated, but cover_image_url is missing.', recommended_action: classification.cover_missing_action || getSmugMusicShowClassificationAction('cover_missing'), source_route: '/api/admin/diagnostics/music/smugmug-shows/classification' }); }
+    }
+    state.categories.shows.metrics = showMetrics;
+    state.categories.smugmug.metrics = smugMetrics;
+  }
+  delete state._bandNames;
+  return finalizeMusicDataAuditResponse(state, generated, page, limit);
+}
+
+async function handleMusicDataAuditRequest(req, res) {
+  try { return res.status(200).json(await buildMusicDataAuditResponse(req.query || {})); }
+  catch (err) { return res.status(500).json(buildAdminError(MUSIC_DATA_AUDIT_ROUTE, err, { source: 'postgres', section: 'music', type: 'data_audit', error: 'MUSIC_DATA_AUDIT_ERROR' })); }
+}
 async function buildMusicDiagnosticsResponse() {
   const generated = new Date();
   const warnings = [];
@@ -18706,6 +18892,10 @@ async function handleMusicDiagnosticsSectionRequest(req, res, category) {
     });
   }
 }
+
+app.get('/api/admin/diagnostics/music/data-audit', async (req, res) => {
+  return handleMusicDataAuditRequest(req, res);
+});
 
 app.get('/api/admin/diagnostics/music/bands/smug-folder', async (req, res) => {
   return handleMusicBandSmugFolderDiagnosticsRequest(req, res);
