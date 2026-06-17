@@ -704,6 +704,22 @@ function getSmugImageDateTimeOriginal(image) {
   ]);
 }
 
+function getSmugImageDateTaken(image) {
+  return getSmugNestedField(image, [
+    'DateTaken',
+    'date_taken',
+    'dateTaken'
+  ]);
+}
+
+function getSmugImageTakenAt(image) {
+  return getSmugNestedField(image, [
+    'TakenAt',
+    'taken_at',
+    'takenAt'
+  ]);
+}
+
 function clampSmugAlbumPhotoLimit(value) {
   const parsed = Number.parseInt(String(value || ''), 10);
   if (!Number.isFinite(parsed)) return SMUG_ALBUM_PHOTOS_DEFAULT_LIMIT;
@@ -957,6 +973,9 @@ async function hydrateSmugAlbumPhotoImage(image) {
 
 function buildSmugAlbumPhotoItem(image, options = {}) {
   const urls = getSmugAlbumPhotoUrls(image);
+  const dateTimeOriginal = getSmugImageDateTimeOriginal(image);
+  const dateTaken = getSmugImageDateTaken(image) || dateTimeOriginal;
+  const takenAt = getSmugImageTakenAt(image) || dateTimeOriginal || dateTaken;
   const item = {
     image_key: getSmugAlbumPhotoImageKey(image),
     thumbnail_url: urls.thumbnail_url,
@@ -964,7 +983,9 @@ function buildSmugAlbumPhotoItem(image, options = {}) {
     medium_url: urls.medium_url,
     large_url: urls.large_url,
     caption: getSmugImageCaption(image),
-    date_time_original: getSmugImageDateTimeOriginal(image) || null
+    date_taken: dateTaken || null,
+    taken_at: takenAt || null,
+    date_time_original: dateTimeOriginal || null
   };
 
   if (options.debug) {
@@ -1294,7 +1315,17 @@ function getMusicPeopleArchiveAlbumKey(album) {
 }
 
 function getMusicPeopleArchiveShowKey(show) {
-  return String(show && (show.show_id || show.id || show.name || '') || '').trim();
+  return String(show && (
+    show.show_key ||
+    show.showKey ||
+    show.show_url ||
+    show.showUrl ||
+    formatMusicShowUrlDateKey(show.show_date || show.date) ||
+    show.show_id ||
+    show.id ||
+    show.name ||
+    ''
+  ) || '').trim();
 }
 
 function getMusicPeopleArchiveShowTime(show) {
@@ -1306,6 +1337,36 @@ function getMusicPeopleArchiveShowTime(show) {
 function getMusicPeopleArchiveDateTimeOriginalTime(value) {
   const parsed = Date.parse(String(value || '').trim());
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getMusicPeopleArchiveDateValue(...values) {
+  return values
+    .map((value) => String(value || '').trim())
+    .find(Boolean) || '';
+}
+
+function getMusicPeopleArchivePhotoDateValue(photo, includeShowDateFallback = false) {
+  const photoDate = getMusicPeopleArchiveDateValue(
+    photo && photo.date_time_original,
+    photo && photo.dateTimeOriginal,
+    photo && photo.DateTimeOriginal,
+    photo && photo.date_taken,
+    photo && photo.dateTaken,
+    photo && photo.DateTaken,
+    photo && photo.taken_at,
+    photo && photo.takenAt,
+    photo && photo.TakenAt
+  );
+  if (photoDate || !includeShowDateFallback) return photoDate;
+  return getMusicPeopleArchiveDateValue(
+    photo && photo.show_date,
+    photo && photo.showDate,
+    photo && photo.date
+  );
+}
+
+function getMusicPeopleArchiveMatchedPhotoTime(photo) {
+  return getMusicPeopleArchiveDateTimeOriginalTime(getMusicPeopleArchivePhotoDateValue(photo, true));
 }
 
 function formatMusicPeopleArchiveSeenDate(value) {
@@ -1326,10 +1387,17 @@ function getMusicPeopleArchivePhotoUrl(photo) {
 function buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey) {
   const show = album && album.show ? album.show : {};
   const albumId = String(album && album.album_id || '').trim();
+  const dateTimeOriginal = getMusicPeopleArchiveDateValue(photo && photo.date_time_original, photo && photo.dateTimeOriginal, photo && photo.DateTimeOriginal);
+  const dateTaken = getMusicPeopleArchiveDateValue(photo && photo.date_taken, photo && photo.dateTaken, photo && photo.DateTaken, dateTimeOriginal);
+  const takenAt = getMusicPeopleArchiveDateValue(photo && photo.taken_at, photo && photo.takenAt, photo && photo.TakenAt, dateTimeOriginal, dateTaken);
+  const showKey = getMusicPeopleArchiveShowKey(show);
+  const showTitle = String(show && (show.show_title || show.showTitle || show.name || show.title) || '').trim();
   return {
     image_key: String(photo && photo.image_key || photoKey || '').trim(),
     caption: String(photo && photo.caption || '').trim(),
-    date_time_original: String(photo && photo.date_time_original || '').trim() || null,
+    date_taken: dateTaken || null,
+    taken_at: takenAt || null,
+    date_time_original: dateTimeOriginal || null,
     thumbnail_url: String(photo && photo.thumbnail_url || '').trim() || null,
     small_url: String(photo && photo.small_url || '').trim() || null,
     medium_url: String(photo && photo.medium_url || '').trim() || null,
@@ -1337,7 +1405,9 @@ function buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey) {
     album_id: albumId || null,
     gallery_id: String(album && (album.gallery_id || albumId) || '').trim() || null,
     show_id: String(show && (show.show_id || show.id) || '').trim() || null,
-    show_name: String(show && (show.name || show.title) || '').trim() || null,
+    show_key: showKey || null,
+    show_title: showTitle || null,
+    show_name: showTitle || null,
     show_date: String(show && (show.show_date || show.date) || '').trim() || null,
     venue: String(show && show.venue || '').trim() || null,
     location: [show && show.city, show && show.state].map((part) => String(part || '').trim()).filter(Boolean).join(', ') || null
@@ -1345,8 +1415,8 @@ function buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey) {
 }
 
 function compareMusicPeopleArchiveMatchedPhotos(a, b) {
-  const bTime = getMusicPeopleArchiveDateTimeOriginalTime(b && b.date_time_original);
-  const aTime = getMusicPeopleArchiveDateTimeOriginalTime(a && a.date_time_original);
+  const bTime = getMusicPeopleArchiveMatchedPhotoTime(b);
+  const aTime = getMusicPeopleArchiveMatchedPhotoTime(a);
   if (bTime !== aTime) return bTime - aTime;
   return String(b && b.image_key || '').localeCompare(String(a && a.image_key || ''));
 }
@@ -1363,12 +1433,12 @@ function finalizeMusicPeopleArchiveRelationships(relationships) {
         return {
           ...show,
           tagged_photo_count: showPhotos.length,
-          matched_photos: showPhotos.slice(0, 4)
+          matched_photos: showPhotos
         };
       })
       .sort((a, b) => {
-        const bTime = Math.max(0, ...(Array.isArray(b.matched_photos) ? b.matched_photos : []).map((photo) => getMusicPeopleArchiveDateTimeOriginalTime(photo.date_time_original)));
-        const aTime = Math.max(0, ...(Array.isArray(a.matched_photos) ? a.matched_photos : []).map((photo) => getMusicPeopleArchiveDateTimeOriginalTime(photo.date_time_original)));
+        const bTime = Math.max(0, ...(Array.isArray(b.matched_photos) ? b.matched_photos : []).map(getMusicPeopleArchiveMatchedPhotoTime));
+        const aTime = Math.max(0, ...(Array.isArray(a.matched_photos) ? a.matched_photos : []).map(getMusicPeopleArchiveMatchedPhotoTime));
         return bTime - aTime;
       });
     finalized.set(String(personId || '').trim(), {
@@ -1483,7 +1553,7 @@ async function fetchMusicPeopleArchiveAlbumPhotos(albumId) {
 
 async function getMusicPeopleArchiveAlbumsForScan() {
   const showsResult = await dbPool.query(`
-    SELECT id, show_id, name, date, show_date, venue, city, state, gallery_id, album_id, cover_image_url, smug_albums
+    SELECT id, show_id, name, date, show_date, show_url, venue, city, state, gallery_id, album_id, cover_image_url, smug_albums
     FROM music_shows
     WHERE (
       (jsonb_typeof(smug_albums) = 'array' AND jsonb_array_length(smug_albums) > 0)
@@ -1548,31 +1618,34 @@ function addMusicPeopleArchiveMatch(relationships, personId, album, photo) {
     relationship.event_count = relationship.show_count;
   }
 
+  let matchedPhoto = null;
   if (isNewPhoto) {
-    const matchedPhoto = buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey);
+    matchedPhoto = buildMusicPeopleArchiveMatchedPhoto(album, photo, photoKey);
     relationship.matchedPhotos.push(matchedPhoto);
     relationship.photo_count = relationship.photoKeys.size;
 
-    const dateTimeOriginal = matchedPhoto.date_time_original || '';
-    const originalTime = getMusicPeopleArchiveDateTimeOriginalTime(dateTimeOriginal);
+    const matchedPhotoDate = getMusicPeopleArchivePhotoDateValue(matchedPhoto, true);
+    const originalTime = getMusicPeopleArchiveDateTimeOriginalTime(matchedPhotoDate);
     if (originalTime && (!relationship.firstSeenTime || originalTime < relationship.firstSeenTime)) {
       relationship.firstSeenTime = originalTime;
-      relationship.first_seen = dateTimeOriginal;
-      relationship.first_seen_display = formatMusicPeopleArchiveSeenDate(dateTimeOriginal);
+      relationship.first_seen = matchedPhotoDate;
+      relationship.first_seen_display = formatMusicPeopleArchiveSeenDate(matchedPhotoDate);
     }
     if (originalTime && originalTime >= relationship.latestSeenTime) {
       relationship.latestSeenTime = originalTime;
-      relationship.latest_seen = dateTimeOriginal;
-      relationship.latest_seen_display = formatMusicPeopleArchiveSeenDate(dateTimeOriginal);
+      relationship.latest_seen = matchedPhotoDate;
+      relationship.latest_seen_display = formatMusicPeopleArchiveSeenDate(matchedPhotoDate);
     }
 
     const groupKey = showKey || albumId || photoKey;
     if (!relationship.showMatches.has(groupKey)) {
       relationship.showMatches.set(groupKey, {
         show_id: matchedPhoto.show_id,
+        show_key: matchedPhoto.show_key,
+        show_title: matchedPhoto.show_title,
         album_id: matchedPhoto.album_id,
         gallery_id: matchedPhoto.gallery_id,
-        title: matchedPhoto.show_name || `Tagged Set ${relationship.showMatches.size + 1}`,
+        title: matchedPhoto.show_title || matchedPhoto.show_name || `Tagged Set ${relationship.showMatches.size + 1}`,
         date: matchedPhoto.show_date,
         venue: matchedPhoto.venue,
         location: matchedPhoto.location,
@@ -1582,7 +1655,9 @@ function addMusicPeopleArchiveMatch(relationships, personId, album, photo) {
     relationship.showMatches.get(groupKey).matched_photos.push(matchedPhoto);
   }
 
-  const photoTime = getMusicPeopleArchiveDateTimeOriginalTime(photo && photo.date_time_original);
+  const photoTime = matchedPhoto
+    ? getMusicPeopleArchiveMatchedPhotoTime(matchedPhoto)
+    : getMusicPeopleArchiveDateTimeOriginalTime(getMusicPeopleArchivePhotoDateValue(photo, true));
   const coverUrl = getMusicPeopleArchivePhotoUrl(photo) || String(album && album.cover_image_url || '').trim();
   if (coverUrl && (!relationship.cover_image_url || (photoTime && photoTime >= relationship.latestPhotoTime))) {
     relationship.latestPhotoTime = photoTime || relationship.latestPhotoTime;
