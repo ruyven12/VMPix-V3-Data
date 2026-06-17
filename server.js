@@ -132,6 +132,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics/music/bands',
     '/api/admin/diagnostics/music/shows',
     '/api/admin/diagnostics/music/smugmug-shows/classification',
+    '/api/admin/smug/music/shows/repair',
     '/api/admin/diagnostics/music/people',
     '/api/admin/diagnostics/music/venues',
     '/api/admin/diagnostics/wrestling',
@@ -12657,6 +12658,386 @@ async function buildSmugMusicShowClassificationResponse(query = {}) {
 
   return response;
 }
+const SMUG_MUSIC_SHOW_REPAIR_DEFAULT_LIMIT = 25;
+const SMUG_MUSIC_SHOW_REPAIR_MAX_LIMIT = 100;
+const SMUG_MUSIC_SHOW_REPAIR_BUCKETS = Object.freeze(['legacy_smugmug_error', 'cover_missing']);
+
+function getSmugMusicShowRepairLimit(value) {
+  const limit = Number(String(value || '').trim());
+  if (!Number.isInteger(limit)) return SMUG_MUSIC_SHOW_REPAIR_DEFAULT_LIMIT;
+  return Math.min(SMUG_MUSIC_SHOW_REPAIR_MAX_LIMIT, Math.max(1, limit));
+}
+
+function isSmugMusicShowRepairDryRun(query = {}) {
+  const value = String(query.dry_run == null ? query.dryRun : query.dry_run).trim().toLowerCase();
+  return !['false', '0', 'no'].includes(value);
+}
+
+function getSmugMusicShowRepairRequestedBuckets(query = {}) {
+  const raw = String(query.bucket || query.buckets || '').trim();
+  if (!raw) return Array.from(SMUG_MUSIC_SHOW_REPAIR_BUCKETS);
+  const requested = raw.split(',').map((item) => item.trim().toLowerCase()).filter(Boolean);
+  const allowed = requested.filter((item) => SMUG_MUSIC_SHOW_REPAIR_BUCKETS.includes(item));
+  return allowed.length ? Array.from(new Set(allowed)) : Array.from(SMUG_MUSIC_SHOW_REPAIR_BUCKETS);
+}
+
+function buildSmugMusicShowRepairTargetItem(row, classification) {
+  return {
+    show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
+    name: row && row.name ? row.name : '',
+    date: row && row.date ? row.date : '',
+    bucket: classification.bucket,
+    cover_missing: classification.cover_missing,
+    stored_status: classification.stored_status,
+    album_id: row && row.album_id ? row.album_id : '',
+    gallery_id: row && row.gallery_id ? row.gallery_id : '',
+    photo_count: classification.photo_count,
+    attempted_paths: classification.attempted_paths.slice(0, 5),
+    album_statuses: classification.album_statuses.slice(0, 5),
+    reason: classification.reason,
+    recommended_action: classification.recommended_action
+  };
+}
+
+async function getSmugMusicShowRepairCandidateRows(scanLimit) {
+  const result = await dbPool.query(`
+    SELECT id, show_id, name, date, poster, show_url, raw_sheet, bands, stats,
+           gallery_id, album_id, cover_image_url, photo_count, smug_albums,
+           smug_last_synced_at, smug_sync_status, smug_sync_error
+    FROM music_shows
+    WHERE (
+        trim(coalesce(album_id, '')) = ''
+        AND trim(coalesce(gallery_id, '')) = ''
+        AND (
+          lower(trim(coalesce(smug_sync_status, ''))) IN ('error', 'raw_photo_source_no_album_context', 'no_image_key', 'no_album_key', 'skipped_logo_source', 'skipped_venue_logo_source')
+          OR coalesce(smug_sync_error, '') ILIKE '%/image/%'
+          OR coalesce(smug_sync_error, '') ILIKE '%raw_photo_source_no_album_context%'
+        )
+      )
+      OR (
+        (
+          trim(coalesce(album_id, '')) <> ''
+          OR trim(coalesce(gallery_id, '')) <> ''
+          OR coalesce(photo_count, 0) > 0
+        )
+        AND trim(coalesce(cover_image_url, '')) = ''
+      )
+    ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+    LIMIT $1
+  `, [scanLimit]);
+  return result.rows || [];
+}
+
+function getSmugMusicShowRepairTargets(rows, requestedBuckets, limit) {
+  const targets = [];
+  const requested = new Set(requestedBuckets);
+  for (const row of rows || []) {
+    const classification = classifySmugMusicShowSnapshotRow(row);
+    let bucket = '';
+    if (classification.bucket === 'legacy_smugmug_error' && requested.has('legacy_smugmug_error')) bucket = 'legacy_smugmug_error';
+    else if (classification.cover_missing && requested.has('cover_missing')) bucket = 'cover_missing';
+    if (!bucket) continue;
+
+    targets.push({ row, bucket, classification });
+    if (targets.length >= limit) break;
+  }
+  return targets;
+}
+
+function buildSmugMusicShowRepairMapping(candidate, resolved, lineup) {
+  return {
+    band: candidate.band,
+    band_id: candidate.band_id || '',
+    slot: candidate.slot,
+    bandViewCount: lineup && lineup.bandViewCount != null ? toIntegerCount(lineup.bandViewCount) : null,
+    lineupBand: lineup && lineup.band ? lineup.band : '',
+    lineupSlot: lineup && lineup.slot != null ? toIntegerCount(lineup.slot) : null,
+    region: candidate.region,
+    region_source: candidate.region_source,
+    band_folder: candidate.band_folder,
+    date_folder: candidate.date_folder,
+    smug_path: candidate.smug_path,
+    album_id: resolved.album_id || '',
+    gallery_id: resolved.gallery_id || '',
+    album_url: resolved.album_url || '',
+    album_title: resolved.album_title || '',
+    photo_count: toIntegerCount(resolved.photo_count),
+    cover_image_url: resolved.cover_image_url || '',
+    status: resolved.status || 'unresolved',
+    endpoint: resolved.endpoint || '',
+    api_url_before_api_key: resolved.api_url_before_api_key || '',
+    childAlbumCount: resolved.childAlbumCount == null ? null : toIntegerCount(resolved.childAlbumCount),
+    duplicateMatchCount: resolved.duplicateMatchCount == null ? null : toIntegerCount(resolved.duplicateMatchCount),
+    error: resolved.error || ''
+  };
+}
+
+async function repairSmugMusicShowLegacyError(row, bandLookup, dryRun) {
+  const { dateFolder, candidates, regionFallbackUsed } = getSmugMusicShowAlbumCandidates(row, bandLookup);
+  const target = buildSmugMusicShowRepairTargetItem(row, classifySmugMusicShowSnapshotRow(row));
+
+  if (!dateFolder || !candidates.length) {
+    return {
+      ...target,
+      repair_type: 'legacy_smugmug_error',
+      dry_run: dryRun,
+      would_update: false,
+      updated: false,
+      status: 'no_candidate_album',
+      message: !dateFolder ? 'Missing date folder; no deterministic repair attempted.' : 'Missing band candidates; no deterministic repair attempted.'
+    };
+  }
+
+  const lineupBands = Array.isArray(row && row.bands) ? row.bands : [];
+  const mappings = [];
+  for (const candidate of candidates) {
+    const lineup = findMusicShowLineupBandForAlbum(candidate, lineupBands);
+    const resolved = await resolveSmugAlbumByPath(candidate.smug_path);
+    mappings.push(buildSmugMusicShowRepairMapping(candidate, resolved, lineup));
+  }
+
+  const resolvedMappings = mappings.filter((mapping) => mapping.album_id && /^resolved/i.test(mapping.status));
+  if (!resolvedMappings.length) {
+    return {
+      ...target,
+      repair_type: 'legacy_smugmug_error',
+      dry_run: dryRun,
+      would_update: false,
+      updated: false,
+      status: 'still_unresolved',
+      message: 'Current deterministic resolver did not find an album; existing legacy error was left unchanged.',
+      region_fallback_used: regionFallbackUsed,
+      attempted_paths: mappings.map((mapping) => mapping.smug_path).filter(Boolean).slice(0, 10),
+      smug_albums: mappings
+    };
+  }
+
+  const first = resolvedMappings[0];
+  const photoCount = resolvedMappings.reduce((total, mapping) => total + toIntegerCount(mapping.photo_count), 0);
+  const coverImageUrl = resolvedMappings.map((mapping) => mapping.cover_image_url).find((value) => String(value || '').trim()) || getSmugMusicShowResolvedCoverImageUrl(null, '', row);
+  const stats = buildSmugMusicShowStatsSnapshot(row, photoCount);
+  let updated = null;
+
+  if (!dryRun) {
+    updated = await updateSmugMusicShowSnapshot(row, {
+      gallery_id: first.gallery_id || first.album_id,
+      album_id: first.album_id,
+      cover_image_url: coverImageUrl,
+      photo_count: photoCount,
+      stats,
+      smug_albums: mappings,
+      smug_sync_status: 'resolved',
+      smug_sync_error: null
+    });
+  }
+
+  return {
+    ...target,
+    repair_type: 'legacy_smugmug_error',
+    dry_run: dryRun,
+    would_update: true,
+    updated: !!updated,
+    status: dryRun ? 'would_resolve' : (updated ? 'resolved' : 'not_updated'),
+    message: dryRun ? 'Dry run found a deterministic album match; no database update was made.' : 'Legacy error replaced with resolved album snapshot.',
+    album_id: first.album_id,
+    gallery_id: first.gallery_id || first.album_id,
+    photo_count: photoCount,
+    cover_image_url_present: !!String(coverImageUrl || '').trim(),
+    region_fallback_used: regionFallbackUsed,
+    attempted_paths: mappings.map((mapping) => mapping.smug_path).filter(Boolean).slice(0, 10),
+    resolved_album_count: resolvedMappings.length,
+    unresolved_album_count: mappings.length - resolvedMappings.length,
+    smug_albums: mappings
+  };
+}
+
+async function updateSmugMusicShowCoverOnly(row, coverImageUrl) {
+  const result = await dbPool.query(`
+    UPDATE music_shows
+    SET cover_image_url = $2,
+        updated_at = NOW()
+    WHERE id = $1
+      AND trim(coalesce(cover_image_url, '')) = ''
+      AND (
+        trim(coalesce(album_id, '')) <> ''
+        OR trim(coalesce(gallery_id, '')) <> ''
+        OR coalesce(photo_count, 0) > 0
+      )
+    RETURNING id, show_id, name, date, gallery_id, album_id, cover_image_url, photo_count, stats, smug_albums, smug_last_synced_at, smug_sync_status, smug_sync_error
+  `, [row.id, coverImageUrl]);
+  return result.rows && result.rows[0] ? result.rows[0] : null;
+}
+
+async function repairSmugMusicShowMissingCover(row, dryRun) {
+  const classification = classifySmugMusicShowSnapshotRow(row);
+  const target = buildSmugMusicShowRepairTargetItem(row, { ...classification, bucket: 'cover_missing' });
+  const albumId = String(row && (row.album_id || row.gallery_id) || '').trim();
+
+  if (!albumId) {
+    return {
+      ...target,
+      repair_type: 'cover_missing',
+      dry_run: dryRun,
+      would_update: false,
+      updated: false,
+      status: 'missing_album_id',
+      message: 'Cover repair skipped because the show has no album_id/gallery_id.'
+    };
+  }
+
+  let metadata = null;
+  try {
+    metadata = await fetchSmugAlbumMetadata(albumId);
+  } catch (err) {
+    return {
+      ...target,
+      repair_type: 'cover_missing',
+      dry_run: dryRun,
+      would_update: false,
+      updated: false,
+      status: 'metadata_error',
+      message: getSafeErrorMessage(err)
+    };
+  }
+
+  const coverImageUrl = getSmugAlbumCoverImageUrl(metadata) || '';
+  if (!isUsableShowImageUrl(coverImageUrl)) {
+    return {
+      ...target,
+      repair_type: 'cover_missing',
+      dry_run: dryRun,
+      would_update: false,
+      updated: false,
+      status: 'cover_still_missing',
+      message: 'Album metadata did not include a usable cover image URL.'
+    };
+  }
+
+  let updated = null;
+  if (!dryRun) updated = await updateSmugMusicShowCoverOnly(row, coverImageUrl);
+
+  return {
+    ...target,
+    repair_type: 'cover_missing',
+    dry_run: dryRun,
+    would_update: true,
+    updated: !!updated,
+    status: dryRun ? 'would_update_cover' : (updated ? 'cover_updated' : 'not_updated'),
+    message: dryRun ? 'Dry run found a cover image; no database update was made.' : 'cover_image_url updated while preserving existing album/gallery/photo fields.',
+    cover_image_url: coverImageUrl
+  };
+}
+
+async function runSmugMusicShowRepair(query = {}) {
+  const generated = new Date();
+  const route = '/api/admin/smug/music/shows/repair';
+  const warnings = [];
+  const dryRun = isSmugMusicShowRepairDryRun(query);
+  const limit = getSmugMusicShowRepairLimit(query.limit);
+  const requestedBuckets = getSmugMusicShowRepairRequestedBuckets(query);
+  const config = getSmugMugConfigDiagnostics();
+  const response = buildAdminResponse({
+    route,
+    generated,
+    source: 'smugmug',
+    section: 'music',
+    type: 'smug_show_repair',
+    dry_run: dryRun,
+    databaseMutated: false,
+    targetBuckets: requestedBuckets,
+    limit,
+    summary: {
+      scanned: 0,
+      targeted: 0,
+      legacy_targets: 0,
+      cover_missing_targets: 0,
+      expected_updates: 0,
+      records_updated: 0,
+      still_unresolved: 0,
+      cover_still_missing: 0,
+      failed: 0,
+      skipped: 0
+    },
+    results: [],
+    warnings,
+    classificationRoute: '/api/admin/diagnostics/music/smugmug-shows/classification'
+  });
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    response.ok = false;
+    response.error = 'DATABASE_NOT_CONFIGURED';
+    response.message = 'DATABASE_URL is required for Music Show SmugMug repair.';
+    return response;
+  }
+
+  if (!config.configured) {
+    response.ok = false;
+    response.error = 'SMUGMUG_NOT_CONFIGURED';
+    response.message = 'SMUG_API_KEY and SMUG_NICKNAME are required for Music Show SmugMug repair.';
+    response.missing = config.missing;
+    return response;
+  }
+
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+  if (!snapshotFields.present) {
+    response.ok = false;
+    response.error = 'SNAPSHOT_FIELDS_MISSING';
+    response.message = 'Music show SmugMug snapshot fields are missing.';
+    response.snapshotFields = snapshotFields;
+    return response;
+  }
+
+  const scanLimit = Math.min(500, Math.max(limit * 5, limit));
+  const candidateRows = await getSmugMusicShowRepairCandidateRows(scanLimit);
+  const targets = getSmugMusicShowRepairTargets(candidateRows, requestedBuckets, limit);
+  const bandLookup = targets.some((target) => target.bucket === 'legacy_smugmug_error')
+    ? await getSmugMusicShowBandLookup(targets.map((target) => target.row))
+    : new Map();
+
+  response.summary.scanned = candidateRows.length;
+  response.summary.targeted = targets.length;
+  response.summary.legacy_targets = targets.filter((target) => target.bucket === 'legacy_smugmug_error').length;
+  response.summary.cover_missing_targets = targets.filter((target) => target.bucket === 'cover_missing').length;
+
+  const results = await mapWithConcurrency(targets, SMUG_REQUEST_CONCURRENCY, async (target) => {
+    try {
+      if (target.bucket === 'legacy_smugmug_error') return await repairSmugMusicShowLegacyError(target.row, bandLookup, dryRun);
+      if (target.bucket === 'cover_missing') return await repairSmugMusicShowMissingCover(target.row, dryRun);
+      return {
+        ...buildSmugMusicShowRepairTargetItem(target.row, target.classification),
+        dry_run: dryRun,
+        would_update: false,
+        updated: false,
+        status: 'skipped_bucket',
+        message: 'Bucket is not part of this repair route.'
+      };
+    } catch (err) {
+      return {
+        ...buildSmugMusicShowRepairTargetItem(target.row, target.classification),
+        dry_run: dryRun,
+        would_update: false,
+        updated: false,
+        status: 'failed',
+        message: getSafeErrorMessage(err)
+      };
+    }
+  });
+
+  response.results = results;
+  response.summary.expected_updates = results.filter((item) => item.would_update).length;
+  response.summary.records_updated = results.filter((item) => item.updated).length;
+  response.summary.still_unresolved = results.filter((item) => item.status === 'still_unresolved').length;
+  response.summary.cover_still_missing = results.filter((item) => item.status === 'cover_still_missing').length;
+  response.summary.failed = results.filter((item) => item.status === 'failed' || item.status === 'metadata_error').length;
+  response.summary.skipped = results.filter((item) => /^missing_|skipped_|not_updated/.test(String(item.status || ''))).length;
+  response.databaseMutated = !dryRun && response.summary.records_updated > 0;
+  response.message = dryRun
+    ? 'Dry run complete. Re-run with dry_run=false to apply only the listed updates.'
+    : 'Repair run complete. Only targeted legacy error and cover-missing records were eligible for updates.';
+  response.warnings = warnings;
+
+  return response;
+}
 const SMUG_MUSIC_BAND_DISCOVER_DEFAULT_LIMIT = 25;
 const SMUG_MUSIC_BAND_DISCOVER_MAX_LIMIT = 100;
 
@@ -17755,6 +18136,77 @@ app.get([
   '/admin/smug/music/shows/classification',
   '/api/admin/smug/music/shows/classification'
 ], handleSmugMusicShowClassificationRequest);
+
+async function handleSmugMusicShowRepairRequest(req, res) {
+  let importLock = null;
+  try {
+    const dryRun = isSmugMusicShowRepairDryRun(req.query || {});
+    if (!dryRun && !getConfiguredAdminSecrets().length) {
+      return res.status(503).json(buildAdminAccessError(
+        req,
+        'ADMIN_PROTECTION_NOT_CONFIGURED',
+        'Set ADMIN_TOKEN or ADMIN_PASSWORD before running Music Show SmugMug repair with dry_run=false.'
+      ));
+    }
+
+    const lockAttempt = await acquireImportLock({
+      section: 'music',
+      category: 'smug_shows_repair',
+      owner: getImportLockOwner(),
+      meta: {
+        route: req.path || '/api/admin/smug/music/shows/repair',
+        dry_run: dryRun,
+        limit: getSmugMusicShowRepairLimit((req.query || {}).limit),
+        buckets: getSmugMusicShowRepairRequestedBuckets(req.query || {})
+      }
+    });
+
+    if (lockAttempt && lockAttempt.acquired === false) {
+      return res.status(409).json(buildAdminResponse({
+        ok: false,
+        route: req.path || '/api/admin/smug/music/shows/repair',
+        source: 'smugmug',
+        section: 'music',
+        type: 'smug_show_repair',
+        locked: true,
+        message: 'Music Show SmugMug repair already running',
+        lock: lockAttempt.lock
+      }));
+    }
+
+    importLock = lockAttempt && lockAttempt.lock ? lockAttempt.lock : null;
+    const response = await runSmugMusicShowRepair(req.query || {});
+    const released = await releaseImportLock(importLock && importLock.id, response.ok ? 'completed' : 'failed', {
+      completedAt: new Date().toISOString(),
+      status: response.ok ? 'completed' : 'failed',
+      route: req.path || '/api/admin/smug/music/shows/repair',
+      dry_run: response.dry_run,
+      recordsUpdated: response.summary ? response.summary.records_updated : 0
+    });
+    if (released) response.importLock = released;
+    return res.status(response.ok ? 200 : 400).json(response);
+  } catch (err) {
+    const released = await releaseImportLock(importLock && importLock.id, 'failed', {
+      completedAt: new Date().toISOString(),
+      status: 'failed',
+      error: getSafeErrorMessage(err),
+      route: req.path || '/api/admin/smug/music/shows/repair'
+    });
+    const errorResponse = buildAdminError(req.path || '/api/admin/smug/music/shows/repair', err, {
+      source: 'smugmug',
+      section: 'music',
+      type: 'smug_show_repair',
+      error: 'SMUG_SHOW_REPAIR_ERROR'
+    });
+    if (released) errorResponse.importLock = released;
+    return res.status(500).json(errorResponse);
+  }
+}
+
+app.get([
+  '/api/admin/smug/music/shows/repair',
+  '/admin/smug/music/shows/repair'
+], handleSmugMusicShowRepairRequest);
 app.get('/api/admin/stats/summary', async (req, res) => {
   return handleStatsSummaryRequest(req, res);
 });
