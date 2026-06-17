@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const fs = require('fs');
 const path = require('path');
@@ -6136,7 +6136,7 @@ function normalizeWrestlingMatchPhotoToken(value) {
   return String(value || '')
     .trim()
     .toLowerCase()
-    .replace(/['’]/g, '')
+    .replace(/['â€™]/g, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
 }
@@ -17076,7 +17076,7 @@ function suggestMusicBandSmugFolder(value) {
   if (!clean || isMalformedMusicBandDiagnosticRecord({ band: clean })) return '';
 
   return clean
-    .replace(/[’']/g, '')
+    .replace(/[â€™']/g, '')
     .replace(/&/g, ' And ')
     .replace(/[^A-Za-z0-9]+/g, '-')
     .replace(/-+/g, '-')
@@ -17546,6 +17546,371 @@ async function buildMusicDataAuditResponse(query = {}) {
 async function handleMusicDataAuditRequest(req, res) {
   try { return res.status(200).json(await buildMusicDataAuditResponse(req.query || {})); }
   catch (err) { return res.status(500).json(buildAdminError(MUSIC_DATA_AUDIT_ROUTE, err, { source: 'postgres', section: 'music', type: 'data_audit', error: 'MUSIC_DATA_AUDIT_ERROR' })); }
+}
+const MUSIC_PEOPLE_CAPTION_INDEX_ROUTE = '/api/admin/diagnostics/music/people/caption-index';
+const musicPeopleCaptionIndexAlbumCache = new Map();
+const MUSIC_PEOPLE_CAPTION_INDEX_CACHE_TTL_MS = 1000 * 60 * 10;
+
+function getMusicPeopleCaptionIndexLimit(value) {
+  const number = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isFinite(number)) return 25;
+  return Math.min(100, Math.max(1, number));
+}
+
+function getMusicPeopleCaptionIndexAlbumLimit(value) {
+  const number = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isFinite(number)) return 10;
+  return Math.min(25, Math.max(1, number));
+}
+
+function getMusicPeopleCaptionIndexPhotoLimit(value) {
+  const number = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isFinite(number)) return 25;
+  return Math.min(50, Math.max(1, number));
+}
+
+function normalizeMusicPeopleCaptionIndexName(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function splitMusicPeopleCaptionIndexTokens(caption) {
+  return String(caption || '')
+    .split(';')
+    .map((part) => String(part || '').trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function getMusicPeopleCaptionIndexAlbumCacheKey(albumId, photoLimit) {
+  return `music_people_caption_index:v1:${albumId}:${photoLimit}`;
+}
+
+function getCachedMusicPeopleCaptionIndexAlbumPhotos(albumId, photoLimit) {
+  const hit = musicPeopleCaptionIndexAlbumCache.get(getMusicPeopleCaptionIndexAlbumCacheKey(albumId, photoLimit));
+  if (!hit) return null;
+  if (Date.now() - hit.fetchedAt > MUSIC_PEOPLE_CAPTION_INDEX_CACHE_TTL_MS) {
+    musicPeopleCaptionIndexAlbumCache.delete(getMusicPeopleCaptionIndexAlbumCacheKey(albumId, photoLimit));
+    return null;
+  }
+  return hit.photos;
+}
+
+function setCachedMusicPeopleCaptionIndexAlbumPhotos(albumId, photoLimit, photos) {
+  musicPeopleCaptionIndexAlbumCache.set(getMusicPeopleCaptionIndexAlbumCacheKey(albumId, photoLimit), {
+    fetchedAt: Date.now(),
+    photos
+  });
+}
+
+function buildMusicPeopleCaptionIndexPhotoRef(album, photo) {
+  const show = album && album.show ? album.show : {};
+  return {
+    album_id: String(album && album.album_id || '').trim() || null,
+    gallery_id: String(album && (album.gallery_id || album.album_id) || '').trim() || null,
+    image_key: String(photo && photo.image_key || '').trim() || null,
+    caption: String(photo && photo.caption || '').trim(),
+    thumbnail_url: String(photo && photo.thumbnail_url || '').trim() || null,
+    show_id: show && show.show_id != null ? String(show.show_id) : null,
+    show_name: String(show && show.name || '').trim() || null,
+    show_date: String(show && (show.show_date || show.date) || '').trim() || null,
+    band: String(album && album.band || '').trim() || null,
+    slot: album && album.slot != null ? toIntegerCount(album.slot) : null
+  };
+}
+
+async function fetchMusicPeopleCaptionIndexAlbumPhotos(albumId, photoLimit, state) {
+  const cleanAlbumId = String(albumId || '').trim();
+  if (!cleanAlbumId) return [];
+  const cached = getCachedMusicPeopleCaptionIndexAlbumPhotos(cleanAlbumId, photoLimit);
+  if (cached) {
+    state.summary.cache_hits += 1;
+    return cached;
+  }
+  state.summary.cache_misses += 1;
+  const endpoint = `/album/${encodeURIComponent(cleanAlbumId)}!images?count=${photoLimit}&start=1&_accept=application/json&_expand=Image`;
+  const json = await fetchSmugJson(endpoint);
+  const photos = getSmugAlbumImages(json).slice(0, photoLimit).map((image) => buildSmugAlbumPhotoItem(image));
+  setCachedMusicPeopleCaptionIndexAlbumPhotos(cleanAlbumId, photoLimit, photos);
+  return photos;
+}
+
+function addMusicPeopleCaptionIndexAlbum(albumMap, show, album, source) {
+  const albumId = getMusicPeopleArchiveAlbumKey(album);
+  if (!albumId || albumMap.has(albumId)) return;
+  albumMap.set(albumId, {
+    album_id: albumId,
+    gallery_id: String(album && (album.gallery_id || album.galleryId || albumId) || '').trim(),
+    band: String(album && album.band || '').trim() || null,
+    slot: album && album.slot != null ? toIntegerCount(album.slot) : null,
+    source,
+    show
+  });
+}
+
+function collectMusicPeopleCaptionIndexAlbums(rows) {
+  const albumMap = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((show) => {
+    const smugAlbums = getMusicDataAuditArray(show && show.smug_albums);
+    smugAlbums.forEach((album) => addMusicPeopleCaptionIndexAlbum(albumMap, show, album, 'smug_albums'));
+    const directAlbumId = String(show && (show.album_id || show.gallery_id) || '').trim();
+    if (directAlbumId && !albumMap.has(directAlbumId)) {
+      albumMap.set(directAlbumId, {
+        album_id: directAlbumId,
+        gallery_id: String(show && (show.gallery_id || directAlbumId) || '').trim(),
+        band: null,
+        slot: null,
+        source: 'music_shows.album_id',
+        show
+      });
+    }
+  });
+  return Array.from(albumMap.values());
+}
+
+function createMusicPeopleCaptionIndexResponseShell(generated, page, limit, albumLimit, photoLimit) {
+  return {
+    ok: true,
+    route: MUSIC_PEOPLE_CAPTION_INDEX_ROUTE,
+    source: 'postgres+smugmug',
+    section: 'music',
+    type: 'people_caption_index_diagnostic',
+    generated,
+    readOnly: true,
+    databaseMutated: false,
+    summary: {
+      database_connected: false,
+      smugmug_configured: false,
+      total_people: 0,
+      total_albums_available: 0,
+      total_albums_inspected: 0,
+      total_photos_inspected: 0,
+      photos_with_captions: 0,
+      caption_tokens_parsed: 0,
+      matched_caption_tokens: 0,
+      unmatched_caption_tokens: 0,
+      people_with_indexed_photo_matches: 0,
+      people_with_zero_matches: 0,
+      duplicate_people_name_keys: 0,
+      scan_limited: false,
+      album_limit: albumLimit,
+      photo_limit: photoLimit,
+      cache_hits: 0,
+      cache_misses: 0,
+      warnings: [],
+      limitations: []
+    },
+    matches: [],
+    unmatched: [],
+    recommendedActions: [
+      'Use this diagnostic to validate semicolon-caption tagging before adding permanent storage.',
+      'Fix unmatched caption tokens in SmugMug captions or Music-People source names; matching is exact normalized name only.',
+      'Increase album_limit/photo_limit carefully for a broader sample, but keep the route diagnostic-only.'
+    ]
+  };
+}
+
+function paginateMusicPeopleCaptionIndex(items, page, limit) {
+  const total = Array.isArray(items) ? items.length : 0;
+  const totalPages = total ? Math.ceil(total / limit) : 0;
+  const safePage = Math.min(Math.max(1, page), Math.max(totalPages, 1));
+  const offset = (safePage - 1) * limit;
+  return {
+    page: safePage,
+    limit,
+    total,
+    totalPages,
+    hasNextPage: safePage < totalPages,
+    hasPrevPage: safePage > 1 && totalPages > 0,
+    items: (Array.isArray(items) ? items : []).slice(offset, offset + limit)
+  };
+}
+
+function finalizeMusicPeopleCaptionIndexResponse(state, page, limit) {
+  const matchItems = Array.from(state.matchMap.values())
+    .map((entry) => ({
+      person_id: entry.person_id,
+      name: entry.name,
+      matched_photo_count: entry.photoKeys.size,
+      matched_caption_token_count: entry.token_count,
+      sample_photo_refs: entry.samples.slice(0, 5),
+      source_albums: Array.from(entry.albumIds).sort()
+    }))
+    .sort((a, b) => b.matched_photo_count - a.matched_photo_count || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  const unmatchedItems = Array.from(state.unmatchedMap.values())
+    .map((entry) => ({
+      token: entry.token,
+      normalized_token: entry.normalized_token,
+      count: entry.count,
+      sample_photo_refs: entry.samples.slice(0, 5),
+      recommended_action: 'Add/confirm a Music-People row or correct the semicolon caption token; matching is exact normalized name only.'
+    }))
+    .sort((a, b) => b.count - a.count || a.token.localeCompare(b.token, undefined, { sensitivity: 'base' }));
+  state.summary.people_with_indexed_photo_matches = matchItems.length;
+  state.summary.people_with_zero_matches = Math.max(0, state.summary.total_people - matchItems.length);
+  const matchesPage = paginateMusicPeopleCaptionIndex(matchItems, page, limit);
+  const unmatchedPage = paginateMusicPeopleCaptionIndex(unmatchedItems, page, limit);
+  return buildAdminResponse({
+    ok: state.ok,
+    route: state.route,
+    source: state.source,
+    section: state.section,
+    type: state.type,
+    generated: state.generated,
+    readOnly: true,
+    databaseMutated: false,
+    summary: state.summary,
+    pagination: {
+      page: matchesPage.page,
+      limit,
+      matches: {
+        total: matchesPage.total,
+        totalPages: matchesPage.totalPages,
+        hasNextPage: matchesPage.hasNextPage,
+        hasPrevPage: matchesPage.hasPrevPage
+      },
+      unmatched: {
+        total: unmatchedPage.total,
+        totalPages: unmatchedPage.totalPages,
+        hasNextPage: unmatchedPage.hasNextPage,
+        hasPrevPage: unmatchedPage.hasPrevPage
+      }
+    },
+    matches: matchesPage.items,
+    unmatched: unmatchedPage.items,
+    recommendedActions: state.recommendedActions
+  });
+}
+
+async function buildMusicPeopleCaptionIndexDiagnosticResponse(query = {}) {
+  const generated = new Date();
+  const page = getPageNumber(query.page);
+  const limit = getMusicPeopleCaptionIndexLimit(query.limit);
+  const albumLimit = getMusicPeopleCaptionIndexAlbumLimit(query.album_limit);
+  const photoLimit = getMusicPeopleCaptionIndexPhotoLimit(query.photo_limit);
+  const state = createMusicPeopleCaptionIndexResponseShell(generated, page, limit, albumLimit, photoLimit);
+  state.matchMap = new Map();
+  state.unmatchedMap = new Map();
+  state.ok = true;
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    state.ok = false;
+    state.summary.limitations.push('DATABASE_URL is not configured; cannot inspect Music People or Music Shows records.');
+    return finalizeMusicPeopleCaptionIndexResponse(state, page, limit);
+  }
+
+  try { await dbPool.query('SELECT 1'); state.summary.database_connected = true; }
+  catch (err) {
+    state.ok = false;
+    state.summary.limitations.push(`Database disconnected: ${getSafeErrorMessage(err)}`);
+    return finalizeMusicPeopleCaptionIndexResponse(state, page, limit);
+  }
+
+  const existingTables = await getExistingPublicTables(['music_people', 'music_shows']);
+  const columnsByTable = await getExistingPublicColumns(['music_people', 'music_shows']);
+  const missingTables = ['music_people', 'music_shows'].filter((table) => !existingTables.has(table));
+  if (missingTables.length) {
+    state.ok = false;
+    state.summary.limitations.push(`Missing required table(s): ${missingTables.join(', ')}.`);
+    return finalizeMusicPeopleCaptionIndexResponse(state, page, limit);
+  }
+  const requiredPeopleColumns = ['person_id', 'name'];
+  const requiredShowColumns = ['show_id', 'name', 'date', 'album_id', 'gallery_id', 'smug_albums'];
+  const missingColumns = [];
+  requiredPeopleColumns.forEach((column) => { if (!hasDiagnosticColumn(columnsByTable, 'music_people', column)) missingColumns.push(`music_people.${column}`); });
+  requiredShowColumns.forEach((column) => { if (!hasDiagnosticColumn(columnsByTable, 'music_shows', column)) missingColumns.push(`music_shows.${column}`); });
+  if (missingColumns.length) {
+    state.ok = false;
+    state.summary.limitations.push(`Missing required column(s): ${missingColumns.join(', ')}.`);
+    return finalizeMusicPeopleCaptionIndexResponse(state, page, limit);
+  }
+
+  const peopleResult = await dbPool.query(`SELECT person_id, name FROM music_people ORDER BY lower(trim(coalesce(name, ''))) ASC, person_id ASC`);
+  const peopleRows = peopleResult.rows || [];
+  state.summary.total_people = peopleRows.length;
+  const peopleByName = new Map();
+  peopleRows.forEach((row) => {
+    const name = String(row.name || '').trim().replace(/\s+/g, ' ');
+    const key = normalizeMusicPeopleCaptionIndexName(name);
+    if (!key) return;
+    if (!peopleByName.has(key)) peopleByName.set(key, []);
+    peopleByName.get(key).push({ person_id: row.person_id == null ? '' : String(row.person_id), name });
+  });
+  state.summary.duplicate_people_name_keys = Array.from(peopleByName.values()).filter((rows) => rows.length > 1).length;
+
+  const showResult = await dbPool.query(`
+    SELECT show_id, name, date, show_date, gallery_id, album_id, smug_albums
+    FROM music_shows
+    WHERE (
+      (jsonb_typeof(smug_albums) = 'array' AND jsonb_array_length(smug_albums) > 0)
+      OR trim(coalesce(album_id, '')) <> ''
+      OR trim(coalesce(gallery_id, '')) <> ''
+    )
+    ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+  `);
+  const albums = collectMusicPeopleCaptionIndexAlbums(showResult.rows || []);
+  state.summary.total_albums_available = albums.length;
+  const sampledAlbums = albums.slice(0, albumLimit);
+  state.summary.total_albums_inspected = sampledAlbums.length;
+  state.summary.scan_limited = albums.length > sampledAlbums.length;
+
+  const smugConfig = getSmugMugConfigDiagnostics();
+  state.summary.smugmug_configured = smugConfig.configured;
+  if (!smugConfig.configured) {
+    state.summary.limitations.push(`SmugMug is not configured; missing ${smugConfig.missing.join(', ')}.`);
+    return finalizeMusicPeopleCaptionIndexResponse(state, page, limit);
+  }
+
+  await mapWithConcurrency(sampledAlbums, SMUG_REQUEST_CONCURRENCY, async (album) => {
+    let photos = [];
+    try { photos = await fetchMusicPeopleCaptionIndexAlbumPhotos(album.album_id, photoLimit, state); }
+    catch (err) {
+      state.summary.warnings.push(`Album ${album.album_id} scan failed: ${getSafeErrorMessage(err)}`);
+      return;
+    }
+    state.summary.total_photos_inspected += photos.length;
+    photos.forEach((photo) => {
+      const caption = String(photo && photo.caption || '').trim();
+      if (!caption) return;
+      state.summary.photos_with_captions += 1;
+      const ref = buildMusicPeopleCaptionIndexPhotoRef(album, photo);
+      splitMusicPeopleCaptionIndexTokens(caption).forEach((token) => {
+        const key = normalizeMusicPeopleCaptionIndexName(token);
+        if (!key) return;
+        state.summary.caption_tokens_parsed += 1;
+        const people = peopleByName.get(key) || [];
+        if (people.length) {
+          state.summary.matched_caption_tokens += 1;
+          people.forEach((person) => {
+            const personKey = person.person_id || person.name;
+            if (!state.matchMap.has(personKey)) {
+              state.matchMap.set(personKey, { person_id: person.person_id, name: person.name, photoKeys: new Set(), token_count: 0, samples: [], albumIds: new Set() });
+            }
+            const entry = state.matchMap.get(personKey);
+            entry.token_count += 1;
+            const photoKey = `${ref.album_id || ''}:${ref.image_key || ''}:${caption}`;
+            entry.photoKeys.add(photoKey);
+            if (entry.samples.length < 5) entry.samples.push(ref);
+            if (ref.album_id) entry.albumIds.add(ref.album_id);
+          });
+        } else {
+          state.summary.unmatched_caption_tokens += 1;
+          if (!state.unmatchedMap.has(key)) state.unmatchedMap.set(key, { token, normalized_token: key, count: 0, samples: [] });
+          const entry = state.unmatchedMap.get(key);
+          entry.count += 1;
+          if (entry.samples.length < 5) entry.samples.push(ref);
+        }
+      });
+    });
+  });
+
+  return finalizeMusicPeopleCaptionIndexResponse(state, page, limit);
+}
+
+async function handleMusicPeopleCaptionIndexDiagnosticRequest(req, res) {
+  try {
+    return res.status(200).json(await buildMusicPeopleCaptionIndexDiagnosticResponse(req.query || {}));
+  } catch (err) {
+    return res.status(500).json(buildAdminError(MUSIC_PEOPLE_CAPTION_INDEX_ROUTE, err, { source: 'postgres+smugmug', section: 'music', type: 'people_caption_index_diagnostic', error: 'MUSIC_PEOPLE_CAPTION_INDEX_ERROR' }));
+  }
 }
 async function buildMusicDiagnosticsResponse() {
   const generated = new Date();
@@ -18893,6 +19258,10 @@ async function handleMusicDiagnosticsSectionRequest(req, res, category) {
   }
 }
 
+app.get('/api/admin/diagnostics/music/people/caption-index', async (req, res) => {
+  return handleMusicPeopleCaptionIndexDiagnosticRequest(req, res);
+});
+
 app.get('/api/admin/diagnostics/music/data-audit', async (req, res) => {
   return handleMusicDataAuditRequest(req, res);
 });
@@ -19175,6 +19544,8 @@ async function startServer() {
 }
 
 startServer();
+
+
 
 
 
