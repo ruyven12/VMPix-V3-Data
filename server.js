@@ -8501,6 +8501,349 @@ function buildMusicVenueDbApiItem(row) {
 }
 
 
+const MUSIC_VENUE_PHOTOS_ROUTE = '/api/music/venues/:venue_id/photos';
+const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v1';
+const MUSIC_VENUE_PHOTOS_CACHE_TTL_MS = 1000 * 60 * 10;
+const musicVenuePhotoAggregationCache = new Map();
+
+function getMusicVenuePhotoLimit(value) {
+  const number = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isFinite(number)) return 24;
+  return Math.min(100, Math.max(1, number));
+}
+
+function getMusicVenuePhotoAlbumLimit(value) {
+  const number = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isFinite(number)) return 25;
+  return Math.min(75, Math.max(1, number));
+}
+
+function getMusicVenuePhotoLimitPerAlbum(value) {
+  const number = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isFinite(number)) return 12;
+  return Math.min(50, Math.max(1, number));
+}
+
+function getMusicVenuePhotoCacheKey(venueId, albumLimit, photoLimitPerAlbum) {
+  return `${MUSIC_VENUE_PHOTOS_CACHE_VERSION}:${normalizeMusicLookupKey(venueId)}:${albumLimit}:${photoLimitPerAlbum}`;
+}
+
+function getCachedMusicVenuePhotoAggregation(cacheKey) {
+  const hit = musicVenuePhotoAggregationCache.get(cacheKey);
+  if (!hit) return null;
+  if (Date.now() - hit.fetchedAt > MUSIC_VENUE_PHOTOS_CACHE_TTL_MS) {
+    musicVenuePhotoAggregationCache.delete(cacheKey);
+    return null;
+  }
+  return hit.payload;
+}
+
+function setCachedMusicVenuePhotoAggregation(cacheKey, payload) {
+  musicVenuePhotoAggregationCache.set(cacheKey, { fetchedAt: Date.now(), payload });
+}
+
+function buildMusicVenuePhotoSlugCandidates(row) {
+  const values = [
+    row && row.venue_key,
+    row && row.venue,
+    [row && row.venue, row && row.city, row && row.state].map((part) => String(part || '').trim()).filter(Boolean).join(' ')
+  ];
+  return new Set(values.map(slugifyMusicBandId).filter(Boolean));
+}
+
+async function findMusicVenueForPhotoAggregation(value) {
+  const requested = String(value || '').trim();
+  const key = normalizeMusicLookupKey(requested);
+  if (!key) return null;
+
+  const exactResult = await dbPool.query(`
+    SELECT venue_id, venue_key, venue, city, state, country, region, status
+    FROM music_venues
+    WHERE lower(trim(coalesce(venue_key, ''))) = $1
+       OR lower(trim(coalesce(venue_id::text, ''))) = $1
+    ORDER BY venue_key ASC NULLS LAST, venue_id ASC
+    LIMIT 1
+  `, [key]);
+  if (exactResult.rows && exactResult.rows[0]) return exactResult.rows[0];
+
+  const slugResult = await dbPool.query(`
+    SELECT venue_id, venue_key, venue, city, state, country, region, status
+    FROM music_venues
+    ORDER BY venue_key ASC NULLS LAST, venue ASC NULLS LAST, venue_id ASC
+  `);
+  const requestedSlug = slugifyMusicBandId(requested);
+  return (slugResult.rows || []).find((row) => buildMusicVenuePhotoSlugCandidates(row).has(requestedSlug)) || null;
+}
+
+function buildMusicVenuePhotoVenuePayload(row) {
+  const venueId = String(row && (row.venue_key || row.venue_id) || '').trim();
+  const venueName = String(row && row.venue || '').trim();
+  return {
+    venue_id: venueId,
+    venue_name: venueName,
+    venue: venueName,
+    slug: slugifyMusicBandId(venueId || venueName),
+    city: String(row && row.city || '').trim(),
+    state: String(row && row.state || '').trim(),
+    country: String(row && row.country || '').trim(),
+    region: String(row && row.region || '').trim(),
+    status: String(row && row.status || '').trim()
+  };
+}
+
+function buildMusicVenuePhotoShowRef(row) {
+  return {
+    show_id: row && row.show_id != null ? toIntegerCount(row.show_id) : null,
+    show_key: String(row && (row.show_url || formatMusicShowUrlDateKey(row.date)) || '').trim() || null,
+    show_title: String(row && row.name || '').trim() || null,
+    show_date: String(row && row.date || '').trim() || null,
+    venue_id: String(row && row.venue_id || '').trim() || null
+  };
+}
+
+function addMusicVenuePhotoAlbum(albumMap, show, albumId, source, extra = {}) {
+  const cleanAlbumId = String(albumId || '').trim();
+  if (!cleanAlbumId) return false;
+  if (albumMap.has(cleanAlbumId)) return true;
+  albumMap.set(cleanAlbumId, {
+    album_id: cleanAlbumId,
+    gallery_id: String(extra.gallery_id || cleanAlbumId).trim(),
+    source,
+    band: String(extra.band || '').trim() || null,
+    slot: extra.slot == null ? null : toIntegerCount(extra.slot),
+    show: buildMusicVenuePhotoShowRef(show)
+  });
+  return true;
+}
+
+function collectMusicVenuePhotoAlbumsFromShows(rows, skippedShows) {
+  const albumMap = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((show) => {
+    let hasUsableAlbum = false;
+    hasUsableAlbum = addMusicVenuePhotoAlbum(albumMap, show, show.album_id, 'music_shows.album_id', { gallery_id: show.gallery_id }) || hasUsableAlbum;
+    hasUsableAlbum = addMusicVenuePhotoAlbum(albumMap, show, show.gallery_id, 'music_shows.gallery_id', { gallery_id: show.gallery_id }) || hasUsableAlbum;
+    getMusicDataAuditArray(show.smug_albums).forEach((album) => {
+      const albumId = getMusicPeopleArchiveAlbumKey(album);
+      hasUsableAlbum = addMusicVenuePhotoAlbum(albumMap, show, albumId, 'music_shows.smug_albums', {
+        gallery_id: album && (album.gallery_id || album.galleryId || albumId),
+        band: album && album.band,
+        slot: album && album.slot
+      }) || hasUsableAlbum;
+    });
+    if (!hasUsableAlbum) {
+      skippedShows.push({
+        show_id: show && show.show_id != null ? toIntegerCount(show.show_id) : null,
+        show_key: String(show && (show.show_url || formatMusicShowUrlDateKey(show.date)) || '').trim() || null,
+        show_title: String(show && show.name || '').trim() || null,
+        show_date: String(show && show.date || '').trim() || null,
+        reason: 'no_usable_album_id'
+      });
+    }
+  });
+  return Array.from(albumMap.values());
+}
+
+function getMusicVenuePhotoSortTime(photo) {
+  const candidates = [photo && photo.date_taken, photo && photo.taken_at, photo && photo.date_time_original, photo && photo.show_date];
+  for (const candidate of candidates) {
+    const parsed = Date.parse(String(candidate || '').trim());
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function buildMusicVenueAggregatedPhoto(album, photo) {
+  const show = album && album.show ? album.show : {};
+  const takenAt = String(photo && photo.date_time_original || '').trim() || null;
+  return {
+    image_key: String(photo && photo.image_key || '').trim() || null,
+    thumbnail_url: String(photo && photo.thumbnail_url || '').trim() || null,
+    small_url: String(photo && photo.small_url || '').trim() || null,
+    medium_url: String(photo && photo.medium_url || '').trim() || null,
+    large_url: String(photo && photo.large_url || '').trim() || null,
+    caption: String(photo && photo.caption || '').trim(),
+    date_taken: takenAt,
+    taken_at: takenAt,
+    date_time_original: takenAt,
+    show_id: show.show_id,
+    show_key: show.show_key,
+    show_title: show.show_title,
+    show_date: show.show_date,
+    album_id: album.album_id,
+    gallery_id: album.gallery_id || album.album_id,
+    band: album.band || null,
+    slot: album.slot
+  };
+}
+
+function getMusicVenueAggregatedPhotoDedupeKey(photo) {
+  return String(photo && (photo.image_key || photo.large_url || photo.medium_url || photo.small_url || photo.thumbnail_url) || '').trim().toLowerCase();
+}
+
+async function fetchMusicVenueAlbumPhotos(album, photoLimitPerAlbum, debug) {
+  const endpoint = `/album/${encodeURIComponent(album.album_id)}!images?count=${photoLimitPerAlbum}&start=1&_accept=application/json&_expand=Image`;
+  const json = await fetchSmugJson(endpoint);
+  const images = getSmugAlbumImages(json).slice(0, photoLimitPerAlbum);
+  const photos = await buildSmugAlbumPhotoItemsForResponse(images, !!debug);
+  return {
+    album_id: album.album_id,
+    endpoint,
+    total: getSmugAlbumPhotosTotal(json, photos.length, 1, hasSmugNextPage(json)),
+    count: photos.length,
+    photos: photos.map((photo) => buildMusicVenueAggregatedPhoto(album, photo))
+  };
+}
+
+async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
+  const generated = new Date();
+  const debug = query.debug === '1';
+  const albumLimit = getMusicVenuePhotoAlbumLimit(query.album_limit);
+  const photoLimitPerAlbum = getMusicVenuePhotoLimitPerAlbum(query.photo_limit_per_album);
+  const venue = buildMusicVenuePhotoVenuePayload(venueRow);
+  const cacheKey = getMusicVenuePhotoCacheKey(venue.venue_id, albumLimit, photoLimitPerAlbum);
+  const cached = debug ? null : getCachedMusicVenuePhotoAggregation(cacheKey);
+  if (cached) return { ...cached, generated, cache: { hit: true, key: cacheKey } };
+
+  const warnings = [];
+  const skippedShows = [];
+  const showResult = await dbPool.query(`
+    SELECT show_id, name, date, show_date, show_url, venue_id, venue, album_id, gallery_id, smug_albums
+    FROM music_shows
+    WHERE lower(trim(coalesce(venue_id, ''))) = lower(trim($1))
+    ORDER BY show_date DESC NULLS LAST, show_id DESC NULLS LAST
+  `, [venue.venue_id]);
+  const linkedShows = showResult.rows || [];
+  const allAlbums = collectMusicVenuePhotoAlbumsFromShows(linkedShows, skippedShows);
+  const albums = allAlbums.slice(0, albumLimit);
+  if (allAlbums.length > albums.length) warnings.push(`Album scan limited to ${albumLimit} of ${allAlbums.length} linked albums.`);
+
+  let perAlbum = [];
+  let photos = [];
+  const smugConfig = getSmugMugConfigDiagnostics();
+  if (!smugConfig.configured) {
+    warnings.push(`SmugMug is not configured; missing ${smugConfig.missing.join(', ')}.`);
+  } else if (albums.length) {
+    perAlbum = await mapWithConcurrency(albums, SMUG_REQUEST_CONCURRENCY, async (album) => {
+      try {
+        return await fetchMusicVenueAlbumPhotos(album, photoLimitPerAlbum, debug);
+      } catch (err) {
+        warnings.push(`Album ${album.album_id} fetch failed: ${getSafeErrorMessage(err)}`);
+        return { album_id: album.album_id, count: 0, total: 0, photos: [], error: getSafeErrorMessage(err) };
+      }
+    });
+    const seen = new Set();
+    perAlbum.forEach((albumResult) => {
+      (albumResult.photos || []).forEach((photo) => {
+        const key = getMusicVenueAggregatedPhotoDedupeKey(photo);
+        if (key && seen.has(key)) return;
+        if (key) seen.add(key);
+        photos.push(photo);
+      });
+    });
+    photos = photos.sort((a, b) => getMusicVenuePhotoSortTime(b) - getMusicVenuePhotoSortTime(a));
+  }
+
+  const payload = {
+    ok: true,
+    route: `/api/music/venues/${encodeURIComponent(venue.venue_id)}/photos`,
+    section: 'music',
+    type: 'venue_photo_aggregation',
+    readOnly: true,
+    databaseMutated: false,
+    venue,
+    summary: {
+      linked_show_count: linkedShows.length,
+      album_count: albums.length,
+      available_album_count: allAlbums.length,
+      photo_count: photos.length,
+      returned_count: 0
+    },
+    allPhotos: photos,
+    warnings,
+    debug: {
+      linked_shows: linkedShows.map(buildMusicVenuePhotoShowRef),
+      skipped_shows: skippedShows,
+      album_ids_used: albums.map((album) => album.album_id),
+      per_album_photo_counts: perAlbum.map((album) => ({ album_id: album.album_id, count: toIntegerCount(album.count), total: album.total == null ? null : toIntegerCount(album.total), error: album.error || null })),
+      cache_key: cacheKey
+    }
+  };
+  if (!debug) setCachedMusicVenuePhotoAggregation(cacheKey, payload);
+  return { ...payload, generated, cache: { hit: false, key: cacheKey } };
+}
+
+function buildMusicVenuePhotoAggregationResponse(payload, query = {}) {
+  const page = getPageNumber(query.page);
+  const limit = getMusicVenuePhotoLimit(query.limit);
+  const photos = Array.isArray(payload.allPhotos) ? payload.allPhotos : [];
+  const total = photos.length;
+  const totalPages = total ? Math.ceil(total / limit) : 0;
+  const safePage = Math.min(Math.max(1, page), Math.max(totalPages, 1));
+  const offset = (safePage - 1) * limit;
+  const returned = photos.slice(offset, offset + limit);
+  const response = buildAdminResponse({
+    ok: true,
+    route: payload.route,
+    section: 'music',
+    type: 'venue_photo_aggregation',
+    generated: payload.generated,
+    readOnly: true,
+    databaseMutated: false,
+    venue: payload.venue,
+    summary: {
+      ...payload.summary,
+      photo_count: total,
+      returned_count: returned.length
+    },
+    pagination: {
+      page: safePage,
+      limit,
+      total,
+      totalPages,
+      has_more: safePage < totalPages,
+      hasNextPage: safePage < totalPages,
+      hasPrevPage: safePage > 1 && totalPages > 0,
+      next_page: safePage < totalPages ? safePage + 1 : null
+    },
+    photos: returned,
+    warnings: payload.warnings || [],
+    cache: payload.cache ? { hit: !!payload.cache.hit } : { hit: false }
+  });
+  if (query.debug === '1') response.debug = payload.debug || {};
+  return response;
+}
+
+async function handleMusicVenuePhotosRequest(req, res) {
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('Missing DATABASE_URL environment variable.');
+    }
+    const venueRow = await findMusicVenueForPhotoAggregation(req.params.venue_id);
+    if (!venueRow) {
+      const generated = new Date();
+      return res.status(404).json(buildAdminResponse({
+        ok: false,
+        route: MUSIC_VENUE_PHOTOS_ROUTE,
+        section: 'music',
+        type: 'venue_photo_aggregation',
+        generated,
+        readOnly: true,
+        databaseMutated: false,
+        error: 'MUSIC_VENUE_NOT_FOUND',
+        message: 'Music venue not found.',
+        venue: { venue_id: String(req.params.venue_id || '').trim(), venue_name: '', slug: slugifyMusicBandId(req.params.venue_id) },
+        summary: { linked_show_count: 0, album_count: 0, photo_count: 0, returned_count: 0 },
+        pagination: { page: getPageNumber(req.query.page), limit: getMusicVenuePhotoLimit(req.query.limit), has_more: false },
+        photos: [],
+        warnings: []
+      }));
+    }
+    const payload = await buildMusicVenuePhotoAggregationPayload(venueRow, req.query || {});
+    return res.json(buildMusicVenuePhotoAggregationResponse(payload, req.query || {}));
+  } catch (err) {
+    return res.status(500).json(buildApiError(MUSIC_VENUE_PHOTOS_ROUTE, err, { source: 'PostgreSQL:music_venues+music_shows', error: 'MUSIC_VENUE_PHOTOS_ERROR' }));
+  }
+}
 const MUSIC_VENUE_GEOCODE_ROUTE = '/admin/enrich/music/venues/geocode';
 const MUSIC_VENUE_GEOCODE_DEFAULT_LIMIT = 5;
 const MUSIC_VENUE_GEOCODE_MAX_LIMIT = 25;
@@ -19473,6 +19816,9 @@ app.get('/api/music/venues/stats', async (req, res) => {
   }
 });
 
+app.get('/api/music/venues/:venue_id/photos', async (req, res) => {
+  return handleMusicVenuePhotosRequest(req, res);
+});
 for (const [routePath, cfg] of Object.entries(ROUTES)) {
   app.get(routePath, async (req, res) => {
     try {
@@ -19544,6 +19890,9 @@ async function startServer() {
 }
 
 startServer();
+
+
+
 
 
 
