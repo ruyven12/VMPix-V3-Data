@@ -3600,6 +3600,20 @@ function parseMusicShowDate(value) {
   };
 }
 
+function formatMusicShowUrlDateKey(value) {
+  const parsed = parseMusicShowDate(value);
+  if (!parsed || !parsed.iso) return '';
+
+  const [year, month, day] = parsed.iso.split('-');
+  if (!year || !month || !day) return '';
+  return `${month}${day}${year.slice(-2)}`;
+}
+
+function buildMusicShowFallbackShowUrl(row) {
+  const dateKey = formatMusicShowUrlDateKey(row && row.date);
+  const showSlug = slugifyMusicBandId(row && row.name);
+  return dateKey && showSlug ? `${dateKey}-${showSlug}` : null;
+}
 function hasMusicShowImportData(row) {
   if (['name', 'venue_id', 'venue', 'city', 'state', 'date', 'show_url', 'poster', 'notes', 'camera_1', 'camera_2'].some((key) => toDbText(row[key]))) {
     return true;
@@ -3642,6 +3656,7 @@ function buildMusicShowImportBands(row, bandCounts) {
 function buildMusicShowDbRow(row, showId, bandCounts) {
   const parsedDate = parseMusicShowDate(row.date);
   const bands = buildMusicShowImportBands(row, bandCounts);
+  const showUrl = toDbText(row.show_url) || buildMusicShowFallbackShowUrl(row);
 
   return {
     show_id: showId,
@@ -3653,7 +3668,7 @@ function buildMusicShowDbRow(row, showId, bandCounts) {
     date: toDbText(row.date),
     show_date: parsedDate ? parsedDate.iso : null,
     poster: toDbText(row.poster),
-    show_url: toDbText(row.show_url),
+    show_url: showUrl,
     notes: toDbText(row.notes),
     camera_1: toDbText(row.camera_1),
     camera_2: toDbText(row.camera_2),
