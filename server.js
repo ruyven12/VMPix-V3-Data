@@ -3314,6 +3314,40 @@ function slugifyMusicBandId(value) {
     .replace(/^-+|-+$/g, '');
 }
 
+function isValidMusicBandName(value) {
+  const clean = String(value || '').trim();
+  if (!clean) return false;
+  if (/^[0-9]+$/.test(clean)) return false;
+
+  const normalized = normalizeImportHeaderKey(clean);
+  const invalidNames = new Set([
+    'archived_sets',
+    'total_sets',
+    'photo_count',
+    'photocount',
+    'total_photos',
+    'totalphotos',
+    'band_id',
+    'bandid',
+    'band',
+    'name',
+    'region',
+    'smug_folder',
+    'slug_folder',
+    'logo_url',
+    'status',
+    'notes',
+    'members',
+    'past_members',
+    'tags',
+    'location',
+    'state',
+    'country'
+  ]);
+
+  return !invalidNames.has(normalized);
+}
+
 function parseMusicBandImportPersonnel(value) {
   return String(value || '')
     .split(';')
@@ -3482,6 +3516,7 @@ async function importMusicBandsToDatabase(forceRefresh) {
     skipped: 0,
     skippedMissingBand: 0,
     skippedMissingBandId: 0,
+    skippedInvalidBand: 0,
     generatedBandIds: 0
   };
 
@@ -3492,6 +3527,12 @@ async function importMusicBandsToDatabase(forceRefresh) {
       if (!item.band) {
         result.skipped += 1;
         result.skippedMissingBand += 1;
+        continue;
+      }
+
+      if (!isValidMusicBandName(item.band)) {
+        result.skipped += 1;
+        result.skippedInvalidBand += 1;
         continue;
       }
 
@@ -3611,9 +3652,9 @@ function formatMusicShowUrlDateKey(value) {
 
 function buildMusicShowFallbackShowUrl(row) {
   const dateKey = formatMusicShowUrlDateKey(row && row.date);
-  const showSlug = slugifyMusicBandId(row && row.name);
-  return dateKey && showSlug ? `${dateKey}-${showSlug}` : null;
+  return dateKey || null;
 }
+
 function hasMusicShowImportData(row) {
   if (['name', 'venue_id', 'venue', 'city', 'state', 'date', 'show_url', 'poster', 'notes', 'camera_1', 'camera_2'].some((key) => toDbText(row[key]))) {
     return true;
