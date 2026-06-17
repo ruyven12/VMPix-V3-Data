@@ -8502,7 +8502,7 @@ function buildMusicVenueDbApiItem(row) {
 
 
 const MUSIC_VENUE_PHOTOS_ROUTE = '/api/music/venues/:venue_id/photos';
-const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v1';
+const MUSIC_VENUE_PHOTOS_CACHE_VERSION = 'music_venue_photos:v2';
 const MUSIC_VENUE_PHOTOS_CACHE_TTL_MS = 1000 * 60 * 10;
 const musicVenuePhotoAggregationCache = new Map();
 
@@ -8557,7 +8557,7 @@ async function findMusicVenueForPhotoAggregation(value) {
   if (!key) return null;
 
   const exactResult = await dbPool.query(`
-    SELECT venue_id, venue_key, venue, city, state, country, region, status
+    SELECT venue_id, venue_key, venue, city, state, country, region, status, stats
     FROM music_venues
     WHERE lower(trim(coalesce(venue_key, ''))) = $1
        OR lower(trim(coalesce(venue_id::text, ''))) = $1
@@ -8567,7 +8567,7 @@ async function findMusicVenueForPhotoAggregation(value) {
   if (exactResult.rows && exactResult.rows[0]) return exactResult.rows[0];
 
   const slugResult = await dbPool.query(`
-    SELECT venue_id, venue_key, venue, city, state, country, region, status
+    SELECT venue_id, venue_key, venue, city, state, country, region, status, stats
     FROM music_venues
     ORDER BY venue_key ASC NULLS LAST, venue ASC NULLS LAST, venue_id ASC
   `);
@@ -8589,6 +8589,13 @@ function buildMusicVenuePhotoVenuePayload(row) {
     region: String(row && row.region || '').trim(),
     status: String(row && row.status || '').trim()
   };
+}
+
+function getMusicVenueOfficialPhotoTotal(row) {
+  const stats = row && row.stats && typeof row.stats === 'object' && !Array.isArray(row.stats)
+    ? row.stats
+    : getMusicDataAuditObject(row && row.stats);
+  return getMusicStatsNumber(stats, ['totalPhotos', 'photo_count', 'photoCount', 'photosTotal', 'total_photos']);
 }
 
 function buildMusicVenuePhotoShowRef(row) {
@@ -8700,6 +8707,7 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
   const albumLimit = getMusicVenuePhotoAlbumLimit(query.album_limit);
   const photoLimitPerAlbum = getMusicVenuePhotoLimitPerAlbum(query.photo_limit_per_album);
   const venue = buildMusicVenuePhotoVenuePayload(venueRow);
+  const venueTotalPhotos = getMusicVenueOfficialPhotoTotal(venueRow);
   const cacheKey = getMusicVenuePhotoCacheKey(venue.venue_id, albumLimit, photoLimitPerAlbum);
   const cached = debug ? null : getCachedMusicVenuePhotoAggregation(cacheKey);
   if (cached) return { ...cached, generated, cache: { hit: true, key: cacheKey } };
@@ -8743,6 +8751,11 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
     photos = photos.sort((a, b) => getMusicVenuePhotoSortTime(b) - getMusicVenuePhotoSortTime(a));
   }
 
+  const aggregatedPhotoCount = photos.length;
+  if (venueTotalPhotos > aggregatedPhotoCount) {
+    warnings.push('Aggregated photo count is lower than the official venue total; this route is limited by linked show albums, album_limit/photo_limit_per_album, and de-dupe. It does not replace venue_total_photos.');
+  }
+
   const payload = {
     ok: true,
     route: `/api/music/venues/${encodeURIComponent(venue.venue_id)}/photos`,
@@ -8755,7 +8768,9 @@ async function buildMusicVenuePhotoAggregationPayload(venueRow, query = {}) {
       linked_show_count: linkedShows.length,
       album_count: albums.length,
       available_album_count: allAlbums.length,
-      photo_count: photos.length,
+      venue_total_photos: venueTotalPhotos,
+      aggregated_photo_count: aggregatedPhotoCount,
+      photo_count: aggregatedPhotoCount,
       returned_count: 0
     },
     allPhotos: photos,
@@ -8792,6 +8807,8 @@ function buildMusicVenuePhotoAggregationResponse(payload, query = {}) {
     venue: payload.venue,
     summary: {
       ...payload.summary,
+      venue_total_photos: toIntegerCount(payload.summary && payload.summary.venue_total_photos),
+      aggregated_photo_count: total,
       photo_count: total,
       returned_count: returned.length
     },
@@ -8832,7 +8849,7 @@ async function handleMusicVenuePhotosRequest(req, res) {
         error: 'MUSIC_VENUE_NOT_FOUND',
         message: 'Music venue not found.',
         venue: { venue_id: String(req.params.venue_id || '').trim(), venue_name: '', slug: slugifyMusicBandId(req.params.venue_id) },
-        summary: { linked_show_count: 0, album_count: 0, photo_count: 0, returned_count: 0 },
+        summary: { linked_show_count: 0, album_count: 0, available_album_count: 0, venue_total_photos: 0, aggregated_photo_count: 0, photo_count: 0, returned_count: 0 },
         pagination: { page: getPageNumber(req.query.page), limit: getMusicVenuePhotoLimit(req.query.limit), has_more: false },
         photos: [],
         warnings: []
@@ -19890,6 +19907,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
