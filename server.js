@@ -13308,6 +13308,445 @@ async function handleMusicSmugMugHealthRequest(req, res) {
     }));
   }
 }
+const MUSIC_SMUGMUG_EXCEPTIONS_ROUTE = '/api/admin/diagnostics/music/smugmug/exceptions';
+
+function getMusicSmugMugExceptionLimit(value, fallback, max) {
+  return getMusicSmugMugHealthLimit(value, fallback, max);
+}
+
+function buildMusicSmugMugExceptionShowRef(row) {
+  const bands = getMusicDataAuditArray(row && row.bands)
+    .map((band) => {
+      if (typeof band === 'string') return band.trim();
+      return String(band && (band.band || band.name || band.band_name || '') || '').trim();
+    })
+    .filter(Boolean);
+  return {
+    show_id: row && row.show_id != null ? row.show_id : null,
+    show_key: String(row && (row.show_url || formatMusicShowUrlDateKey(row.date) || row.show_id || '') || '').trim() || null,
+    name: String(row && row.name || '').trim(),
+    date: String(row && row.date || '').trim(),
+    venue_id: String(row && row.venue_id || '').trim() || null,
+    bands,
+    album_id: String(row && row.album_id || '').trim() || null,
+    gallery_id: String(row && row.gallery_id || '').trim() || null,
+    smug_sync_status: String(row && row.smug_sync_status || '').trim() || null
+  };
+}
+
+function getMusicSmugMugExceptionAlbumRefsFromRow(row) {
+  const refs = [];
+  const add = (value, source) => {
+    const clean = String(value || '').trim();
+    if (clean) refs.push({ album_id: clean, source });
+  };
+  add(row && row.album_id, 'album_id');
+  add(row && row.gallery_id, 'gallery_id');
+  const albums = Array.isArray(row && row.smug_albums) ? row.smug_albums : getMusicDataAuditArray(row && row.smug_albums);
+  albums.forEach((album, index) => add(getMusicPeopleArchiveAlbumKey(album), `smug_albums[${index}]`));
+  return refs;
+}
+
+function isMusicSmugMugExceptionAlbumIdSuspicious(value) {
+  const clean = String(value || '').trim();
+  if (!clean) return false;
+  if (/^https?:\/\//i.test(clean)) return true;
+  if (/[\s\/\\]/.test(clean)) return true;
+  return !/^[A-Za-z0-9_-]+$/.test(clean);
+}
+
+function buildMusicSmugMugSuspiciousAlbumReason(row) {
+  const reasons = [];
+  const refs = getMusicSmugMugExceptionAlbumRefsFromRow(row);
+  refs.forEach((ref) => {
+    if (isMusicSmugMugExceptionAlbumIdSuspicious(ref.album_id)) reasons.push(`${ref.source} has suspicious album id format`);
+  });
+
+  if (row && Object.prototype.hasOwnProperty.call(row, 'smug_albums')) {
+    const rawAlbums = row.smug_albums;
+    if (rawAlbums != null && !Array.isArray(rawAlbums)) reasons.push('smug_albums is not an array');
+    if (Array.isArray(rawAlbums)) {
+      const status = String(row.smug_sync_status || '').trim().toLowerCase();
+      if (rawAlbums.length === 0 && !String(row.album_id || row.gallery_id || '').trim() && ['resolved', 'partial', 'synced'].includes(status)) {
+        reasons.push('smug_albums is empty while show is marked synced/resolved');
+      }
+      rawAlbums.forEach((album, index) => {
+        if (!album || typeof album !== 'object' || Array.isArray(album)) reasons.push(`smug_albums[${index}] is not an object`);
+        else {
+          const albumKey = getMusicPeopleArchiveAlbumKey(album);
+          if (!albumKey) reasons.push(`smug_albums[${index}] has no album_id/gallery_id`);
+          else if (isMusicSmugMugExceptionAlbumIdSuspicious(albumKey)) reasons.push(`smug_albums[${index}] has suspicious album id format`);
+        }
+      });
+    }
+  }
+
+  const seen = new Map();
+  refs.forEach((ref) => {
+    const key = ref.album_id.toLowerCase();
+    if (!seen.has(key)) seen.set(key, []);
+    seen.get(key).push(ref.source);
+  });
+  seen.forEach((sources, key) => {
+    if (sources.length > 1) reasons.push(`duplicate album id ${key} appears in ${sources.join(', ')}`);
+  });
+
+  return Array.from(new Set(reasons));
+}
+
+function normalizeMusicSmugMugExceptionName(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function buildMusicSmugMugExceptionResponseShell(generated, limits) {
+  return buildAdminResponse({
+    route: MUSIC_SMUGMUG_EXCEPTIONS_ROUTE,
+    generated,
+    source: 'postgres+smugmug',
+    section: 'music',
+    type: 'smugmug_relationship_exceptions',
+    readOnly: true,
+    databaseMutated: false,
+    summary: {
+      shows_missing_album_links: 0,
+      shows_with_suspicious_album_fields: 0,
+      venues_with_no_linked_shows: 0,
+      venues_with_linked_shows_but_no_album_ids: 0,
+      shows_with_unresolved_venue_refs: 0,
+      unmatched_caption_token_count: 0,
+      duplicate_people_name_count: 0,
+      duplicate_venue_key_count: 0,
+      duplicate_album_id_warning_count: 0
+    },
+    exceptions: {
+      shows_missing_album_links: [],
+      shows_with_suspicious_album_fields: [],
+      venues_with_no_linked_shows: [],
+      venues_with_linked_shows_but_no_album_ids: [],
+      shows_with_unresolved_venue_refs: [],
+      people_caption_unmatched_tokens: [],
+      duplicate_people_names: [],
+      duplicate_venue_keys: [],
+      duplicate_album_id_warnings: []
+    },
+    warnings: [],
+    limits
+  });
+}
+
+async function buildMusicSmugMugExceptionsResponse(query = {}) {
+  const generated = new Date();
+  const showLimit = getMusicSmugMugExceptionLimit(query.show_limit, 100, 500);
+  const venueLimit = getMusicSmugMugExceptionLimit(query.venue_limit, 100, 500);
+  const albumLimit = getMusicSmugMugExceptionLimit(query.album_limit, 25, 75);
+  const photoLimit = getMusicSmugMugExceptionLimit(query.photo_limit, 25, 50);
+  const tokenLimit = getMusicSmugMugExceptionLimit(query.token_limit, 100, 500);
+  const debug = query.debug === '1' || query.debug === 'true';
+  const limits = { show_limit: showLimit, venue_limit: venueLimit, album_limit: albumLimit, photo_limit: photoLimit, token_limit: tokenLimit, debug };
+  const response = buildMusicSmugMugExceptionResponseShell(generated, limits);
+  const warnings = response.warnings;
+  const smugConfig = getSmugMugConfigDiagnostics();
+
+  if (!smugConfig.configured) warnings.push(`SmugMug is not configured; caption exception sampling is limited. Missing ${smugConfig.missing.join(', ')}.`);
+  (smugConfig.warnings || []).forEach((warning) => warnings.push(`SmugMug: ${warning}`));
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    response.ok = false;
+    warnings.push('DATABASE_URL is not configured; Music SmugMug relationship exceptions could not be checked.');
+    return response;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+  } catch (err) {
+    response.ok = false;
+    warnings.push(`Database disconnected: ${getSafeErrorMessage(err)}`);
+    return response;
+  }
+
+  try {
+    const tableNames = ['music_shows', 'music_people', 'music_venues'];
+    const existingTables = await getExistingPublicTables(tableNames);
+    const columnsByTable = await getExistingPublicColumns(tableNames);
+    const showColumns = getSmugMusicTableColumns(columnsByTable, 'music_shows');
+    const peopleColumns = getSmugMusicTableColumns(columnsByTable, 'music_people');
+    const venueColumns = getSmugMusicTableColumns(columnsByTable, 'music_venues');
+
+    if (!existingTables.has('music_shows')) {
+      warnings.push('Missing table: music_shows');
+    } else {
+      const albumLinkCondition = buildMusicSmugMugHealthAlbumLinkCondition(showColumns);
+      const showSelect = [
+        buildMusicSmugMugHealthShowSelect(showColumns),
+        showColumns.has('show_url') ? 'show_url' : 'NULL AS show_url',
+        showColumns.has('bands') ? 'bands' : "'[]'::jsonb AS bands",
+        showColumns.has('smug_albums') ? 'smug_albums' : "'[]'::jsonb AS smug_albums",
+        showColumns.has('photo_count') ? 'photo_count' : '0::int AS photo_count'
+      ].join(', ');
+      const showOrderBy = getMusicSmugMugHealthShowOrderBy(showColumns);
+      const missingCountResult = await dbPool.query(`SELECT count(*)::int AS count FROM music_shows WHERE NOT ${albumLinkCondition}`);
+      response.summary.shows_missing_album_links = toIntegerCount(missingCountResult.rows && missingCountResult.rows[0] && missingCountResult.rows[0].count);
+      const missingRows = await dbPool.query(`
+        SELECT ${showSelect}
+        FROM music_shows
+        WHERE NOT ${albumLinkCondition}
+        ORDER BY ${showOrderBy}
+        LIMIT $1
+      `, [showLimit]);
+      response.exceptions.shows_missing_album_links = diagnosticRows(missingRows).map((row) => ({
+        ...buildMusicSmugMugExceptionShowRef(row),
+        reason: 'No usable album_id, gallery_id, or smug_albums entry.'
+      }));
+      if (response.summary.shows_missing_album_links > response.exceptions.shows_missing_album_links.length) warnings.push('show_limit reached; shows_missing_album_links results are sampled.');
+
+      const candidateRows = await dbPool.query(`
+        SELECT ${showSelect}
+        FROM music_shows
+        WHERE ${albumLinkCondition}
+           OR ${showColumns.has('smug_albums') ? 'smug_albums IS NOT NULL' : 'false'}
+           OR ${showColumns.has('smug_sync_status') ? "trim(coalesce(smug_sync_status, '')) <> ''" : 'false'}
+        ORDER BY ${showOrderBy}
+        LIMIT $1
+      `, [showLimit]);
+      response.exceptions.shows_with_suspicious_album_fields = diagnosticRows(candidateRows)
+        .map((row) => {
+          const reasons = buildMusicSmugMugSuspiciousAlbumReason(row);
+          return reasons.length ? { ...buildMusicSmugMugExceptionShowRef(row), reasons, reason: reasons.join('; ') } : null;
+        })
+        .filter(Boolean);
+      response.summary.shows_with_suspicious_album_fields = response.exceptions.shows_with_suspicious_album_fields.length;
+      if (response.exceptions.shows_with_suspicious_album_fields.length >= showLimit) warnings.push('show_limit reached; suspicious album field results may be sampled.');
+
+      const albumRefParts = [];
+      const showRefSql = [
+        showColumns.has('show_id') ? 'show_id::text' : 'NULL::text',
+        showColumns.has('name') ? 'name' : 'NULL::text',
+        showColumns.has('date') ? 'date' : 'NULL::text'
+      ];
+      if (showColumns.has('album_id')) {
+        albumRefParts.push(`SELECT ${showRefSql[0]} AS show_id, ${showRefSql[1]} AS name, ${showRefSql[2]} AS date, trim(album_id) AS album_id, 'album_id' AS source FROM music_shows WHERE trim(coalesce(album_id, '')) <> ''`);
+      }
+      if (showColumns.has('gallery_id')) {
+        albumRefParts.push(`SELECT ${showRefSql[0]} AS show_id, ${showRefSql[1]} AS name, ${showRefSql[2]} AS date, trim(gallery_id) AS album_id, 'gallery_id' AS source FROM music_shows WHERE trim(coalesce(gallery_id, '')) <> ''`);
+      }
+      if (showColumns.has('smug_albums')) {
+        albumRefParts.push(`SELECT ${showRefSql[0]} AS show_id, ${showRefSql[1]} AS name, ${showRefSql[2]} AS date, trim(coalesce(album->>'album_id', album->>'albumId', album->>'gallery_id', album->>'galleryId', '')) AS album_id, 'smug_albums' AS source FROM music_shows CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(smug_albums) = 'array' THEN smug_albums ELSE '[]'::jsonb END) album`);
+      }
+      if (albumRefParts.length) {
+        const duplicateAlbumRows = await dbPool.query(`
+          WITH album_refs AS (${albumRefParts.join(' UNION ALL ')}),
+          clean_refs AS (
+            SELECT album_id, source, show_id, name, date, coalesce(show_id, name || '|' || date, album_id) AS show_ref
+            FROM album_refs
+            WHERE trim(coalesce(album_id, '')) <> ''
+          )
+          SELECT album_id,
+                 count(DISTINCT show_ref)::int AS show_count,
+                 jsonb_agg(jsonb_build_object('show_id', show_id, 'name', name, 'date', date, 'source', source) ORDER BY date DESC NULLS LAST, show_id DESC NULLS LAST) AS shows
+          FROM clean_refs
+          GROUP BY album_id
+          HAVING count(DISTINCT show_ref) > 1
+          ORDER BY show_count DESC, album_id ASC
+          LIMIT $1
+        `, [Math.min(tokenLimit, 500)]);
+        response.exceptions.duplicate_album_id_warnings = diagnosticRows(duplicateAlbumRows).map((row) => ({
+          album_id: row.album_id,
+          show_count: toIntegerCount(row.show_count),
+          shows: Array.isArray(row.shows) ? row.shows.slice(0, 10) : [],
+          reason: 'Album ID appears on more than one Music Show. This may be valid for shared/multi-band albums, so it is a warning only.'
+        }));
+        response.summary.duplicate_album_id_warning_count = response.exceptions.duplicate_album_id_warnings.length;
+        if (response.exceptions.duplicate_album_id_warnings.length >= Math.min(tokenLimit, 500)) warnings.push('token_limit reached; duplicate album ID warnings are sampled.');
+      }
+    }
+
+    if (existingTables.has('music_venues')) {
+      if (existingTables.has('music_shows') && venueColumns.has('venue_key') && showColumns.has('venue_id')) {
+        const albumLinkCondition = buildMusicSmugMugHealthAlbumLinkCondition(showColumns, 'ms');
+        const noLinkedCount = await dbPool.query(`
+          SELECT count(*)::int AS count FROM (
+            SELECT mv.venue_key
+            FROM music_venues mv
+            LEFT JOIN music_shows ms ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+            WHERE trim(coalesce(mv.venue_key, '')) <> ''
+            GROUP BY mv.venue_key
+            HAVING count(ms.*) = 0
+          ) rows
+        `);
+        response.summary.venues_with_no_linked_shows = toIntegerCount(noLinkedCount.rows && noLinkedCount.rows[0] && noLinkedCount.rows[0].count);
+        const noLinkedRows = await dbPool.query(`
+          SELECT mv.venue_key AS venue_id, mv.venue AS venue_name, 0::int AS linked_show_count, 0::int AS usable_album_count
+          FROM music_venues mv
+          LEFT JOIN music_shows ms ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+          WHERE trim(coalesce(mv.venue_key, '')) <> ''
+          GROUP BY mv.venue_key, mv.venue
+          HAVING count(ms.*) = 0
+          ORDER BY mv.venue ASC NULLS LAST, mv.venue_key ASC
+          LIMIT $1
+        `, [venueLimit]);
+        response.exceptions.venues_with_no_linked_shows = diagnosticRows(noLinkedRows).map((row) => ({ ...row, reason: 'Venue has no linked Music Shows by venue_id.' }));
+        if (response.summary.venues_with_no_linked_shows > response.exceptions.venues_with_no_linked_shows.length) warnings.push('venue_limit reached; venues_with_no_linked_shows results are sampled.');
+
+        const linkedNoAlbumsCount = await dbPool.query(`
+          SELECT count(*)::int AS count FROM (
+            SELECT mv.venue_key
+            FROM music_venues mv
+            JOIN music_shows ms ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+            WHERE trim(coalesce(mv.venue_key, '')) <> ''
+            GROUP BY mv.venue_key
+            HAVING count(ms.*) > 0 AND count(*) FILTER (WHERE ${albumLinkCondition}) = 0
+          ) rows
+        `);
+        response.summary.venues_with_linked_shows_but_no_album_ids = toIntegerCount(linkedNoAlbumsCount.rows && linkedNoAlbumsCount.rows[0] && linkedNoAlbumsCount.rows[0].count);
+        const linkedNoAlbumsRows = await dbPool.query(`
+          SELECT mv.venue_key AS venue_id, mv.venue AS venue_name, count(ms.*)::int AS linked_show_count, count(*) FILTER (WHERE ${albumLinkCondition})::int AS usable_album_count
+          FROM music_venues mv
+          JOIN music_shows ms ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+          WHERE trim(coalesce(mv.venue_key, '')) <> ''
+          GROUP BY mv.venue_key, mv.venue
+          HAVING count(ms.*) > 0 AND count(*) FILTER (WHERE ${albumLinkCondition}) = 0
+          ORDER BY linked_show_count DESC, mv.venue ASC NULLS LAST
+          LIMIT $1
+        `, [venueLimit]);
+        response.exceptions.venues_with_linked_shows_but_no_album_ids = diagnosticRows(linkedNoAlbumsRows).map((row) => ({ ...row, reason: 'Venue has linked Music Shows, but none have usable album_id/gallery_id/smug_albums.' }));
+        if (response.summary.venues_with_linked_shows_but_no_album_ids > response.exceptions.venues_with_linked_shows_but_no_album_ids.length) warnings.push('venue_limit reached; venues_with_linked_shows_but_no_album_ids results are sampled.');
+
+        const unresolvedVenueCount = await dbPool.query(`
+          SELECT count(*)::int AS count
+          FROM music_shows ms
+          LEFT JOIN music_venues mv ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+          WHERE trim(coalesce(ms.venue_id, '')) <> ''
+            AND mv.venue_key IS NULL
+        `);
+        response.summary.shows_with_unresolved_venue_refs = toIntegerCount(unresolvedVenueCount.rows && unresolvedVenueCount.rows[0] && unresolvedVenueCount.rows[0].count);
+        const unresolvedVenueRows = await dbPool.query(`
+          SELECT ${buildMusicSmugMugHealthShowSelect(showColumns, 'ms')}, ${showColumns.has('show_url') ? 'ms.show_url AS show_url' : 'NULL AS show_url'}, ${showColumns.has('bands') ? 'ms.bands AS bands' : "'[]'::jsonb AS bands"}
+          FROM music_shows ms
+          LEFT JOIN music_venues mv ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+          WHERE trim(coalesce(ms.venue_id, '')) <> ''
+            AND mv.venue_key IS NULL
+          ORDER BY ${getMusicSmugMugHealthShowOrderBy(showColumns, 'ms')}
+          LIMIT $1
+        `, [showLimit]);
+        response.exceptions.shows_with_unresolved_venue_refs = diagnosticRows(unresolvedVenueRows).map((row) => ({
+          ...buildMusicSmugMugExceptionShowRef(row),
+          reason: 'Show venue_id does not resolve to music_venues.venue_key.'
+        }));
+        if (response.summary.shows_with_unresolved_venue_refs > response.exceptions.shows_with_unresolved_venue_refs.length) warnings.push('show_limit reached; shows_with_unresolved_venue_refs results are sampled.');
+      } else {
+        warnings.push('Venue relationship exceptions skipped; missing music_shows.venue_id or music_venues.venue_key.');
+      }
+
+      if (venueColumns.has('venue_key')) {
+        const duplicateVenueRows = await dbPool.query(`
+          SELECT lower(trim(coalesce(venue_key, ''))) AS normalized_key,
+                 count(*)::int AS count,
+                 jsonb_agg(jsonb_build_object('venue_id', venue_id, 'venue_key', venue_key, 'venue', venue) ORDER BY venue ASC NULLS LAST) AS records
+          FROM music_venues
+          WHERE trim(coalesce(venue_key, '')) <> ''
+          GROUP BY lower(trim(coalesce(venue_key, '')))
+          HAVING count(*) > 1
+          ORDER BY count DESC, normalized_key ASC
+          LIMIT $1
+        `, [Math.min(tokenLimit, 500)]);
+        const duplicateVenueKeyItems = diagnosticRows(duplicateVenueRows).map((row) => ({
+          normalized_key: row.normalized_key,
+          count: toIntegerCount(row.count),
+          records: Array.isArray(row.records) ? row.records.slice(0, 10) : [],
+          reason: 'Duplicate normalized music_venues.venue_key.'
+        }));
+
+        const slugRowsResult = await dbPool.query(`SELECT venue_id, venue_key, venue FROM music_venues ORDER BY venue ASC NULLS LAST LIMIT $1`, [Math.max(venueLimit * 5, venueLimit)]);
+        const slugMap = new Map();
+        diagnosticRows(slugRowsResult).forEach((row) => {
+          const slug = slugifyMusicBandId(row.venue_key || row.venue || '');
+          if (!slug) return;
+          if (!slugMap.has(slug)) slugMap.set(slug, []);
+          slugMap.get(slug).push({ venue_id: row.venue_id, venue_key: row.venue_key, venue: row.venue });
+        });
+        const duplicateSlugItems = Array.from(slugMap.entries())
+          .filter(([, rows]) => rows.length > 1)
+          .slice(0, Math.min(tokenLimit, 500))
+          .map(([slug, rows]) => ({ normalized_key: slug, count: rows.length, records: rows.slice(0, 10), reason: 'Duplicate normalized Music venue slug candidate.' }));
+        response.exceptions.duplicate_venue_keys = duplicateVenueKeyItems.concat(duplicateSlugItems);
+        response.summary.duplicate_venue_key_count = response.exceptions.duplicate_venue_keys.length;
+        if (response.exceptions.duplicate_venue_keys.length >= Math.min(tokenLimit, 500)) warnings.push('token_limit reached; duplicate venue key/slug warnings are sampled.');
+      } else {
+        warnings.push('Duplicate venue key diagnostics skipped; missing music_venues.venue_key.');
+      }
+    } else {
+      warnings.push('Missing table: music_venues');
+    }
+
+    if (existingTables.has('music_people')) {
+      if (peopleColumns.has('name')) {
+        const personIdExpr = peopleColumns.has('person_id') ? 'person_id' : 'NULL';
+        const duplicatePeopleRows = await dbPool.query(`
+          SELECT lower(regexp_replace(trim(coalesce(name, '')), '\\s+', ' ', 'g')) AS normalized_name,
+                 count(*)::int AS count,
+                 jsonb_agg(jsonb_build_object('person_id', ${personIdExpr}, 'name', name) ORDER BY name ASC) AS records
+          FROM music_people
+          WHERE trim(coalesce(name, '')) <> ''
+          GROUP BY lower(regexp_replace(trim(coalesce(name, '')), '\\s+', ' ', 'g'))
+          HAVING count(*) > 1
+          ORDER BY count DESC, normalized_name ASC
+          LIMIT $1
+        `, [Math.min(tokenLimit, 500)]);
+        response.exceptions.duplicate_people_names = diagnosticRows(duplicatePeopleRows).map((row) => ({
+          normalized_name: row.normalized_name,
+          count: toIntegerCount(row.count),
+          records: Array.isArray(row.records) ? row.records.slice(0, 10) : [],
+          reason: 'Duplicate normalized Music People name.'
+        }));
+        response.summary.duplicate_people_name_count = response.exceptions.duplicate_people_names.length;
+        if (response.exceptions.duplicate_people_names.length >= Math.min(tokenLimit, 500)) warnings.push('token_limit reached; duplicate people name warnings are sampled.');
+      } else {
+        warnings.push('Duplicate people name diagnostics skipped; missing music_people.name.');
+      }
+    } else {
+      warnings.push('Missing table: music_people');
+    }
+
+    try {
+      const captionResponse = await buildMusicPeopleCaptionIndexDiagnosticResponse({
+        page: 1,
+        limit: Math.min(tokenLimit, 100),
+        album_limit: albumLimit,
+        photo_limit: photoLimit
+      });
+      const captionSummary = captionResponse.summary || {};
+      response.summary.unmatched_caption_token_count = toIntegerCount(captionSummary.unmatched_caption_tokens);
+      response.exceptions.people_caption_unmatched_tokens = Array.isArray(captionResponse.unmatched)
+        ? captionResponse.unmatched.slice(0, Math.min(tokenLimit, 500))
+        : [];
+      if (captionSummary.scan_limited) warnings.push('album_limit reached; people caption unmatched-token results are sampled.');
+      (captionSummary.warnings || []).forEach((warning) => warnings.push(`Caption index: ${warning}`));
+      (captionSummary.limitations || []).forEach((warning) => warnings.push(`Caption index: ${warning}`));
+    } catch (err) {
+      warnings.push(`Unable to sample Music People caption exceptions: ${getSafeErrorMessage(err)}`);
+    }
+  } catch (err) {
+    response.ok = false;
+    warnings.push(`Unable to build Music SmugMug relationship exceptions: ${getSafeErrorMessage(err)}`);
+  }
+
+  return response;
+}
+
+async function handleMusicSmugMugExceptionsRequest(req, res) {
+  try {
+    return res.status(200).json(await buildMusicSmugMugExceptionsResponse(req.query || {}));
+  } catch (err) {
+    return res.status(500).json(buildAdminError(MUSIC_SMUGMUG_EXCEPTIONS_ROUTE, err, {
+      source: 'postgres+smugmug',
+      section: 'music',
+      type: 'smugmug_relationship_exceptions',
+      error: 'MUSIC_SMUGMUG_EXCEPTIONS_ERROR',
+      readOnly: true,
+      databaseMutated: false
+    }));
+  }
+}
 const SMUG_MUSIC_SHOW_CLASSIFICATION_BUCKETS = Object.freeze([
   'resolved',
   'pending_archive',
@@ -19950,6 +20389,7 @@ app.get([
 ], handleSmugMusicDiagnosticsRequest);
 
 app.get(MUSIC_SMUGMUG_HEALTH_ROUTE, handleMusicSmugMugHealthRequest);
+app.get(MUSIC_SMUGMUG_EXCEPTIONS_ROUTE, handleMusicSmugMugExceptionsRequest);
 
 async function handleSmugMusicShowClassificationRequest(req, res) {
   try {
@@ -20415,6 +20855,8 @@ async function startServer() {
 }
 
 startServer();
+
+
 
 
 
