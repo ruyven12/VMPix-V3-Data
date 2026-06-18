@@ -14622,6 +14622,326 @@ async function handleMusicSmugMugGalleryVerificationRequest(req, res) {
     }));
   }
 }
+const MUSIC_SMUGMUG_RELATIONSHIP_AUDIT_ROUTE = '/api/admin/diagnostics/music/smugmug/relationship-audit';
+
+function getMusicSmugMugRelationshipAuditLimit(value, fallback, max) {
+  return getMusicSmugMugHealthLimit(value, fallback, max);
+}
+
+function createMusicSmugMugRelationshipAuditShell(generated, limits) {
+  return buildAdminResponse({
+    route: MUSIC_SMUGMUG_RELATIONSHIP_AUDIT_ROUTE,
+    generated,
+    source: 'postgres+smugmug',
+    section: 'music',
+    type: 'relationship_audit',
+    readOnly: true,
+    databaseMutated: false,
+    summary: {
+      bands_reviewed: 0,
+      venues_reviewed: 0,
+      expected_count: 0,
+      warning_count: 0,
+      action_needed_count: 0
+    },
+    bands: [],
+    venues: [],
+    warnings: [],
+    recommendedActions: [],
+    limits
+  });
+}
+
+function addMusicSmugMugRelationshipAuditSummary(summary, severity) {
+  if (severity === 'action_needed') summary.action_needed_count += 1;
+  else if (severity === 'warning') summary.warning_count += 1;
+  else summary.expected_count += 1;
+}
+
+function addUniqueMusicSmugMugRelationshipAction(actions, action) {
+  const clean = String(action || '').trim();
+  if (clean && !actions.includes(clean)) actions.push(clean);
+}
+
+function classifyMusicSmugMugBandRelationship(row) {
+  const linkedShowCount = toIntegerCount(row && row.linked_show_count);
+  const albumCount = toIntegerCount(row && row.album_count);
+  const archivedSets = toIntegerCount(row && row.archived_sets);
+  const totalSets = toIntegerCount(row && row.total_sets);
+  const dbPhotoCount = toIntegerCount(row && row.photo_count);
+  const hasArchiveSignal = archivedSets > 0 || totalSets > 0 || dbPhotoCount > 0;
+
+  if (linkedShowCount <= 0) {
+    return hasArchiveSignal
+      ? { severity: 'warning', reason: 'Band has archive/set/photo indicators but no linked Music Shows were found.', recommended_action: 'Review source sheet relationship.' }
+      : { severity: 'expected', reason: 'Legacy or incomplete band record with no linked Music Shows.', recommended_action: 'Legacy record; no action required.' };
+  }
+
+  if (albumCount <= 0) {
+    return {
+      severity: hasArchiveSignal ? 'action_needed' : 'warning',
+      reason: 'Band has linked Music Shows, but none have usable album IDs.',
+      recommended_action: 'Review SmugMug album mapping.'
+    };
+  }
+
+  if (dbPhotoCount <= 0) {
+    return {
+      severity: 'warning',
+      reason: 'Band has album-linked shows, but stored band photo_count is zero or unavailable.',
+      recommended_action: 'Review SmugMug album mapping.'
+    };
+  }
+
+  return null;
+}
+
+function classifyMusicSmugMugVenueRelationship(row) {
+  const linkedShowCount = toIntegerCount(row && row.linked_show_count);
+  const albumCount = toIntegerCount(row && row.album_count);
+  const venueTotalInfo = getMusicVenueOfficialPhotoTotalInfo(row || {});
+  const venueTotalPhotos = toIntegerCount(venueTotalInfo.value);
+
+  if (linkedShowCount <= 0) {
+    return venueTotalPhotos > 0
+      ? { severity: 'action_needed', reason: 'Venue has an official photo total but no linked Music Shows were found.', recommended_action: 'Missing venue linkage.', venueTotalPhotos }
+      : { severity: 'expected', reason: 'Venue has no linked Music Shows and no official photo total signal.', recommended_action: 'Legacy record; no action required.', venueTotalPhotos };
+  }
+
+  if (albumCount <= 0) {
+    return {
+      severity: venueTotalPhotos > 0 ? 'action_needed' : 'warning',
+      reason: 'Venue has linked Music Shows, but none have usable album IDs.',
+      recommended_action: 'Missing album linkage.',
+      venueTotalPhotos
+    };
+  }
+
+  return null;
+}
+
+function buildMusicSmugMugRelationshipFinalClassification(response) {
+  if (response.ok === false || response.summary.action_needed_count > 0) return 'One additional cleanup pass recommended';
+  if (response.summary.warning_count > 0) return 'Music SmugMug Integration COMPLETE with legacy archive exceptions';
+  return 'Music SmugMug Integration COMPLETE';
+}
+
+async function maybeSampleMusicSmugMugRelationshipPhotos(albumRefs, photoLimit, debug, smugConfig, warnings) {
+  if (!debug) return { checked: false, photo_count: 0, error: 'debug_not_enabled' };
+  if (!smugConfig || !smugConfig.configured) return { checked: false, photo_count: 0, error: 'smugmug_not_configured' };
+  const result = await verifyMusicSmugMugSampleAlbums(albumRefs, photoLimit, true, warnings);
+  return {
+    checked: true,
+    album_id: result.album_id || null,
+    photo_count: Array.isArray(result.photos) ? result.photos.length : 0,
+    usable_photo_found: !!result.photo,
+    error: result.error || ''
+  };
+}
+
+async function buildMusicSmugMugRelationshipAuditResponse(query = {}) {
+  const generated = new Date();
+  const bandLimit = getMusicSmugMugRelationshipAuditLimit(query.band_limit || query.limit, 100, 500);
+  const venueLimit = getMusicSmugMugRelationshipAuditLimit(query.venue_limit || query.limit, 100, 500);
+  const photoLimit = getMusicSmugMugRelationshipAuditLimit(query.photo_limit, 5, 20);
+  const debug = query.debug === '1' || query.debug === 'true';
+  const limits = { band_limit: bandLimit, venue_limit: venueLimit, photo_limit: photoLimit, debug };
+  const response = createMusicSmugMugRelationshipAuditShell(generated, limits);
+  const warnings = response.warnings;
+  const smugConfig = getSmugMugConfigDiagnostics();
+
+  if (!smugConfig.configured) warnings.push(`SmugMug is not configured; live photo checks are skipped. Missing ${smugConfig.missing.join(', ')}.`);
+  (smugConfig.warnings || []).forEach((warning) => warnings.push(`SmugMug: ${warning}`));
+
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    response.ok = false;
+    warnings.push('DATABASE_URL is not configured; Music SmugMug relationship audit could not inspect PostgreSQL records.');
+    response.finalClassification = buildMusicSmugMugRelationshipFinalClassification(response);
+    return response;
+  }
+
+  try {
+    await dbPool.query('SELECT 1');
+  } catch (err) {
+    response.ok = false;
+    warnings.push(`Database disconnected: ${getSafeErrorMessage(err)}`);
+    response.finalClassification = buildMusicSmugMugRelationshipFinalClassification(response);
+    return response;
+  }
+
+  try {
+    const tableNames = ['music_bands', 'music_shows', 'music_venues'];
+    const existingTables = await getExistingPublicTables(tableNames);
+    const columnsByTable = await getExistingPublicColumns(tableNames);
+    const bandColumns = getSmugMusicTableColumns(columnsByTable, 'music_bands');
+    const showColumns = getSmugMusicTableColumns(columnsByTable, 'music_shows');
+    const venueColumns = getSmugMusicTableColumns(columnsByTable, 'music_venues');
+    const showAlbumCondition = existingTables.has('music_shows') ? buildMusicSmugMugHealthAlbumLinkCondition(showColumns, 'ms') : 'false';
+    const showSelect = existingTables.has('music_shows') ? [
+      buildMusicSmugMugHealthShowSelect(showColumns, 'ms'),
+      showColumns.has('show_url') ? 'ms.show_url AS show_url' : 'NULL AS show_url',
+      showColumns.has('bands') ? 'ms.bands AS bands' : "'[]'::jsonb AS bands",
+      showColumns.has('smug_albums') ? 'ms.smug_albums AS smug_albums' : "'[]'::jsonb AS smug_albums"
+    ].join(', ') : '';
+
+    if (existingTables.has('music_bands') && existingTables.has('music_shows') && bandColumns.has('band') && showColumns.has('bands')) {
+      const bandIdExpr = bandColumns.has('band_id') ? 'band_id' : 'NULL::text AS band_id';
+      const bandRegionExpr = bandColumns.has('region') ? 'region' : 'NULL::text AS region';
+      const bandSmugFolderExpr = bandColumns.has('smug_folder') ? 'smug_folder' : 'NULL::text AS smug_folder';
+      const archivedSetsExpr = bandColumns.has('archived_sets') ? 'archived_sets' : '0::int AS archived_sets';
+      const totalSetsExpr = bandColumns.has('total_sets') ? 'total_sets' : '0::int AS total_sets';
+      const photoCountExpr = bandColumns.has('photo_count') ? 'photo_count' : '0::int AS photo_count';
+      const bandRows = await dbPool.query(`
+        WITH band_base AS (
+          SELECT ${bandIdExpr}, band, ${bandRegionExpr}, ${bandSmugFolderExpr}, ${archivedSetsExpr}, ${totalSetsExpr}, ${photoCountExpr}
+          FROM music_bands
+          WHERE trim(coalesce(band, '')) <> ''
+        ), band_links AS (
+          SELECT b.*,
+                 count(ms.*)::int AS linked_show_count,
+                 count(*) FILTER (WHERE ${showAlbumCondition})::int AS album_count
+          FROM band_base b
+          LEFT JOIN music_shows ms ON EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(CASE WHEN jsonb_typeof(ms.bands) = 'array' THEN ms.bands ELSE '[]'::jsonb END) band_item
+            WHERE lower(trim(coalesce(band_item->>'band', band_item->>'name', ''))) = lower(trim(b.band))
+          )
+          GROUP BY b.band_id, b.band, b.region, b.smug_folder, b.archived_sets, b.total_sets, b.photo_count
+        )
+        SELECT *
+        FROM band_links
+        WHERE linked_show_count = 0 OR album_count = 0 OR coalesce(photo_count, 0) = 0
+        ORDER BY CASE WHEN linked_show_count = 0 THEN 0 WHEN album_count = 0 THEN 1 ELSE 2 END, band ASC
+        LIMIT $1
+      `, [bandLimit]);
+
+      for (const row of diagnosticRows(bandRows)) {
+        let classification = classifyMusicSmugMugBandRelationship(row);
+        let photoSample = null;
+        if (classification && toIntegerCount(row.album_count) > 0 && debug) {
+          const linkedShows = await dbPool.query(`
+            SELECT ${showSelect}
+            FROM music_shows ms
+            WHERE EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(CASE WHEN jsonb_typeof(ms.bands) = 'array' THEN ms.bands ELSE '[]'::jsonb END) band_item
+              WHERE lower(trim(coalesce(band_item->>'band', band_item->>'name', ''))) = lower(trim($1))
+            )
+              AND ${showAlbumCondition}
+            ORDER BY ${getMusicSmugMugHealthShowOrderBy(showColumns, 'ms')}
+            LIMIT $2
+          `, [String(row.band || '').trim(), Math.min(5, photoLimit)]);
+          const refs = diagnosticRows(linkedShows).flatMap(buildMusicSmugMugGalleryAlbumRefsFromShow);
+          photoSample = await maybeSampleMusicSmugMugRelationshipPhotos(refs, photoLimit, debug, smugConfig, warnings);
+          if (photoSample.checked && !photoSample.usable_photo_found) {
+            classification = { severity: 'action_needed', reason: 'Band has album IDs, but sampled album photos did not produce a usable image URL.', recommended_action: 'Review SmugMug album mapping.' };
+          } else if (photoSample.checked && photoSample.usable_photo_found && classification && /photo_count/.test(classification.reason)) {
+            classification = null;
+          }
+        }
+        if (!classification) continue;
+        const item = {
+          band_id: row.band_id == null ? '' : String(row.band_id),
+          band_name: String(row.band || '').trim(),
+          reason: classification.reason,
+          severity: classification.severity,
+          linked_show_count: toIntegerCount(row.linked_show_count),
+          album_count: toIntegerCount(row.album_count),
+          photo_count: photoSample && photoSample.checked ? toIntegerCount(photoSample.photo_count) : toIntegerCount(row.photo_count),
+          recommended_action: classification.recommended_action
+        };
+        if (debug) item.photo_sample = photoSample || { checked: false, reason: 'not_sampled' };
+        response.bands.push(item);
+        addMusicSmugMugRelationshipAuditSummary(response.summary, item.severity);
+        addUniqueMusicSmugMugRelationshipAction(response.recommendedActions, item.recommended_action);
+      }
+      if (response.bands.length >= bandLimit) warnings.push('band_limit reached; band relationship audit is sampled.');
+    } else {
+      warnings.push('Band relationship audit skipped; missing music_bands.band, music_shows.bands, or required tables.');
+    }
+
+    if (existingTables.has('music_venues') && existingTables.has('music_shows') && venueColumns.has('venue_key') && showColumns.has('venue_id')) {
+      const albumCondition = buildMusicSmugMugHealthAlbumLinkCondition(showColumns, 'ms');
+      const venueRows = await dbPool.query(`
+        SELECT mv.venue_id, mv.venue_key, mv.venue, mv.city, mv.state, mv.stats, mv.raw_sheet,
+               count(ms.*)::int AS linked_show_count,
+               count(*) FILTER (WHERE ${albumCondition})::int AS album_count
+        FROM music_venues mv
+        LEFT JOIN music_shows ms ON lower(trim(coalesce(ms.venue_id, ''))) = lower(trim(coalesce(mv.venue_key, '')))
+        WHERE trim(coalesce(mv.venue_key, '')) <> ''
+        GROUP BY mv.venue_id, mv.venue_key, mv.venue, mv.city, mv.state, mv.stats, mv.raw_sheet
+        HAVING count(ms.*) = 0 OR count(*) FILTER (WHERE ${albumCondition}) = 0
+        ORDER BY CASE WHEN count(ms.*) = 0 THEN 0 ELSE 1 END, mv.venue ASC NULLS LAST
+        LIMIT $1
+      `, [venueLimit]);
+
+      for (const row of diagnosticRows(venueRows)) {
+        let classification = classifyMusicSmugMugVenueRelationship(row);
+        let photoSample = null;
+        if (classification && toIntegerCount(row.album_count) > 0 && debug) {
+          const linkedShows = await dbPool.query(`
+            SELECT ${showSelect}
+            FROM music_shows ms
+            WHERE lower(trim(coalesce(ms.venue_id, ''))) = lower(trim($1))
+              AND ${buildMusicSmugMugHealthAlbumLinkCondition(showColumns, 'ms')}
+            ORDER BY ${getMusicSmugMugHealthShowOrderBy(showColumns, 'ms')}
+            LIMIT $2
+          `, [String(row.venue_key || '').trim(), Math.min(5, photoLimit)]);
+          const refs = diagnosticRows(linkedShows).flatMap(buildMusicSmugMugGalleryAlbumRefsFromShow);
+          photoSample = await maybeSampleMusicSmugMugRelationshipPhotos(refs, photoLimit, debug, smugConfig, warnings);
+          if (photoSample.checked && !photoSample.usable_photo_found) {
+            classification = { severity: 'action_needed', reason: 'Venue has album-linked shows, but sampled album photos did not produce a usable image URL.', recommended_action: 'Review SmugMug album mapping.', venueTotalPhotos: getMusicVenueOfficialPhotoTotalInfo(row).value };
+          } else if (photoSample.checked && photoSample.usable_photo_found) {
+            classification = null;
+          }
+        }
+        if (!classification) continue;
+        const item = {
+          venue_id: String(row.venue_key || row.venue_id || '').trim(),
+          venue_name: String(row.venue || '').trim(),
+          reason: classification.reason,
+          severity: classification.severity,
+          linked_show_count: toIntegerCount(row.linked_show_count),
+          album_count: toIntegerCount(row.album_count),
+          photo_count: photoSample && photoSample.checked ? toIntegerCount(photoSample.photo_count) : toIntegerCount(classification.venueTotalPhotos),
+          recommended_action: classification.recommended_action
+        };
+        if (debug) item.photo_sample = photoSample || { checked: false, reason: 'not_sampled' };
+        response.venues.push(item);
+        addMusicSmugMugRelationshipAuditSummary(response.summary, item.severity);
+        addUniqueMusicSmugMugRelationshipAction(response.recommendedActions, item.recommended_action);
+      }
+      if (response.venues.length >= venueLimit) warnings.push('venue_limit reached; venue relationship audit is sampled.');
+    } else {
+      warnings.push('Venue relationship audit skipped; missing music_venues.venue_key, music_shows.venue_id, or required tables.');
+    }
+
+    response.summary.bands_reviewed = response.bands.length;
+    response.summary.venues_reviewed = response.venues.length;
+    if (!response.recommendedActions.length) response.recommendedActions.push('No relationship cleanup actions found in sampled audit.');
+  } catch (err) {
+    response.ok = false;
+    warnings.push(`Unable to build Music SmugMug relationship audit: ${getSafeErrorMessage(err)}`);
+  }
+
+  response.finalClassification = buildMusicSmugMugRelationshipFinalClassification(response);
+  return response;
+}
+
+async function handleMusicSmugMugRelationshipAuditRequest(req, res) {
+  try {
+    return res.status(200).json(await buildMusicSmugMugRelationshipAuditResponse(req.query || {}));
+  } catch (err) {
+    return res.status(500).json(buildAdminError(MUSIC_SMUGMUG_RELATIONSHIP_AUDIT_ROUTE, err, {
+      source: 'postgres+smugmug',
+      section: 'music',
+      type: 'relationship_audit',
+      error: 'MUSIC_SMUGMUG_RELATIONSHIP_AUDIT_ERROR',
+      readOnly: true,
+      databaseMutated: false
+    }));
+  }
+}
 const SMUG_MUSIC_SHOW_CLASSIFICATION_BUCKETS = Object.freeze([
   'resolved',
   'pending_archive',
@@ -21267,6 +21587,7 @@ app.get(MUSIC_SMUGMUG_HEALTH_ROUTE, handleMusicSmugMugHealthRequest);
 app.get(MUSIC_SMUGMUG_EXCEPTIONS_ROUTE, handleMusicSmugMugExceptionsRequest);
 app.get(MUSIC_SMUGMUG_VERIFY_ROUTE, handleMusicSmugMugVerifyRequest);
 app.get(MUSIC_SMUGMUG_GALLERY_VERIFY_ROUTE, handleMusicSmugMugGalleryVerificationRequest);
+app.get(MUSIC_SMUGMUG_RELATIONSHIP_AUDIT_ROUTE, handleMusicSmugMugRelationshipAuditRequest);
 
 async function handleSmugMusicShowClassificationRequest(req, res) {
   try {
@@ -21732,6 +22053,7 @@ async function startServer() {
 }
 
 startServer();
+
 
 
 
