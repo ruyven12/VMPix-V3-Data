@@ -8255,6 +8255,9 @@ async function scanWrestlingPeoplePhotoAggregationSources(matchRows, sampleLimit
       photo_count: 0,
       unique_photo_count: 0,
       albums: [],
+      albumsAll: [],
+      skippedAlbums: [],
+      skipped_album_count: 0,
       scan_limited: false,
       limit: WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS
     },
@@ -8295,6 +8298,23 @@ async function scanWrestlingPeoplePhotoAggregationSources(matchRows, sampleLimit
 
   const rowsToScan = (Array.isArray(matchRows) ? matchRows : []).slice(0, WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS);
   state.smugMug.scan_limited = Array.isArray(matchRows) && matchRows.length > rowsToScan.length;
+  if (state.smugMug.scan_limited) {
+    const skippedRows = (Array.isArray(matchRows) ? matchRows : []).slice(WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS);
+    state.smugMug.skipped_album_count = skippedRows.length;
+    state.smugMug.skippedAlbums = skippedRows.map((row) => {
+      const context = buildWrestlingPeoplePhotoAggregationMatchContext(row);
+      return {
+        show_id: toIntegerCount(row && row.show_id),
+        show_key: row && row.show_key || '',
+        show_name: row && row.show_name || '',
+        date: row && row.date || '',
+        match_order: context.match_order == null ? null : toIntegerCount(context.match_order),
+        title: context.title || '',
+        album_id: '',
+        skipped_reason: 'WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS'
+      };
+    });
+  }
 
   await mapWithConcurrency(rowsToScan, SMUG_REQUEST_CONCURRENCY, async (row) => {
     const match = row && row.match && typeof row.match === 'object' ? row.match : {};
@@ -8324,6 +8344,7 @@ async function scanWrestlingPeoplePhotoAggregationSources(matchRows, sampleLimit
     };
 
     if (!albumId) {
+      state.smugMug.albumsAll.push(albumSummary);
       if (state.smugMug.albums.length < sampleLimit) state.smugMug.albums.push(albumSummary);
       return;
     }
@@ -8338,6 +8359,7 @@ async function scanWrestlingPeoplePhotoAggregationSources(matchRows, sampleLimit
     }
 
     albumSummary.photo_count = Array.isArray(photos) ? photos.length : 0;
+    state.smugMug.albumsAll.push(albumSummary);
     if (state.smugMug.albums.length < sampleLimit) state.smugMug.albums.push(albumSummary);
 
     (Array.isArray(photos) ? photos : []).forEach((photo, photoIndex) => {
@@ -8482,6 +8504,348 @@ function scanWrestlingPeoplePhotoAggregationCaptions(photoRefs, lookupEntries, s
     teamTokenMatches: teamMatches,
     unmatchedNearbyTokens: nearbyTokens,
     samplePhotoRefs: captionSampleRefs
+  };
+}
+
+function getWrestlingPeoplePhotoAggregationExpectedCount(value) {
+  const clean = String(value == null ? '' : value).trim();
+  if (!clean) return null;
+  const number = Number(clean);
+  if (!Number.isFinite(number)) return null;
+  const integer = Math.trunc(number);
+  return integer >= 0 ? integer : null;
+}
+
+function buildWrestlingPeoplePhotoAggregationCaptionTokenSets(lookupEntries) {
+  const primaryKeys = new Set();
+  const aliasKeys = new Set();
+  const teamKeys = new Set();
+
+  (Array.isArray(lookupEntries) ? lookupEntries : []).forEach((entry) => {
+    const key = entry && entry.key;
+    if (!key) return;
+    if (['requested', 'name'].includes(entry.type)) {
+      primaryKeys.add(key);
+      return;
+    }
+    if (entry.type === 'alias') {
+      aliasKeys.add(key);
+      return;
+    }
+    if (entry.type === 'team') {
+      teamKeys.add(key);
+    }
+  });
+
+  return {
+    primaryKeys,
+    aliasKeys,
+    teamKeys,
+    allKnownKeys: new Set([...primaryKeys, ...aliasKeys, ...teamKeys])
+  };
+}
+
+function getWrestlingPeoplePhotoAggregationPhotoRefKey(photoRef, fallback) {
+  return getWrestlingPeoplePhotoAggregationPhotoKey(photoRef && photoRef.album_id, photoRef, fallback);
+}
+
+function getWrestlingPeoplePhotoAggregationUniquePhotoRefEntries(photoRefs) {
+  const seen = new Set();
+  const entries = [];
+  (Array.isArray(photoRefs) ? photoRefs : []).forEach((photoRef, index) => {
+    const key = getWrestlingPeoplePhotoAggregationPhotoRefKey(photoRef, `photo:${index}`);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    entries.push({ key, photoRef, index });
+  });
+  return entries;
+}
+
+function buildWrestlingPeoplePhotoAggregationCaptionBreakdown(photoRefs, lookupEntries, sampleLimit) {
+  const tokenSets = buildWrestlingPeoplePhotoAggregationCaptionTokenSets(lookupEntries);
+  const primaryTokenMatches = new Map();
+  const aliasTokenMatches = new Map();
+  const teamTokenMatches = new Map();
+  const unmatchedCaptionTokens = new Map();
+  const matchedPhotoKeys = new Set();
+  const primaryMatchedPhotoKeys = new Set();
+  const aliasMatchedPhotoKeys = new Set();
+  const teamMatchedPhotoKeys = new Set();
+  const noCaptionPhotoKeys = new Set();
+  const captionNoMatchPhotoKeys = new Set();
+  const sampleUnmatchedPhotoRefs = [];
+  const sampleNoCaptionPhotoRefs = [];
+  let photosWithCaptions = 0;
+  let captionTokensParsed = 0;
+
+  const uniquePhotoEntries = getWrestlingPeoplePhotoAggregationUniquePhotoRefEntries(photoRefs);
+  uniquePhotoEntries.forEach(({ key, photoRef }) => {
+    const caption = String(photoRef && photoRef.caption || '').trim();
+    if (!caption) {
+      noCaptionPhotoKeys.add(key);
+      if (sampleNoCaptionPhotoRefs.length < sampleLimit) sampleNoCaptionPhotoRefs.push(photoRef);
+      return;
+    }
+
+    photosWithCaptions += 1;
+    const tokens = getWrestlingPeoplePhotoAggregationCaptionTokens(caption);
+    captionTokensParsed += tokens.length;
+    let photoMatched = false;
+
+    tokens.forEach((tokenEntry) => {
+      let tokenMatched = false;
+      if (tokenSets.primaryKeys.has(tokenEntry.key)) {
+        addWrestlingPeoplePhotoAggregationCaptionToken(primaryTokenMatches, tokenEntry, photoRef, sampleLimit);
+        primaryMatchedPhotoKeys.add(key);
+        tokenMatched = true;
+      }
+      if (tokenSets.aliasKeys.has(tokenEntry.key)) {
+        addWrestlingPeoplePhotoAggregationCaptionToken(aliasTokenMatches, tokenEntry, photoRef, sampleLimit);
+        aliasMatchedPhotoKeys.add(key);
+        tokenMatched = true;
+      }
+      if (tokenSets.teamKeys.has(tokenEntry.key)) {
+        addWrestlingPeoplePhotoAggregationCaptionToken(teamTokenMatches, tokenEntry, photoRef, sampleLimit);
+        teamMatchedPhotoKeys.add(key);
+        tokenMatched = true;
+      }
+      if (tokenMatched) {
+        photoMatched = true;
+        matchedPhotoKeys.add(key);
+      }
+    });
+
+    if (!photoMatched) {
+      captionNoMatchPhotoKeys.add(key);
+      if (sampleUnmatchedPhotoRefs.length < sampleLimit) sampleUnmatchedPhotoRefs.push(photoRef);
+      tokens.forEach((tokenEntry) => {
+        addWrestlingPeoplePhotoAggregationCaptionToken(unmatchedCaptionTokens, tokenEntry, photoRef, sampleLimit);
+      });
+    }
+  });
+
+  const primaryMatches = buildWrestlingPeoplePhotoAggregationCaptionTokenList(primaryTokenMatches);
+  const aliasMatches = buildWrestlingPeoplePhotoAggregationCaptionTokenList(aliasTokenMatches);
+  const teamMatches = buildWrestlingPeoplePhotoAggregationCaptionTokenList(teamTokenMatches);
+  const topUnmatchedTokens = buildWrestlingPeoplePhotoAggregationCaptionTokenList(unmatchedCaptionTokens).slice(0, sampleLimit);
+  const primaryTokenMatchCount = primaryMatches.reduce((sum, entry) => sum + toIntegerCount(entry.count), 0);
+  const aliasTokenMatchCount = aliasMatches.reduce((sum, entry) => sum + toIntegerCount(entry.count), 0);
+  const teamTokenMatchCount = teamMatches.reduce((sum, entry) => sum + toIntegerCount(entry.count), 0);
+
+  return {
+    summary: {
+      photos_scanned: Array.isArray(photoRefs) ? photoRefs.length : 0,
+      unique_photos_scanned: uniquePhotoEntries.length,
+      photos_with_captions: photosWithCaptions,
+      photos_with_no_caption: noCaptionPhotoKeys.size,
+      photos_with_captions_but_no_matching_token: captionNoMatchPhotoKeys.size,
+      caption_tokens_parsed: captionTokensParsed,
+      primary_token_match_count: primaryTokenMatchCount,
+      alias_token_match_count: aliasTokenMatchCount,
+      team_token_match_count: teamTokenMatchCount,
+      alias_team_token_match_count: aliasTokenMatchCount + teamTokenMatchCount,
+      primary_token_matched_photo_count: primaryMatchedPhotoKeys.size,
+      alias_token_matched_photo_count: aliasMatchedPhotoKeys.size,
+      team_token_matched_photo_count: teamMatchedPhotoKeys.size,
+      alias_team_token_matched_photo_count: new Set([...aliasMatchedPhotoKeys, ...teamMatchedPhotoKeys]).size,
+      matched_photo_count: matchedPhotoKeys.size,
+      unmatched_or_uncaptioned_photo_count: uniquePhotoEntries.length - matchedPhotoKeys.size
+    },
+    primaryTokenMatches: primaryMatches,
+    aliasTokenMatches: aliasMatches,
+    teamTokenMatches: teamMatches,
+    topUnmatchedCaptionTokens: topUnmatchedTokens,
+    sampleUnmatchedPhotoRefs,
+    sampleNoCaptionPhotoRefs
+  };
+}
+
+function buildWrestlingPeoplePhotoAggregationAlbumCoverage(photoScan, lookupEntries, sampleLimit) {
+  const smugMug = photoScan && photoScan.smugMug ? photoScan.smugMug : {};
+  const refsByAlbum = new Map();
+  getWrestlingPeoplePhotoAggregationUniquePhotoRefEntries(photoScan && photoScan.allPhotoRefs).forEach(({ photoRef }) => {
+    const albumId = String(photoRef && photoRef.album_id || '').trim();
+    const albumKey = albumId || `source:${String(photoRef && photoRef.source || 'unknown')}`;
+    if (!refsByAlbum.has(albumKey)) refsByAlbum.set(albumKey, []);
+    refsByAlbum.get(albumKey).push(photoRef);
+  });
+
+  const albumRows = (Array.isArray(smugMug.albumsAll) ? smugMug.albumsAll : Array.isArray(smugMug.albums) ? smugMug.albums : [])
+    .map((album, index) => {
+      const albumId = String(album && album.album_id || '').trim();
+      const refs = albumId ? (refsByAlbum.get(albumId) || []) : [];
+      const breakdown = buildWrestlingPeoplePhotoAggregationCaptionBreakdown(refs, lookupEntries, sampleLimit);
+      return {
+        ...album,
+        coverage_index: index + 1,
+        unique_photo_count: breakdown.summary.unique_photos_scanned,
+        caption_matched_photo_count: breakdown.summary.matched_photo_count,
+        primary_caption_matched_photo_count: breakdown.summary.primary_token_matched_photo_count,
+        alias_team_caption_matched_photo_count: breakdown.summary.alias_team_token_matched_photo_count,
+        photos_with_no_caption: breakdown.summary.photos_with_no_caption,
+        captions_without_matching_token: breakdown.summary.photos_with_captions_but_no_matching_token
+      };
+    });
+
+  return {
+    related_match_albums_found: albumRows.filter((album) => String(album && album.album_id || '').trim()).length,
+    related_match_album_rows: albumRows.length,
+    albums_scanned: toIntegerCount(smugMug.matchAlbumsScanned),
+    albums_resolved: toIntegerCount(smugMug.albumsResolved),
+    unique_albums_resolved: toIntegerCount(smugMug.uniqueAlbumsResolved),
+    albums_skipped_due_to_limit: toIntegerCount(smugMug.skipped_album_count),
+    album_scan_limit: toIntegerCount(smugMug.limit || WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS),
+    scan_limited: !!smugMug.scan_limited,
+    albums: albumRows,
+    skippedAlbums: Array.isArray(smugMug.skippedAlbums) ? smugMug.skippedAlbums : []
+  };
+}
+
+function buildWrestlingPeoplePhotoAggregationParticipantInferredGap(photoRefs, captionBreakdown) {
+  const summary = captionBreakdown && captionBreakdown.summary ? captionBreakdown.summary : {};
+  const totalUniquePhotos = toIntegerCount(summary.unique_photos_scanned);
+  const captionMatchedPhotos = toIntegerCount(summary.matched_photo_count);
+  const notCaptionMatchedPhotos = Math.max(0, totalUniquePhotos - captionMatchedPhotos);
+
+  return {
+    total_unique_photos_in_related_matches: totalUniquePhotos,
+    unique_caption_matched_photos: captionMatchedPhotos,
+    unique_photos_not_caption_matched: notCaptionMatchedPhotos,
+    photos_with_no_caption: toIntegerCount(summary.photos_with_no_caption),
+    photos_with_captions_but_no_matching_token: toIntegerCount(summary.photos_with_captions_but_no_matching_token),
+    likely_match_participant_inferred_photos: notCaptionMatchedPhotos,
+    classification: notCaptionMatchedPhotos > 0
+      ? 'caption_not_matched_but_match_relationship_present'
+      : 'caption_matched_all_related_match_photos'
+  };
+}
+
+function getWrestlingPeoplePhotoAggregationPersonMeta(personRows, photoAggregation) {
+  const metaRows = [];
+  const meta = photoAggregation && photoAggregation.meta;
+  (Array.isArray(personRows) ? personRows : []).forEach((row) => {
+    const personKey = normalizeWrestlingPersonExactMatchKey(row && row.name);
+    const personMeta = meta && typeof meta.get === 'function' ? meta.get(personKey) : null;
+    metaRows.push({
+      personKey,
+      name: row && row.name || '',
+      status: personMeta && personMeta.status || '',
+      source: personMeta && personMeta.source || '',
+      warning: personMeta && personMeta.warning || ''
+    });
+  });
+  return metaRows;
+}
+
+function buildWrestlingPeoplePhotoAggregationCurrentApiReport(personRows, photoAggregation, currentEndpointPhotoCount, warnings) {
+  const summary = photoAggregation && photoAggregation.summary ? photoAggregation.summary : {};
+  const personMeta = getWrestlingPeoplePhotoAggregationPersonMeta(personRows, photoAggregation);
+  const status = personMeta.find((entry) => entry.status && entry.status !== 'computed')?.status || summary.status || 'computed';
+  const source = personMeta.find((entry) => entry.source)?.source || summary.source || 'bounded_scan';
+  const skippedAlbums = Math.max(0, toIntegerCount(summary.show_match_albums_considered) - toIntegerCount(summary.albums_scanned));
+  const limitHit = !!summary.match_scan_limited;
+  const hasAlbumErrors = toIntegerCount(summary.albums_with_errors) > 0;
+  const partial = status === 'partial' || limitHit || hasAlbumErrors;
+  const unavailable = status === 'unavailable';
+  const apiWarnings = Array.from(new Set([
+    ...personMeta.map((entry) => entry.warning).filter(Boolean),
+    ...(Array.isArray(warnings) ? warnings : []).filter(Boolean)
+  ]));
+
+  return {
+    current_wrestling_people_db_photo_count: toIntegerCount(currentEndpointPhotoCount),
+    aggregation_source: source,
+    aggregation_status: status,
+    complete: !partial && !unavailable,
+    partial,
+    cache_hit_count: toIntegerCount(summary.cache_hit_count),
+    scanned_people_count: toIntegerCount(summary.scanned_people_count),
+    related_show_count: toIntegerCount(summary.related_show_count),
+    matched_matches_count: toIntegerCount(summary.matched_matches_count),
+    show_match_albums_considered: toIntegerCount(summary.show_match_albums_considered),
+    scanned_albums_count: toIntegerCount(summary.albums_scanned),
+    skipped_albums_count: skippedAlbums,
+    albums_resolved: toIntegerCount(summary.albums_resolved),
+    unique_albums_resolved: toIntegerCount(summary.unique_albums_resolved),
+    albums_with_errors: toIntegerCount(summary.albums_with_errors),
+    caption_photo_match_count: toIntegerCount(summary.caption_photo_match_count),
+    limit: WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS,
+    limits_hit: {
+      WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS: limitHit
+    },
+    warnings: apiWarnings,
+    personMeta
+  };
+}
+
+function chooseWrestlingPeoplePhotoAggregationRecommendedFixMode({ expectedCount, currentCount, apiCaptionBreakdown, apiPhotoScan, participantInferredGap }) {
+  const gap = expectedCount == null ? null : expectedCount - currentCount;
+  const apiSummary = apiCaptionBreakdown && apiCaptionBreakdown.summary ? apiCaptionBreakdown.summary : {};
+  const smugMug = apiPhotoScan && apiPhotoScan.smugMug ? apiPhotoScan.smugMug : {};
+  if (smugMug.scan_limited) return 'increase_album_scan_limit';
+  if (toIntegerCount(apiSummary.alias_team_token_matched_photo_count) > 0 && currentCount < toIntegerCount(apiSummary.matched_photo_count)) {
+    return 'include_alias_token_matches';
+  }
+  if (gap != null && gap > 0 && toIntegerCount(participantInferredGap && participantInferredGap.unique_photos_not_caption_matched) >= gap) {
+    return 'include_match_participant_inferred_photos';
+  }
+  if (gap != null && gap > 0 && toIntegerCount(apiSummary.photos_with_captions_but_no_matching_token) > 0) {
+    return 'normalize_caption_variant_tokens';
+  }
+  if (gap != null && gap > 0 && toIntegerCount(smugMug.unique_photo_count) > currentCount) {
+    return 'source_library_count_includes_non_match_or_non-captioned_photos';
+  }
+  return 'unknown';
+}
+
+function buildWrestlingPeoplePhotoAggregationParityAnalysis({
+  expectedCount,
+  currentCount,
+  apiCaptionBreakdown,
+  apiPhotoScan,
+  participantInferredGap,
+  diagnosticApiMatchedPhotoCount
+}) {
+  const apiSummary = apiCaptionBreakdown && apiCaptionBreakdown.summary ? apiCaptionBreakdown.summary : {};
+  const smugMug = apiPhotoScan && apiPhotoScan.smugMug ? apiPhotoScan.smugMug : {};
+  const gap = expectedCount == null ? null : expectedCount - currentCount;
+  const likelyReasons = [];
+
+  if (diagnosticApiMatchedPhotoCount !== currentCount) {
+    likelyReasons.push(`The diagnostic exact-caption scan found ${diagnosticApiMatchedPhotoCount} matched photos while /api/wrestling/people/db currently reports ${currentCount}.`);
+  }
+  if (smugMug.scan_limited) {
+    likelyReasons.push(`The API aggregation album scan reached WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS=${WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS}.`);
+  }
+  if (expectedCount != null && gap > 0) {
+    likelyReasons.push(`Expected input is ${expectedCount}; current aggregation is ${currentCount}, leaving a gap of ${gap}.`);
+  }
+  if (toIntegerCount(apiSummary.photos_with_no_caption) > 0) {
+    likelyReasons.push(`${toIntegerCount(apiSummary.photos_with_no_caption)} unique photos in API-related match albums have no caption.`);
+  }
+  if (toIntegerCount(apiSummary.photos_with_captions_but_no_matching_token) > 0) {
+    likelyReasons.push(`${toIntegerCount(apiSummary.photos_with_captions_but_no_matching_token)} unique photos in API-related match albums have captions but no exact semicolon token for the person, aliases, or teams.`);
+  }
+  if (participantInferredGap && toIntegerCount(participantInferredGap.unique_photos_not_caption_matched) > 0) {
+    likelyReasons.push(`${toIntegerCount(participantInferredGap.unique_photos_not_caption_matched)} unique photos in directly related person matches are not exact caption-token matches and would require participant-inferred counting or caption cleanup.`);
+  }
+  if (!likelyReasons.length) {
+    likelyReasons.push('No specific parity gap reason was identified from the bounded diagnostic scan.');
+  }
+
+  return {
+    expectedCountFromInput: expectedCount,
+    currentAggregatedCount: currentCount,
+    diagnosticApiCaptionMatchedCount: toIntegerCount(diagnosticApiMatchedPhotoCount),
+    gap,
+    likelyReasons,
+    recommendedFixMode: chooseWrestlingPeoplePhotoAggregationRecommendedFixMode({
+      expectedCount,
+      currentCount,
+      apiCaptionBreakdown,
+      apiPhotoScan,
+      participantInferredGap
+    })
   };
 }
 
@@ -8845,6 +9209,17 @@ async function buildWrestlingPeoplePhotoAggregationDiagnosticResponse(query = {}
       matches: {},
       photos: {},
       captions: {},
+      currentApiAggregation: {},
+      participantInferredGap: {},
+      albumCoverage: {},
+      parityAnalysis: {
+        expectedCountFromInput: getWrestlingPeoplePhotoAggregationExpectedCount(query.expected),
+        currentAggregatedCount: 0,
+        diagnosticApiCaptionMatchedCount: 0,
+        gap: null,
+        likelyReasons: ['Pass ?person=<name> to inspect one wrestling person.'],
+        recommendedFixMode: 'unknown'
+      },
       warnings,
       recommendedNextActions: ['Pass ?person=<name> to inspect one wrestling person.']
     });
@@ -8875,6 +9250,17 @@ async function buildWrestlingPeoplePhotoAggregationDiagnosticResponse(query = {}
       matches: {},
       photos: {},
       captions: {},
+      currentApiAggregation: {},
+      participantInferredGap: {},
+      albumCoverage: {},
+      parityAnalysis: {
+        expectedCountFromInput: getWrestlingPeoplePhotoAggregationExpectedCount(query.expected),
+        currentAggregatedCount: 0,
+        diagnosticApiCaptionMatchedCount: 0,
+        gap: null,
+        likelyReasons: ['DATABASE_URL is missing, so live parity analysis could not run.'],
+        recommendedFixMode: 'unknown'
+      },
       warnings,
       recommendedNextActions: getWrestlingPeoplePhotoAggregationRecommendedNextActions('source_data_missing')
     });
@@ -8907,11 +9293,23 @@ async function buildWrestlingPeoplePhotoAggregationDiagnosticResponse(query = {}
       matches: {},
       photos: {},
       captions: {},
+      currentApiAggregation: {},
+      participantInferredGap: {},
+      albumCoverage: {},
+      parityAnalysis: {
+        expectedCountFromInput: getWrestlingPeoplePhotoAggregationExpectedCount(query.expected),
+        currentAggregatedCount: 0,
+        diagnosticApiCaptionMatchedCount: 0,
+        gap: null,
+        likelyReasons: ['Required wrestling source tables are missing, so live parity analysis could not run.'],
+        recommendedFixMode: 'unknown'
+      },
       warnings,
       recommendedNextActions: getWrestlingPeoplePhotoAggregationRecommendedNextActions('source_data_missing')
     });
   }
 
+  const expectedCount = getWrestlingPeoplePhotoAggregationExpectedCount(query.expected);
   const personRows = await getWrestlingPeoplePhotoAggregationPersonRows(requestedPerson, columnsByTable, warnings);
   const appearanceCounts = await getWrestlingPeopleAppearanceCounts(personRows.map((row) => row.name));
   const cachedPhotoCounts = getCachedWrestlingPeoplePhotoCounts();
@@ -8928,15 +9326,54 @@ async function buildWrestlingPeoplePhotoAggregationDiagnosticResponse(query = {}
   const matchRows = await getWrestlingPeoplePhotoAggregationMatchedMatches(lookupEntries, warnings);
   const matches = summarizeWrestlingPeoplePhotoAggregationMatches(matchRows, lookupEntries, sampleLimit);
   const photoScan = await scanWrestlingPeoplePhotoAggregationSources(matchRows, sampleLimit, warnings);
+  const directCaptionBreakdown = buildWrestlingPeoplePhotoAggregationCaptionBreakdown(photoScan.allPhotoRefs, lookupEntries, sampleLimit);
+  const directAlbumCoverage = buildWrestlingPeoplePhotoAggregationAlbumCoverage(photoScan, lookupEntries, sampleLimit);
+  const participantInferredGap = buildWrestlingPeoplePhotoAggregationParticipantInferredGap(photoScan.allPhotoRefs, directCaptionBreakdown);
+  const apiAggregationShowMatchRows = await getWrestlingPeoplePhotoAggregationShowMatchRowsForMatchedEvents(matchRows, warnings);
+  const apiAggregationPhotoScan = await scanWrestlingPeoplePhotoAggregationSources(apiAggregationShowMatchRows, sampleLimit, warnings);
+  const apiAggregationCaptionBreakdown = buildWrestlingPeoplePhotoAggregationCaptionBreakdown(apiAggregationPhotoScan.allPhotoRefs, lookupEntries, sampleLimit);
+  const apiAggregationAlbumCoverage = buildWrestlingPeoplePhotoAggregationAlbumCoverage(apiAggregationPhotoScan, lookupEntries, sampleLimit);
+  const currentApiAggregation = buildWrestlingPeoplePhotoAggregationCurrentApiReport(personRows, fixedPhotoAggregation, currentEndpointPhotoCount, warnings);
+  const parityAnalysis = buildWrestlingPeoplePhotoAggregationParityAnalysis({
+    expectedCount,
+    currentCount: currentEndpointPhotoCount,
+    apiCaptionBreakdown: apiAggregationCaptionBreakdown,
+    apiPhotoScan: apiAggregationPhotoScan,
+    participantInferredGap,
+    diagnosticApiMatchedPhotoCount: apiAggregationCaptionBreakdown.summary.matched_photo_count
+  });
   const photos = {
     storedMatchPhotoArrays: photoScan.storedMatchPhotoArrays,
     smugMug: {
       ...photoScan.smugMug,
-      albums: photoScan.smugMug.albums.slice(0, sampleLimit)
+      albums: photoScan.smugMug.albums.slice(0, sampleLimit),
+      skippedAlbums: photoScan.smugMug.skippedAlbums.slice(0, sampleLimit)
+    },
+    albumCoverage: directAlbumCoverage,
+    apiAggregationCoverage: {
+      relatedShowMatchRows: apiAggregationShowMatchRows.length,
+      storedMatchPhotoArrays: apiAggregationPhotoScan.storedMatchPhotoArrays,
+      smugMug: {
+        ...apiAggregationPhotoScan.smugMug,
+        albums: apiAggregationPhotoScan.smugMug.albums.slice(0, sampleLimit),
+        skippedAlbums: apiAggregationPhotoScan.smugMug.skippedAlbums.slice(0, sampleLimit)
+      },
+      albumCoverage: apiAggregationAlbumCoverage,
+      samplePhotoRefs: apiAggregationPhotoScan.allPhotoRefs.slice(0, sampleLimit)
     },
     samplePhotoRefs: photoScan.allPhotoRefs.slice(0, sampleLimit)
   };
-  const captions = scanWrestlingPeoplePhotoAggregationCaptions(photoScan.allPhotoRefs, lookupEntries, sampleLimit);
+  const captions = {
+    ...scanWrestlingPeoplePhotoAggregationCaptions(photoScan.allPhotoRefs, lookupEntries, sampleLimit),
+    tokenBreakdown: directCaptionBreakdown.summary,
+    topUnmatchedCaptionTokens: directCaptionBreakdown.topUnmatchedCaptionTokens,
+    sampleUnmatchedPhotoRefs: directCaptionBreakdown.sampleUnmatchedPhotoRefs,
+    sampleNoCaptionPhotoRefs: directCaptionBreakdown.sampleNoCaptionPhotoRefs,
+    apiAggregationTokenBreakdown: {
+      ...apiAggregationCaptionBreakdown,
+      relatedShowMatchRows: apiAggregationShowMatchRows.length
+    }
+  };
   const diagnosis = classifyWrestlingPeoplePhotoAggregationDiagnostic(personRows, matches, photos, captions, currentEndpointPhotoCount);
   const recommendedNextActions = getWrestlingPeoplePhotoAggregationRecommendedNextActions(diagnosis);
 
@@ -8965,6 +9402,7 @@ async function buildWrestlingPeoplePhotoAggregationDiagnosticResponse(query = {}
         currentEndpointPhotoCount
       },
       fixedPhotoAggregation: fixedPhotoAggregation.summary,
+      currentApiAggregation,
       rows: responsePersonRows
     },
     summary: {
@@ -8985,11 +9423,26 @@ async function buildWrestlingPeoplePhotoAggregationDiagnosticResponse(query = {}
       caption_alias_token_match_count: captions.summary.alias_token_match_count,
       caption_team_token_match_count: captions.summary.team_token_match_count,
       caption_matched_photo_count: captions.summary.matched_photo_count,
+      caption_photos_with_no_caption: directCaptionBreakdown.summary.photos_with_no_caption,
+      caption_photos_with_captions_but_no_matching_token: directCaptionBreakdown.summary.photos_with_captions_but_no_matching_token,
+      api_aggregation_related_show_match_rows: apiAggregationShowMatchRows.length,
+      api_aggregation_unique_photo_count: apiAggregationPhotoScan.smugMug.unique_photo_count,
+      api_aggregation_caption_matched_photo_count: apiAggregationCaptionBreakdown.summary.matched_photo_count,
+      api_aggregation_photos_with_no_caption: apiAggregationCaptionBreakdown.summary.photos_with_no_caption,
+      api_aggregation_photos_with_captions_but_no_matching_token: apiAggregationCaptionBreakdown.summary.photos_with_captions_but_no_matching_token,
+      participant_inferred_gap_photo_count: participantInferredGap.unique_photos_not_caption_matched,
+      expected_count_from_input: expectedCount,
+      parity_gap: parityAnalysis.gap,
+      recommended_fix_mode: parityAnalysis.recommendedFixMode,
       sample_limit: sampleLimit
     },
+    currentApiAggregation,
     matches,
     photos,
+    albumCoverage: directAlbumCoverage,
+    participantInferredGap,
     captions,
+    parityAnalysis,
     warnings,
     recommendedNextActions
   });
@@ -9019,6 +9472,17 @@ async function handleWrestlingPeoplePhotoAggregationDiagnosticRequest(req, res) 
       matches: {},
       photos: {},
       captions: {},
+      currentApiAggregation: {},
+      participantInferredGap: {},
+      albumCoverage: {},
+      parityAnalysis: {
+        expectedCountFromInput: getWrestlingPeoplePhotoAggregationExpectedCount(req && req.query && req.query.expected),
+        currentAggregatedCount: 0,
+        diagnosticApiCaptionMatchedCount: 0,
+        gap: null,
+        likelyReasons: ['The diagnostic failed before parity analysis could complete.'],
+        recommendedFixMode: 'unknown'
+      },
       warnings: [],
       recommendedNextActions: getWrestlingPeoplePhotoAggregationRecommendedNextActions('unknown'),
       error: 'WRESTLING_PEOPLE_PHOTO_AGGREGATION_DIAGNOSTIC_ERROR'
