@@ -9905,7 +9905,6 @@ async function buildWrestlingVenuesDbStatsResponse() {
     byVenueTypeQuery
   ]);
   const totals = totalsResult.rows && totalsResult.rows[0] ? totalsResult.rows[0] : {};
-  const venueShowTotals = venueShowTotalsResult.rows && venueShowTotalsResult.rows[0] ? venueShowTotalsResult.rows[0] : {};
 
   return {
     ok: true,
