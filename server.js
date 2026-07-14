@@ -4564,6 +4564,13 @@ const WRESTLING_MATCH_IMPORT_HEADER_ALIASES = {
   winner: 'winner',
   referees: 'referees',
   referee: 'referees',
+  finish_type: 'finish_type',
+  finishtype: 'finish_type',
+  match_duration: 'match_duration',
+  matchduration: 'match_duration',
+  duration: 'match_duration',
+  announcer: 'announcer',
+  blood: 'blood',
   notes: 'notes'
 };
 
@@ -4663,6 +4670,10 @@ function hasWrestlingMatchRowData(row) {
     'extra_people',
     'winner',
     'referees',
+    'finish_type',
+    'match_duration',
+    'announcer',
+    'blood',
     'notes'
   ].some((key) => toDbText(row[key]));
 }
@@ -4761,6 +4772,10 @@ function buildWrestlingMatchDbItem(entry) {
     winner: winners,
     referees,
     tagged_people: uniqueWrestlingPeopleList(participants.concat(referees, extraPeople)),
+    finish_type: toDbText(row.finish_type),
+    match_duration: toDbText(row.match_duration),
+    announcer: toDbText(row.announcer),
+    blood: toDbText(row.blood),
     notes: toDbText(row.notes) || ''
   };
 }
@@ -22565,7 +22580,11 @@ async function addWrestlingMatchDiagnostics(response, existingTables, columnsByT
        count(*) FILTER (
          WHERE match_item->'match_order' IS NULL
             OR trim(coalesce(match_item->>'match_order', '')) = ''
-       )::int AS matches_missing_match_order
+       )::int AS matches_missing_match_order,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'finish_type', '')) <> '')::int AS matches_with_finish_type,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'match_duration', '')) <> '')::int AS matches_with_match_duration,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'announcer', '')) <> '')::int AS matches_with_announcer,
+       count(*) FILTER (WHERE trim(coalesce(match_item->>'blood', '')) <> '')::int AS matches_with_blood
      FROM wrestling_shows
      CROSS JOIN LATERAL jsonb_array_elements(${matchesArraySql}) AS match_item`
   );
@@ -22576,6 +22595,25 @@ async function addWrestlingMatchDiagnostics(response, existingTables, columnsByT
   matches.matches_missing_winner = toIntegerCount(totals.matches_missing_winner);
   matches.matches_missing_match_type = toIntegerCount(totals.matches_missing_match_type);
   matches.matches_missing_match_order = toIntegerCount(totals.matches_missing_match_order);
+
+  matches.optional_field_presence = {
+    finish_type: {
+      populated: toIntegerCount(totals.matches_with_finish_type),
+      blank: Math.max(0, matches.total_matches - toIntegerCount(totals.matches_with_finish_type))
+    },
+    match_duration: {
+      populated: toIntegerCount(totals.matches_with_match_duration),
+      blank: Math.max(0, matches.total_matches - toIntegerCount(totals.matches_with_match_duration))
+    },
+    announcer: {
+      populated: toIntegerCount(totals.matches_with_announcer),
+      blank: Math.max(0, matches.total_matches - toIntegerCount(totals.matches_with_announcer))
+    },
+    blood: {
+      populated: toIntegerCount(totals.matches_with_blood),
+      blank: Math.max(0, matches.total_matches - toIntegerCount(totals.matches_with_blood))
+    }
+  };
 
   const sampleBaseSql = `
     SELECT
