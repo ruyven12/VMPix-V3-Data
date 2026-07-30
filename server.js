@@ -5115,6 +5115,10 @@ const WRESTLING_VENUES_SHEET_CONFIG = {
 const WRESTLING_VENUE_IMPORT_HEADER_ALIASES = {
   venue_id: 'venue_id',
   venueid: 'venue_id',
+  venue_slug: 'venue_id',
+  venueslug: 'venue_id',
+  stable_id: 'venue_id',
+  stableid: 'venue_id',
   venue_name: 'venue_name',
   venuename: 'venue_name',
   venue: 'venue_name',
@@ -5136,6 +5140,9 @@ const WRESTLING_VENUE_IMPORT_HEADER_ALIASES = {
   lon: 'longitude',
   gps_lng: 'longitude',
   gpslng: 'longitude',
+  geohash: 'geohash',
+  geo_hash: 'geohash',
+  geohash6: 'geohash',
   notes: 'notes',
   note: 'notes'
 };
@@ -5260,18 +5267,31 @@ function buildPhase1WrestlingVenueGeo(latitude, longitude, existingGeo) {
   return geo;
 }
 
+function slugifyWrestlingVenueStableId(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/^wv[\s_-]+/, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function normalizeWrestlingVenueStableId(value) {
+  const slug = slugifyWrestlingVenueStableId(value);
+  return slug ? `wv_${slug}` : '';
+}
+
 function buildWrestlingVenueFallbackId(row) {
-  return slugifyMusicBandId([
-    row.venue_name,
-    row.city,
-    row.state,
-    row.country
-  ].filter(Boolean).join(' '));
+  return normalizeWrestlingVenueStableId(row.venue_name);
 }
 
 function buildWrestlingVenueDbRows(rows) {
   const items = [];
   const seen = new Set();
+  const duplicateVenueIds = [];
   let skippedMissingVenue = 0;
   let generatedVenueIds = 0;
 
@@ -5284,12 +5304,22 @@ function buildWrestlingVenueDbRows(rows) {
 
     const providedVenueId = cleanMusicVenueText(row.venue_id);
     const generatedVenueId = providedVenueId ? '' : buildWrestlingVenueFallbackId({ ...row, venue_name: venueName });
-    const venueId = providedVenueId || generatedVenueId;
-    if (!venueId || seen.has(venueId)) return;
+    const venueId = normalizeWrestlingVenueStableId(providedVenueId || generatedVenueId);
+    if (!venueId) {
+      skippedMissingVenue += 1;
+      return;
+    }
+    if (seen.has(venueId)) {
+      duplicateVenueIds.push(venueId);
+      return;
+    }
     if (generatedVenueId) generatedVenueIds += 1;
     seen.add(venueId);
     const latitude = toNullableNumber(row.latitude);
     const longitude = toNullableNumber(row.longitude);
+    const geo = buildPhase1WrestlingVenueGeo(latitude, longitude);
+    const sourceGeohash = cleanMusicVenueText(row.geohash).toLowerCase();
+    if (sourceGeohash) geo.geohash = sourceGeohash;
 
     items.push({
       venue_id: venueId,
@@ -5303,7 +5333,7 @@ function buildWrestlingVenueDbRows(rows) {
       latitude,
       longitude,
       notes: toDbText(row.notes),
-      geo: buildPhase1WrestlingVenueGeo(latitude, longitude),
+      geo,
       raw_sheet: compactJsonFields(row)
     });
   });
@@ -5314,7 +5344,13 @@ function buildWrestlingVenueDbRows(rows) {
       String(a.state || '').localeCompare(String(b.state || ''), undefined, { numeric: true, sensitivity: 'base' });
   });
 
-  return { items, skippedMissingVenue, generatedVenueIds };
+  return {
+    items,
+    skippedMissingVenue,
+    generatedVenueIds,
+    skippedDuplicateVenueIds: duplicateVenueIds.length,
+    duplicateVenueIds: Array.from(new Set(duplicateVenueIds)).sort()
+  };
 }
 
 async function upsertWrestlingVenueDbRow(client, item) {
@@ -5341,16 +5377,19 @@ async function upsertWrestlingVenueDbRow(client, item) {
     )
     ON CONFLICT (venue_id) DO UPDATE SET
       venue_name = EXCLUDED.venue_name,
-      city = EXCLUDED.city,
-      state = EXCLUDED.state,
-      country = EXCLUDED.country,
-      region = EXCLUDED.region,
-      venue_type = EXCLUDED.venue_type,
-      status = EXCLUDED.status,
-      latitude = EXCLUDED.latitude,
-      longitude = EXCLUDED.longitude,
-      notes = EXCLUDED.notes,
-      geo = EXCLUDED.geo,
+      city = COALESCE(EXCLUDED.city, wrestling_venues.city),
+      state = COALESCE(EXCLUDED.state, wrestling_venues.state),
+      country = COALESCE(EXCLUDED.country, wrestling_venues.country),
+      region = COALESCE(EXCLUDED.region, wrestling_venues.region),
+      venue_type = COALESCE(EXCLUDED.venue_type, wrestling_venues.venue_type),
+      status = COALESCE(EXCLUDED.status, wrestling_venues.status),
+      latitude = COALESCE(EXCLUDED.latitude, wrestling_venues.latitude),
+      longitude = COALESCE(EXCLUDED.longitude, wrestling_venues.longitude),
+      notes = COALESCE(EXCLUDED.notes, wrestling_venues.notes),
+      geo = CASE
+        WHEN EXCLUDED.latitude IS NOT NULL AND EXCLUDED.longitude IS NOT NULL THEN EXCLUDED.geo
+        ELSE COALESCE(wrestling_venues.geo, EXCLUDED.geo)
+      END,
       raw_sheet = EXCLUDED.raw_sheet,
       updated_at = NOW()
   `, [
@@ -5390,8 +5429,10 @@ async function importWrestlingVenuesToDatabase(forceRefresh) {
     rowsRead: payload.rows.length,
     importedRows: built.items.length,
     upserted: 0,
-    skipped: built.skippedMissingVenue,
+    skipped: built.skippedMissingVenue + built.skippedDuplicateVenueIds,
     skippedMissingVenue: built.skippedMissingVenue,
+    skippedDuplicateVenueIds: built.skippedDuplicateVenueIds,
+    duplicateVenueIds: built.duplicateVenueIds,
     generatedVenueIds: built.generatedVenueIds
   };
 
