@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const fs = require('fs');
 const path = require('path');
@@ -4958,7 +4958,9 @@ const WRESTLING_PERSON_IMPORT_HEADER_ALIASES = {
   teams: 'teams',
   team: 'teams',
   notes: 'notes',
-  note: 'notes'
+  note: 'notes',
+  portrait_url: 'portrait_url',
+  portraiturl: 'portrait_url'
 };
 
 function normalizeWrestlingPersonImportRow(row) {
@@ -5008,7 +5010,8 @@ function buildWrestlingPersonDbRows(rows) {
         category: '',
         aliases: new Map(),
         teams: new Map(),
-        notes: ''
+        notes: '',
+        portrait_url: null
       });
     }
 
@@ -5016,6 +5019,8 @@ function buildWrestlingPersonDbRows(rows) {
     if (!group.name || group.name === group.name.toLowerCase()) group.name = name;
     if (!group.category) group.category = cleanMusicVenueText(row.category);
     if (!group.notes) group.notes = String(row.notes || '').trim();
+    const portraitUrl = String(row.portrait_url || '').trim();
+    if (!group.portrait_url && portraitUrl) group.portrait_url = portraitUrl;
     addWrestlingPersonArrayValues(group.aliases, splitWrestlingSemicolonList(row.aliases));
     addWrestlingPersonArrayValues(group.teams, splitWrestlingSemicolonList(row.teams));
   });
@@ -5028,7 +5033,8 @@ function buildWrestlingPersonDbRows(rows) {
       category: person.category || null,
       aliases: Array.from(person.aliases.values()),
       teams: Array.from(person.teams.values()),
-      notes: person.notes || null
+      notes: person.notes || null,
+      portrait_url: person.portrait_url || null
     }));
 
   return { items, skippedMissingName };
@@ -5042,15 +5048,17 @@ async function upsertWrestlingPersonDbRow(client, item) {
       category,
       aliases,
       teams,
-      notes
+      notes,
+      portrait_url
     )
-    VALUES ($1, $2, $3, $4::text[], $5::text[], $6)
+    VALUES ($1, $2, $3, $4::text[], $5::text[], $6, $7)
     ON CONFLICT (slug) DO UPDATE SET
       name = EXCLUDED.name,
       category = EXCLUDED.category,
       aliases = EXCLUDED.aliases,
       teams = EXCLUDED.teams,
       notes = EXCLUDED.notes,
+      portrait_url = EXCLUDED.portrait_url,
       updated_at = NOW()
   `, [
     item.slug,
@@ -5058,7 +5066,8 @@ async function upsertWrestlingPersonDbRow(client, item) {
     item.category,
     item.aliases,
     item.teams,
-    item.notes
+    item.notes,
+    item.portrait_url
   ]);
 }
 
@@ -7551,6 +7560,7 @@ function buildWrestlingPersonDbApiItem(row, appearanceCounts = new Map(), photoC
     aliases: Array.isArray(row.aliases) ? row.aliases : [],
     teams: Array.isArray(row.teams) ? row.teams : [],
     notes: row.notes || '',
+    portrait_url: typeof row.portrait_url === 'string' ? row.portrait_url.trim() || null : null,
     event_count: toIntegerCount(counts.event_count),
     match_count: toIntegerCount(counts.match_count),
     photo_count: toIntegerCount(photoCount)
@@ -9637,7 +9647,7 @@ async function handleWrestlingPeopleDbRequest(req, res) {
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
     const result = await dbPool.query(
-      `SELECT id, slug, name, category, aliases, teams, notes
+      `SELECT id, slug, name, category, aliases, teams, notes, portrait_url
        FROM wrestling_people
        ${options.whereSql}
        ORDER BY ${options.orderBySql}

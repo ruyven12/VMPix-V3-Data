@@ -527,6 +527,7 @@ CREATE TABLE IF NOT EXISTS wrestling_people (
     aliases TEXT[] DEFAULT '{}'::text[],
     teams TEXT[] DEFAULT '{}'::text[],
     notes TEXT,
+    portrait_url TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -548,6 +549,9 @@ ALTER TABLE IF EXISTS wrestling_people
 
 ALTER TABLE IF EXISTS wrestling_people
     ADD COLUMN IF NOT EXISTS notes TEXT;
+
+ALTER TABLE IF EXISTS wrestling_people
+    ADD COLUMN IF NOT EXISTS portrait_url TEXT;
 
 ALTER TABLE IF EXISTS wrestling_people
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
