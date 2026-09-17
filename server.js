@@ -7007,11 +7007,16 @@ function doesWrestlingAlbumPhotoMatchMatch(photo, match) {
   return matchTokens.some((token) => photoTokens.has(token));
 }
 
-async function enrichWrestlingShowItemWithMatchPhotos(item, row) {
+async function enrichWrestlingShowItemWithMatchPhotos(item, row, options = {}) {
   if (Array.isArray(item.matches)) {
     let showPhotoCount = 0;
+    const requestedMatchUrl = String(options.matchUrl || '').trim().toLowerCase();
 
     item.matches = await mapWithConcurrency(item.matches, SMUG_REQUEST_CONCURRENCY, async (match) => {
+      if (requestedMatchUrl && String(match && match.match_url || '').trim().toLowerCase() !== requestedMatchUrl) {
+        return match;
+      }
+
       const resolvedAlbum = await resolveSmugWrestlingMatchAlbum(match, row, item);
       const albumId = resolvedAlbum.albumId || '';
       if (!albumId) {
@@ -7126,7 +7131,7 @@ async function buildWrestlingShowDbApiItem(row, venueDetailsMap, options = {}) {
   };
 
   if (options.includePhotos) {
-    return enrichWrestlingShowItemWithMatchPhotos(item, row);
+    return enrichWrestlingShowItemWithMatchPhotos(item, row, { matchUrl: options.matchUrl });
   }
 
   return item;
@@ -7340,6 +7345,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
     const offset = (page - 1) * limit;
     const options = buildWrestlingShowsDbQueryOptions(req.query);
     const includePhotos = shouldIncludeWrestlingMatchPhotos(req.query);
+    const matchUrl = includePhotos ? String(req.query.match_url || '').trim() : '';
     const countResult = await dbPool.query(
       `SELECT count(*)::int AS total FROM wrestling_shows ${options.whereSql}`,
       options.values
@@ -7361,7 +7367,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
     const data = await mapWithConcurrency(
       result.rows,
       includePhotos ? 1 : 4,
-      (row) => buildWrestlingShowDbApiItem(row, venueDetailsMap, { includePhotos })
+      (row) => buildWrestlingShowDbApiItem(row, venueDetailsMap, { includePhotos, matchUrl })
     );
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
