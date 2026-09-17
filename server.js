@@ -79,6 +79,7 @@ const WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS = Math.max(
 const WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS = getIntegerEnv('WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS', 500, 1, 2000);
 const WRESTLING_PEOPLE_TRACE_ENABLED = /^(?:1|true|yes|on)$/i.test(String(process.env.WRESTLING_PEOPLE_TRACE || '').trim());
 const WRESTLING_MATCH_GALLERY_TRACE_ENABLED = /^(?:1|true|yes|on)$/i.test(String(process.env.WRESTLING_MATCH_GALLERY_TRACE || '').trim());
+const WRESTLING_MATCH_GALLERY_METADATA_TRACE_ENABLED = /^(?:1|true|yes|on)$/i.test(String(process.env.WRESTLING_MATCH_GALLERY_METADATA_TRACE || '').trim());
 const wrestlingPeopleTraceStorage = new AsyncLocalStorage();
 
 function getWrestlingPeopleTracePoolState() {
@@ -114,6 +115,7 @@ function createWrestlingPeopleRequestTrace(res, options = {}) {
   const trace = {
     requestId,
     gallery: !!options.gallery,
+    metadata: !!options.metadata,
     counters,
     log,
     startStage(name, details = {}, includePool = false) {
@@ -1210,8 +1212,80 @@ function hasSmugWrestlingAlbumPhotoRequiredMetadata(image) {
   );
 }
 
+function recordSmugWrestlingAlbumPhotoMetadataTrace(image, trace) {
+  if (!trace || !trace.metadata) return;
+
+  const urls = getSmugAlbumPhotoUrls(image);
+  const imageKeyPresent = !!getSmugAlbumPhotoImageKey(image);
+  const thumbnailPresent = !!urls.thumbnail_url;
+  const smallPresent = !!urls.small_url;
+  const mediumPresent = !!urls.medium_url;
+  const largePresent = !!urls.large_url;
+  const directThumbnailPresent = !!getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.thumbnail);
+  const directSmallPresent = !!getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.small);
+  const directMediumPresent = !!getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.medium);
+  const directLargePresent = !!getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.large);
+  const explicitLargePresent = hasSmugAlbumPhotoExplicitLargerUrl(image);
+  const caption = getSmugNestedRawField(image, ['Caption', 'CaptionText', 'caption', 'captionText']);
+  const keywords = getSmugNestedRawField(image, ['Keywords', 'Keyword', 'keywords', 'keyword', 'Tags', 'Tag', 'tags', 'tag']);
+  const captureDate = getSmugNestedRawField(image, [
+    'DateTimeOriginal', 'date_time_original', 'dateTimeOriginal',
+    'DateTaken', 'date_taken', 'dateTaken',
+    'TakenAt', 'taken_at', 'takenAt'
+  ]);
+  const captionFieldPresent = caption !== undefined;
+  const keywordsFieldPresent = keywords !== undefined;
+  const captureDateFieldPresent = captureDate !== undefined;
+  const captionPresent = captionFieldPresent && String(caption || '').trim() !== '';
+  const keywordsPresent = keywordsFieldPresent && getSmugImageKeywordValues(image).length > 0;
+  const captureDatePresent = captureDateFieldPresent && String(captureDate || '').trim() !== '';
+  const aaronCaptionMatch = captionPresent && String(caption)
+    .split(';')
+    .some((token) => token.trim().replace(/\s+/g, ' ').toLowerCase() === 'aaron rourke');
+  const requiredFields = [
+    imageKeyPresent,
+    thumbnailPresent,
+    smallPresent,
+    mediumPresent,
+    explicitLargePresent,
+    captionFieldPresent,
+    keywordsFieldPresent,
+    captureDateFieldPresent
+  ];
+  const missingRequiredFieldCount = requiredFields.filter((present) => !present).length;
+
+  trace.increment('metadata_raw_page_items');
+  [
+    ['image_key', imageKeyPresent],
+    ['thumbnail_url', thumbnailPresent],
+    ['small_url', smallPresent],
+    ['medium_url', mediumPresent],
+    ['large_url', largePresent],
+    ['direct_thumbnail_url', directThumbnailPresent],
+    ['direct_small_url', directSmallPresent],
+    ['direct_medium_url', directMediumPresent],
+    ['direct_large_url', directLargePresent],
+    ['explicit_large_url', explicitLargePresent],
+    ['caption_field', captionFieldPresent],
+    ['caption', captionPresent],
+    ['keywords_field', keywordsFieldPresent],
+    ['keywords', keywordsPresent],
+    ['capture_date_field', captureDateFieldPresent],
+    ['capture_date', captureDatePresent]
+  ].forEach(([name, present]) => trace.increment(`metadata_${name}_${present ? 'present' : 'missing'}`));
+
+  if (thumbnailPresent && captionPresent) trace.increment('metadata_thumbnail_caption');
+  if (thumbnailPresent && captionPresent && imageKeyPresent) trace.increment('metadata_thumbnail_caption_image_key');
+  if (thumbnailPresent && captionPresent && !explicitLargePresent) trace.increment('metadata_thumbnail_caption_no_explicit_large');
+  if (aaronCaptionMatch) trace.increment('metadata_aaron_caption_match');
+  if (!captionPresent) trace.increment('metadata_caption_missing');
+  if (missingRequiredFieldCount === 1 && !explicitLargePresent) trace.increment('metadata_only_explicit_large_missing');
+  if (missingRequiredFieldCount > 1) trace.increment('metadata_multiple_required_fields_missing');
+}
+
 async function buildSmugWrestlingAlbumPhotoItemForResponse(image) {
   const galleryTrace = getActiveWrestlingMatchGalleryTrace();
+  recordSmugWrestlingAlbumPhotoMetadataTrace(image, galleryTrace);
   if (hasSmugWrestlingAlbumPhotoRequiredMetadata(image)) {
     if (galleryTrace) galleryTrace.increment('image_detail_skips');
     const item = buildSmugAlbumPhotoItem(image, { hydrated: false });
@@ -24154,14 +24228,17 @@ app.get('/api/music/shows/stats', async (req, res) => {
 });
 
 app.get('/api/wrestling/shows/db', async (req, res) => {
-  const shouldTraceGallery = WRESTLING_MATCH_GALLERY_TRACE_ENABLED
+  const shouldTraceGallery = (WRESTLING_MATCH_GALLERY_TRACE_ENABLED || WRESTLING_MATCH_GALLERY_METADATA_TRACE_ENABLED)
     && shouldIncludeWrestlingMatchPhotos(req.query)
     && String(req.query.match_url || '').trim();
   if (!shouldTraceGallery) return handleWrestlingShowsDbRequest(req, res);
   const galleryTrace = createWrestlingPeopleRequestTrace(res, {
     enabled: true,
     gallery: true,
-    logLabel: 'wrestling-match-gallery-trace'
+    metadata: WRESTLING_MATCH_GALLERY_METADATA_TRACE_ENABLED,
+    logLabel: WRESTLING_MATCH_GALLERY_METADATA_TRACE_ENABLED
+      ? 'wrestling-match-gallery-metadata-trace'
+      : 'wrestling-match-gallery-trace'
   });
   return wrestlingPeopleTraceStorage.run(galleryTrace, () => handleWrestlingShowsDbRequest(req, res));
 });
