@@ -7819,6 +7819,91 @@ function getWrestlingPeoplePhotoCountsForRequest() {
   buildWrestlingPeoplePhotoCounts().catch(() => {});
   return new Map();
 }
+
+function buildWrestlingPeopleCachedPhotoAggregation(rows = []) {
+  const counts = new Map();
+  const meta = new Map();
+  const sharedCache = getCachedWrestlingPeoplePhotoCounts();
+  const matchers = createWrestlingPeoplePhotoAggregationMatchersForRows(rows);
+  let availableCount = 0;
+  let cacheHitCount = 0;
+
+  matchers.forEach((matcher) => {
+    const personCache = getCachedWrestlingPeoplePhotoAggregationPersonCount(matcher);
+    if (personCache) {
+      counts.set(matcher.personKey, toIntegerCount(personCache.count));
+      meta.set(matcher.personKey, {
+        status: personCache.status || 'cached',
+        source: personCache.source || 'bounded_scan_cache',
+        warning: personCache.warning || ''
+      });
+      availableCount += 1;
+      cacheHitCount += 1;
+      return;
+    }
+
+    if (sharedCache && sharedCache.has(matcher.personKey)) {
+      counts.set(matcher.personKey, toIntegerCount(sharedCache.get(matcher.personKey)));
+      meta.set(matcher.personKey, {
+        status: 'cached',
+        source: 'wrestling_people_photo_count_cache',
+        warning: ''
+      });
+      availableCount += 1;
+      cacheHitCount += 1;
+      return;
+    }
+
+    const storedCount = Number(matcher.row && matcher.row.photo_count);
+    if (matcher.row && matcher.row.photo_count != null && Number.isFinite(storedCount) && storedCount >= 0) {
+      counts.set(matcher.personKey, toIntegerCount(storedCount));
+      meta.set(matcher.personKey, {
+        status: 'stored',
+        source: 'database',
+        warning: ''
+      });
+      availableCount += 1;
+      return;
+    }
+
+    counts.set(matcher.personKey, 0);
+    meta.set(matcher.personKey, {
+      status: 'unavailable',
+      source: 'none',
+      warning: 'Photo count is unavailable until the explicit Wrestling People photo aggregation diagnostic refreshes it.'
+    });
+  });
+
+  return {
+    counts,
+    meta,
+    warnings: [],
+    summary: {
+      source: 'stored_or_cached',
+      scoped_to_result_rows: true,
+      requested_people_count: Array.isArray(rows) ? rows.length : 0,
+      scanned_people_count: 0,
+      cache_hit_count: cacheHitCount,
+      related_show_count: 0,
+      matched_matches_count: 0,
+      show_match_albums_considered: 0,
+      match_scan_limited: false,
+      match_scan_limit: WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS,
+      albums_scanned: 0,
+      albums_resolved: 0,
+      albums_with_errors: 0,
+      unique_albums_resolved: 0,
+      caption_photo_match_count: 0,
+      status: matchers.length === 0
+        ? 'unavailable'
+        : availableCount === matchers.length
+        ? 'available'
+        : availableCount > 0
+          ? 'partial'
+          : 'unavailable'
+    }
+  };
+}
 async function buildWrestlingPeoplePhotoCounts() {
   if (!isSmugMugConfigured() || !String(process.env.DATABASE_URL || '').trim()) {
     return new Map();
@@ -9837,7 +9922,8 @@ async function handleWrestlingPeopleDbRequest(req, res) {
     const offsetIdx = dataValues.length;
     const selectStartedAt = peopleTrace && peopleTrace.startStage('people_select_query', {}, true);
     const result = await dbPool.query(
-      `SELECT id, slug, name, category, aliases, teams, notes, portrait_url
+      `SELECT id, slug, name, category, aliases, teams, notes, portrait_url,
+              to_jsonb(wrestling_people)->>'photo_count' AS photo_count
        FROM wrestling_people
        ${options.whereSql}
        ORDER BY ${options.orderBySql}
@@ -9859,7 +9945,7 @@ async function handleWrestlingPeopleDbRequest(req, res) {
       peopleTrace.endStage('appearance_count', appearanceStartedAt, { peopleCount: result.rows.length }, true);
     }
     const photoAggregationStartedAt = peopleTrace && peopleTrace.startStage('photo_aggregation');
-    const photoAggregation = await buildWrestlingPeoplePagePhotoAggregation(result.rows, { warnings });
+    const photoAggregation = buildWrestlingPeopleCachedPhotoAggregation(result.rows);
     if (peopleTrace) {
       peopleTrace.endStage('photo_aggregation', photoAggregationStartedAt, {
         status: photoAggregation.summary.status,
