@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 
 function loadLocalEnv() {
@@ -76,6 +77,106 @@ const WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS = Math.max(
   Number(process.env.WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS || SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS) || SMUG_WRESTLING_MATCH_PHOTOS_CACHE_TTL_MS
 );
 const WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS = getIntegerEnv('WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS', 500, 1, 2000);
+const WRESTLING_PEOPLE_TRACE_ENABLED = /^(?:1|true|yes|on)$/i.test(String(process.env.WRESTLING_PEOPLE_TRACE || '').trim());
+const wrestlingPeopleTraceStorage = new AsyncLocalStorage();
+
+function getWrestlingPeopleTracePoolState() {
+  return {
+    totalCount: toIntegerCount(dbPool.totalCount),
+    idleCount: toIntegerCount(dbPool.idleCount),
+    waitingCount: toIntegerCount(dbPool.waitingCount)
+  };
+}
+
+function createWrestlingPeopleRequestTrace(res) {
+  if (!WRESTLING_PEOPLE_TRACE_ENABLED) return null;
+
+  const requestId = crypto.randomBytes(4).toString('hex');
+  const startedAt = process.hrtime.bigint();
+  const counters = Object.create(null);
+  const aggregates = Object.create(null);
+  let responseFinished = false;
+
+  const elapsedMs = (from = startedAt) => Number(process.hrtime.bigint() - from) / 1e6;
+  const log = (event, details = {}, includePool = false) => {
+    console.info('[wrestling-people-trace]', JSON.stringify({
+      requestId,
+      event,
+      elapsedMs: Number(elapsedMs().toFixed(3)),
+      ...(includePool ? { pool: getWrestlingPeopleTracePoolState() } : {}),
+      ...details
+    }));
+  };
+
+  const trace = {
+    requestId,
+    counters,
+    log,
+    startStage(name, details = {}, includePool = false) {
+      const stageStartedAt = process.hrtime.bigint();
+      log(`${name}_start`, details, includePool);
+      return stageStartedAt;
+    },
+    endStage(name, stageStartedAt, details = {}, includePool = false) {
+      log(`${name}_end`, {
+        durationMs: Number(elapsedMs(stageStartedAt).toFixed(3)),
+        ...details
+      }, includePool);
+    },
+    increment(name, amount = 1) {
+      counters[name] = toIntegerCount(counters[name]) + toIntegerCount(amount);
+    },
+    beginAggregate(name) {
+      if (aggregates[name]) return;
+      aggregates[name] = {
+        startedAt: process.hrtime.bigint(),
+        cumulativeDurationMs: 0,
+        calls: 0
+      };
+      log(`${name}_start`);
+    },
+    startAggregateCall(name) {
+      this.beginAggregate(name);
+      aggregates[name].calls += 1;
+      return process.hrtime.bigint();
+    },
+    endAggregateCall(name, callStartedAt) {
+      if (!aggregates[name] || !callStartedAt) return;
+      aggregates[name].cumulativeDurationMs += elapsedMs(callStartedAt);
+    },
+    endAggregate(name, details = {}) {
+      const aggregate = aggregates[name];
+      if (!aggregate) return;
+      log(`${name}_end`, {
+        durationMs: Number(elapsedMs(aggregate.startedAt).toFixed(3)),
+        cumulativeCallDurationMs: Number(aggregate.cumulativeDurationMs.toFixed(3)),
+        calls: aggregate.calls,
+        ...details
+      });
+    }
+  };
+
+  res.once('finish', () => {
+    responseFinished = true;
+    log('response_finish', {
+      statusCode: res.statusCode,
+      counters: { ...counters }
+    });
+  });
+  res.once('close', () => {
+    log('response_close', {
+      statusCode: res.statusCode,
+      beforeFinish: !responseFinished,
+      counters: { ...counters }
+    });
+  });
+
+  return trace;
+}
+
+function getActiveWrestlingPeopleRequestTrace() {
+  return wrestlingPeopleTraceStorage.getStore() || null;
+}
 const MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS || 1000 * 60 * 60 * 6) || 1000 * 60 * 60 * 6
@@ -588,21 +689,45 @@ async function fetchSmugJson(endpoint, options = {}) {
   const retries = Number.isInteger(options.retries) ? Math.max(0, options.retries) : SMUG_REQUEST_RETRIES;
   const retryDelayMs = Number.isInteger(options.retryDelayMs) ? Math.max(0, options.retryDelayMs) : SMUG_RETRY_DELAY_MS;
   const safeEndpoint = getSmugSafeEndpointLabel(endpoint);
+  const peopleTrace = getActiveWrestlingPeopleRequestTrace();
+  const isImagePageRequest = /\/album\/[^/?#]+!images(?:$|\?)/i.test(normalizeSmugEndpoint(endpoint));
   let lastError;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const res = await fetch(buildSmugApiUrl(endpoint), {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': SMUG_USER_AGENT
-      }
-    });
+    if (peopleTrace) {
+      peopleTrace.increment('smugmug_request_attempts');
+      if (isImagePageRequest) peopleTrace.increment('image_page_requests');
+      if (attempt > 0) peopleTrace.increment('smugmug_retry_count');
+    }
 
-    if (res.ok) return res.json();
+    let res;
+    try {
+      res = await fetch(buildSmugApiUrl(endpoint), {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': SMUG_USER_AGENT
+        }
+      });
+    } catch (err) {
+      if (peopleTrace) {
+        peopleTrace.increment('smugmug_request_failures');
+        if (/abort|timeout/i.test(String(err && (err.name || err.message) || ''))) {
+          peopleTrace.increment('smugmug_timeouts');
+        }
+      }
+      throw err;
+    }
+
+    if (res.ok) {
+      const json = await res.json();
+      if (peopleTrace && isImagePageRequest) peopleTrace.increment('image_pages_fetched');
+      return json;
+    }
 
     const text = await res.text();
     const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
     lastError = new Error(`SmugMug returned HTTP ${res.status} (${safeEndpoint})${snippet ? `: ${snippet}` : ''}`);
+    if (peopleTrace) peopleTrace.increment('smugmug_request_failures');
 
     if (!isSmugRateLimitStatus(res.status) || attempt >= retries) throw lastError;
     await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (attempt + 1)));
@@ -7951,6 +8076,12 @@ async function getWrestlingPeoplePhotoAggregationMatchedMatches(lookupEntries, w
   const taggedPeopleArraySql = getWrestlingTaggedPeopleArraySql('match_item');
   const sideOneArraySql = "CASE WHEN jsonb_typeof(match_item->'side_1') = 'array' THEN match_item->'side_1' ELSE '[]'::jsonb END";
   const sideTwoArraySql = "CASE WHEN jsonb_typeof(match_item->'side_2') = 'array' THEN match_item->'side_2' ELSE '[]'::jsonb END";
+  const peopleTrace = getActiveWrestlingPeopleRequestTrace();
+  const scanStartedAt = peopleTrace && peopleTrace.startStage(
+    'relationship_match_scan',
+    { lookupKeyCount: lookupKeys.length },
+    true
+  );
 
   const result = await runWrestlingDiagnosticQuery(
     warnings,
@@ -8058,7 +8189,11 @@ async function getWrestlingPeoplePhotoAggregationMatchedMatches(lookupEntries, w
     [lookupKeys]
   );
 
-  return diagnosticRows(result);
+  const rows = diagnosticRows(result);
+  if (peopleTrace) {
+    peopleTrace.endStage('relationship_match_scan', scanStartedAt, { rowCount: rows.length }, true);
+  }
+  return rows;
 }
 
 function getWrestlingPeoplePhotoAggregationArrayMatches(values, lookupSet) {
@@ -8980,6 +9115,12 @@ async function getWrestlingPeoplePhotoAggregationShowMatchRowsForMatchedEvents(m
       .filter(Boolean)
   ));
   if (!showIds.length && !showKeys.length) return [];
+  const peopleTrace = getActiveWrestlingPeopleRequestTrace();
+  const lookupStartedAt = peopleTrace && peopleTrace.startStage(
+    'related_show_lookup',
+    { showIdCount: showIds.length, showKeyCount: showKeys.length },
+    true
+  );
 
   const result = await runWrestlingDiagnosticQuery(
     warnings,
@@ -9002,7 +9143,11 @@ async function getWrestlingPeoplePhotoAggregationShowMatchRowsForMatchedEvents(m
     [showIds, showKeys]
   );
 
-  return diagnosticRows(result);
+  const rows = diagnosticRows(result);
+  if (peopleTrace) {
+    peopleTrace.endStage('related_show_lookup', lookupStartedAt, { rowCount: rows.length }, true);
+  }
+  return rows;
 }
 
 function addWrestlingPeoplePagePhotoAggregationMatch(photoSets, matchers, albumId, photo, fallbackKey) {
@@ -9022,6 +9167,7 @@ function addWrestlingPeoplePagePhotoAggregationMatch(photoSets, matchers, albumI
 
 async function buildWrestlingPeoplePagePhotoAggregation(rows = [], options = {}) {
   const warnings = Array.isArray(options.warnings) ? options.warnings : [];
+  const peopleTrace = getActiveWrestlingPeopleRequestTrace();
   const counts = new Map();
   const meta = new Map();
   const summary = {
@@ -9113,6 +9259,11 @@ async function buildWrestlingPeoplePagePhotoAggregation(rows = [], options = {})
 
   const photoSets = new Map();
   const uniqueAlbumIds = new Set();
+  if (peopleTrace) {
+    peopleTrace.increment('albums_considered', rowsToScan.length);
+    peopleTrace.beginAggregate('smugmug_album_resolution');
+    peopleTrace.beginAggregate('smugmug_image_page_fetching');
+  }
 
   await mapWithConcurrency(rowsToScan, SMUG_REQUEST_CONCURRENCY, async (row, rowIndex) => {
     const showIdentity = getWrestlingPeoplePhotoAggregationShowIdentity(row);
@@ -9144,7 +9295,17 @@ async function buildWrestlingPeoplePagePhotoAggregation(rows = [], options = {})
       show_name: row && row.show_name || '',
       date: row && row.date || ''
     };
-    const resolved = await resolveSmugWrestlingMatchAlbum(match, row, item);
+    const resolutionStartedAt = peopleTrace && peopleTrace.startAggregateCall('smugmug_album_resolution');
+    let resolved;
+    try {
+      resolved = await resolveSmugWrestlingMatchAlbum(match, row, item);
+    } finally {
+      if (peopleTrace) peopleTrace.endAggregateCall('smugmug_album_resolution', resolutionStartedAt);
+    }
+    if (peopleTrace) {
+      peopleTrace.increment('album_resolution_calls');
+      if (resolved && resolved.source === 'error') peopleTrace.increment('album_resolution_failures');
+    }
     const albumId = resolved && resolved.albumId ? String(resolved.albumId).trim() : '';
     summary.albums_scanned += 1;
     if (!albumId) return;
@@ -9153,6 +9314,7 @@ async function buildWrestlingPeoplePagePhotoAggregation(rows = [], options = {})
     uniqueAlbumIds.add(albumId);
 
     let photos = [];
+    const imageFetchStartedAt = peopleTrace && peopleTrace.startAggregateCall('smugmug_image_page_fetching');
     try {
       photos = await fetchWrestlingPeoplePhotoAggregationAlbumPhotos(albumId);
     } catch (err) {
@@ -9160,6 +9322,8 @@ async function buildWrestlingPeoplePagePhotoAggregation(rows = [], options = {})
       summary.status = 'partial';
       warnings.push(`Unable to fetch Wrestling People photo aggregation album ${albumId}: ${getSafeErrorMessage(err)}`);
       return;
+    } finally {
+      if (peopleTrace) peopleTrace.endAggregateCall('smugmug_image_page_fetching', imageFetchStartedAt);
     }
 
     (Array.isArray(photos) ? photos : []).forEach((photo, photoIndex) => {
@@ -9172,6 +9336,20 @@ async function buildWrestlingPeoplePagePhotoAggregation(rows = [], options = {})
       );
     });
   });
+  if (peopleTrace) {
+    peopleTrace.endAggregate('smugmug_album_resolution', {
+      albumsConsidered: peopleTrace.counters.albums_considered || 0,
+      resolutionCalls: peopleTrace.counters.album_resolution_calls || 0,
+      failures: peopleTrace.counters.album_resolution_failures || 0
+    });
+    peopleTrace.endAggregate('smugmug_image_page_fetching', {
+      requestAttempts: peopleTrace.counters.image_page_requests || 0,
+      pagesFetched: peopleTrace.counters.image_pages_fetched || 0,
+      retries: peopleTrace.counters.smugmug_retry_count || 0,
+      failures: peopleTrace.counters.smugmug_request_failures || 0,
+      timeouts: peopleTrace.counters.smugmug_timeouts || 0
+    });
+  }
 
   summary.unique_albums_resolved = uniqueAlbumIds.size;
   unresolved.forEach((matcher) => {
@@ -9626,6 +9804,8 @@ function buildWrestlingPeopleDbQueryOptions(query) {
 }
 
 async function handleWrestlingPeopleDbRequest(req, res) {
+  const peopleTrace = getActiveWrestlingPeopleRequestTrace();
+  if (peopleTrace) peopleTrace.log('handler_entry', {}, true);
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
       throw new Error('Missing DATABASE_URL environment variable.');
@@ -9637,15 +9817,25 @@ async function handleWrestlingPeopleDbRequest(req, res) {
     const offset = (page - 1) * limit;
     const options = buildWrestlingPeopleDbQueryOptions(req.query);
     const warnings = [];
+    const countStartedAt = peopleTrace && peopleTrace.startStage('people_count_query', {}, true);
     const countResult = await dbPool.query(
       `SELECT count(*)::int AS total FROM wrestling_people ${options.whereSql}`,
       options.values
     );
+    if (peopleTrace) {
+      peopleTrace.endStage(
+        'people_count_query',
+        countStartedAt,
+        { rowCount: countResult.rows ? countResult.rows.length : 0 },
+        true
+      );
+    }
     const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
     const totalPages = total > 0 ? Math.ceil(total / limit) : 0;
     const dataValues = options.values.concat([limit, offset]);
     const limitIdx = dataValues.length - 1;
     const offsetIdx = dataValues.length;
+    const selectStartedAt = peopleTrace && peopleTrace.startStage('people_select_query', {}, true);
     const result = await dbPool.query(
       `SELECT id, slug, name, category, aliases, teams, notes, portrait_url
        FROM wrestling_people
@@ -9655,11 +9845,39 @@ async function handleWrestlingPeopleDbRequest(req, res) {
        OFFSET $${offsetIdx}`,
       dataValues
     );
+    if (peopleTrace) {
+      peopleTrace.endStage(
+        'people_select_query',
+        selectStartedAt,
+        { rowCount: result.rows ? result.rows.length : 0 },
+        true
+      );
+    }
+    const appearanceStartedAt = peopleTrace && peopleTrace.startStage('appearance_count', {}, true);
     const appearanceCounts = await getWrestlingPeopleAppearanceCounts(result.rows.map((row) => row.name));
+    if (peopleTrace) {
+      peopleTrace.endStage('appearance_count', appearanceStartedAt, { peopleCount: result.rows.length }, true);
+    }
+    const photoAggregationStartedAt = peopleTrace && peopleTrace.startStage('photo_aggregation');
     const photoAggregation = await buildWrestlingPeoplePagePhotoAggregation(result.rows, { warnings });
+    if (peopleTrace) {
+      peopleTrace.endStage('photo_aggregation', photoAggregationStartedAt, {
+        status: photoAggregation.summary.status,
+        cacheHitCount: photoAggregation.summary.cache_hit_count,
+        albumsConsidered: photoAggregation.summary.show_match_albums_considered,
+        albumsScanned: photoAggregation.summary.albums_scanned,
+        albumsResolved: photoAggregation.summary.albums_resolved,
+        counters: { ...peopleTrace.counters }
+      });
+    }
+    const normalizationStartedAt = peopleTrace && peopleTrace.startStage('normalization');
     const data = result.rows.map((row) => buildWrestlingPersonDbApiItem(row, appearanceCounts, photoAggregation.counts, photoAggregation.meta));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
+    if (peopleTrace) {
+      peopleTrace.endStage('normalization', normalizationStartedAt, { rowCount: data.length });
+    }
 
+    const serializationStartedAt = peopleTrace && peopleTrace.startStage('serialization');
     res.json({
       ok: true,
       source: 'db',
@@ -9689,7 +9907,16 @@ async function handleWrestlingPeopleDbRequest(req, res) {
       },
       data
     });
+    if (peopleTrace) {
+      peopleTrace.endStage('serialization', serializationStartedAt, { rowCount: data.length });
+    }
   } catch (err) {
+    if (peopleTrace) {
+      peopleTrace.log('handler_error', {
+        errorName: String(err && err.name || 'Error'),
+        errorMessage: getSafeErrorMessage(err)
+      }, true);
+    }
     res.status(500).json(buildApiError('/api/wrestling/people', err, {
       source: 'db',
       type: 'wrestling_people',
@@ -23777,7 +24004,9 @@ app.get('/api/wrestling/people', async (req, res) => {
 });
 
 app.get('/api/wrestling/people/db', async (req, res) => {
-  return handleWrestlingPeopleDbRequest(req, res);
+  const peopleTrace = createWrestlingPeopleRequestTrace(res);
+  if (!peopleTrace) return handleWrestlingPeopleDbRequest(req, res);
+  return wrestlingPeopleTraceStorage.run(peopleTrace, () => handleWrestlingPeopleDbRequest(req, res));
 });
 
 app.get('/api/wrestling/people/stats', async (req, res) => {
