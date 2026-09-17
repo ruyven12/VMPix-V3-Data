@@ -24270,18 +24270,10 @@ async function handleWrestlingImageDetailRequest(req, res) {
           throw new Error('Image detail unavailable');
         }
         const sizeLink = image.Uris && image.Uris.ImageSizeDetails;
-        const expansion = sizeLink && detail.json.Expansions && detail.json.Expansions[sizeLink.Uri];
+        const sizeUri = typeof sizeLink === 'string' ? sizeLink : sizeLink?.Uri;
+        const expansion = sizeUri && detail.json.Expansions && detail.json.Expansions[sizeUri];
         const sizes = image.ImageSizeDetails || (sizeLink && sizeLink.ImageSizeDetails)
           || (expansion && expansion.ImageSizeDetails) || {};
-        console.info('[wrestling-selected-photo-size-shape]', JSON.stringify({
-          root: Object.keys(detail.json), response: Object.keys(detail.json.Response || {}),
-          image: Object.keys(image), links: Object.keys(image.Uris || {}),
-          sizeLink: Object.keys(sizeLink || {}), sizes: Object.keys(sizes),
-          expansions: Object.values(detail.json.Expansions || {}).map((value) => ({
-            keys: Object.keys(value || {}), details: Object.keys(value?.ImageSizeDetails || {}),
-            response: Object.keys(value?.Response || {})
-          }))
-        }));
         const photo = buildSmugAlbumPhotoItem(image);
         // Only actual returned size URLs; do not synthesize CDN paths.
         const aliases = {
