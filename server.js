@@ -205,6 +205,8 @@ const smugTotalPhotosInFlight = new Map();
 const smugPeoplePhotoCountCache = new Map();
 const smugPeoplePhotoCountInFlight = new Map();
 const smugAlbumPhotosCache = new Map();
+const smugWrestlingImageDetailCache = new Map();
+const smugWrestlingImageDetailInFlight = new Map();
 const smugWrestlingMatchPhotosCache = new Map();
 const smugWrestlingMatchPhotosInFlight = new Map();
 const smugWrestlingAlbumIdCache = new Map();
@@ -18708,9 +18710,11 @@ function buildSmugImageDetailEndpoint(imageKey) {
   return buildSmugImageDetailEndpoints(imageKey)[0] || '';
 }
 
-async function fetchSmugImageDetail(imageKey) {
+async function fetchSmugImageDetail(imageKey, options = {}) {
   const attemptedImageKeys = getSmugImageKeyCandidates(imageKey);
-  const endpoints = buildSmugImageDetailEndpoints(imageKey);
+  const endpoints = buildSmugImageDetailEndpoints(imageKey).map((endpoint) => options.includeSizes
+    ? endpoint.replace('_expand=Image', '_expand=ImageSizes')
+    : endpoint);
   let lastError = null;
 
   for (const endpoint of endpoints) {
@@ -24243,6 +24247,60 @@ app.get('/api/music/shows/stats', async (req, res) => {
     });
   }
 });
+
+// Selected-photo only: never called by album pagination or the initial gallery.
+async function handleWrestlingImageDetailRequest(req, res) {
+  const suppliedKey = String(req.params.image_key || '').trim();
+  if (!/^(?:i-)?[A-Za-z0-9]{1,64}$/.test(suppliedKey)) {
+    return res.status(400).json({ ok: false, error: 'invalid image key' });
+  }
+  const imageKey = getBareSmugImageKey(suppliedKey);
+  const cached = smugWrestlingImageDetailCache.get(imageKey);
+  if (cached && Date.now() - cached.fetchedAt < SMUG_ALBUM_PHOTOS_CACHE_TTL_MS) {
+    return res.json({ ok: true, photo: cached.photo, cache: { hit: true } });
+  }
+  smugWrestlingImageDetailCache.delete(imageKey);
+  try {
+    let request = smugWrestlingImageDetailInFlight.get(imageKey);
+    if (!request) {
+      request = (async () => {
+        const detail = await fetchSmugImageDetail(imageKey, { includeSizes: true });
+        const image = getSmugImageObjectFromDetail(detail.json);
+        if (!image || getBareSmugImageKey(getSmugAlbumPhotoImageKey(image)) !== imageKey) {
+          throw new Error('Image detail unavailable');
+        }
+        const sizeLink = image.Uris && image.Uris.ImageSizes;
+        const expansion = sizeLink && detail.json.Expansions && detail.json.Expansions[sizeLink.Uri];
+        const sizes = image.ImageSizes || (sizeLink && sizeLink.ImageSizes)
+          || (expansion && expansion.ImageSizes) || {};
+        const photo = buildSmugAlbumPhotoItem(image);
+        // Only actual returned size URLs; do not synthesize CDN paths.
+        const aliases = {
+          thumbnail: ['ThumbnailImageUrl', 'ThumbImageUrl', 'TinyImageUrl'],
+          small: ['SmallImageUrl'],
+          medium: ['MediumImageUrl'],
+          large: ['LargestImageUrl', 'X5LargeImageUrl', 'X4LargeImageUrl', 'X3LargeImageUrl', 'X2LargeImageUrl', 'XLargeImageUrl', 'LargeImageUrl', 'OriginalImageUrl']
+        };
+        for (const size of Object.keys(aliases)) {
+          const fields = [...SMUG_ALBUM_PHOTO_URL_FIELDS[size], ...aliases[size]];
+          const url = getSmugAlbumPhotoDirectUrl(sizes, fields) || getSmugAlbumPhotoDirectUrl(image, fields);
+          photo[`${size}_url`] = isLikelySmugImageUrl(url) ? url : '';
+        }
+        if (smugWrestlingImageDetailCache.size >= 256) {
+          smugWrestlingImageDetailCache.delete(smugWrestlingImageDetailCache.keys().next().value);
+        }
+        smugWrestlingImageDetailCache.set(imageKey, { fetchedAt: Date.now(), photo });
+        return photo;
+      })().finally(() => smugWrestlingImageDetailInFlight.delete(imageKey));
+      smugWrestlingImageDetailInFlight.set(imageKey, request);
+    }
+    return res.json({ ok: true, photo: await request, cache: { hit: false } });
+  } catch (_) {
+    return res.status(502).json({ ok: false, error: 'image detail unavailable', image_key: imageKey });
+  }
+}
+
+app.get('/api/wrestling/smugmug/images/:image_key', handleWrestlingImageDetailRequest);
 
 app.get('/api/wrestling/shows/db', async (req, res) => {
   const shouldTraceGallery = (WRESTLING_MATCH_GALLERY_TRACE_ENABLED || WRESTLING_MATCH_GALLERY_METADATA_TRACE_ENABLED)
