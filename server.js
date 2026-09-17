@@ -1187,8 +1187,39 @@ function getSmugImageKeywordValues(image) {
     .filter(Boolean);
 }
 
+function hasSmugWrestlingAlbumPhotoRequiredMetadata(image) {
+  const urls = getSmugAlbumPhotoUrls(image);
+  const caption = getSmugNestedRawField(image, ['Caption', 'CaptionText', 'caption', 'captionText']);
+  const keywords = getSmugNestedRawField(image, ['Keywords', 'Keyword', 'keywords', 'keyword', 'Tags', 'Tag', 'tags', 'tag']);
+  const captureDate = getSmugNestedRawField(image, [
+    'DateTimeOriginal', 'date_time_original', 'dateTimeOriginal',
+    'DateTaken', 'date_taken', 'dateTaken',
+    'TakenAt', 'taken_at', 'takenAt'
+  ]);
+
+  return !!(
+    getSmugAlbumPhotoImageKey(image)
+    && urls.thumbnail_url
+    && urls.small_url
+    && urls.medium_url
+    && urls.large_url
+    && hasSmugAlbumPhotoExplicitLargerUrl(image)
+    && caption !== undefined
+    && keywords !== undefined
+    && captureDate !== undefined
+  );
+}
+
 async function buildSmugWrestlingAlbumPhotoItemForResponse(image) {
   const galleryTrace = getActiveWrestlingMatchGalleryTrace();
+  if (hasSmugWrestlingAlbumPhotoRequiredMetadata(image)) {
+    if (galleryTrace) galleryTrace.increment('image_detail_skips');
+    const item = buildSmugAlbumPhotoItem(image, { hydrated: false });
+    item.keywords = getSmugImageKeywordValues(image);
+    return item;
+  }
+
+  if (galleryTrace) galleryTrace.increment('image_detail_fallbacks');
   const hydrationStartedAt = galleryTrace && galleryTrace.startAggregateCall('image_detail_hydration');
   const hydrated = await hydrateSmugAlbumPhotoImage(image);
   if (galleryTrace) galleryTrace.endAggregateCall('image_detail_hydration', hydrationStartedAt);
