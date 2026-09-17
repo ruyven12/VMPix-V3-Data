@@ -78,6 +78,7 @@ const WRESTLING_PEOPLE_PHOTO_COUNT_CACHE_TTL_MS = Math.max(
 );
 const WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS = getIntegerEnv('WRESTLING_PEOPLE_PHOTO_COUNT_MAX_MATCH_ALBUMS', 500, 1, 2000);
 const WRESTLING_PEOPLE_TRACE_ENABLED = /^(?:1|true|yes|on)$/i.test(String(process.env.WRESTLING_PEOPLE_TRACE || '').trim());
+const WRESTLING_MATCH_GALLERY_TRACE_ENABLED = /^(?:1|true|yes|on)$/i.test(String(process.env.WRESTLING_MATCH_GALLERY_TRACE || '').trim());
 const wrestlingPeopleTraceStorage = new AsyncLocalStorage();
 
 function getWrestlingPeopleTracePoolState() {
@@ -88,10 +89,12 @@ function getWrestlingPeopleTracePoolState() {
   };
 }
 
-function createWrestlingPeopleRequestTrace(res) {
-  if (!WRESTLING_PEOPLE_TRACE_ENABLED) return null;
+function createWrestlingPeopleRequestTrace(res, options = {}) {
+  const enabled = options.enabled == null ? WRESTLING_PEOPLE_TRACE_ENABLED : !!options.enabled;
+  if (!enabled) return null;
 
   const requestId = crypto.randomBytes(4).toString('hex');
+  const logLabel = String(options.logLabel || 'wrestling-people-trace');
   const startedAt = process.hrtime.bigint();
   const counters = Object.create(null);
   const aggregates = Object.create(null);
@@ -99,7 +102,7 @@ function createWrestlingPeopleRequestTrace(res) {
 
   const elapsedMs = (from = startedAt) => Number(process.hrtime.bigint() - from) / 1e6;
   const log = (event, details = {}, includePool = false) => {
-    console.info('[wrestling-people-trace]', JSON.stringify({
+    console.info(`[${logLabel}]`, JSON.stringify({
       requestId,
       event,
       elapsedMs: Number(elapsedMs().toFixed(3)),
@@ -110,6 +113,7 @@ function createWrestlingPeopleRequestTrace(res) {
 
   const trace = {
     requestId,
+    gallery: !!options.gallery,
     counters,
     log,
     startStage(name, details = {}, includePool = false) {
@@ -143,6 +147,7 @@ function createWrestlingPeopleRequestTrace(res) {
     endAggregateCall(name, callStartedAt) {
       if (!aggregates[name] || !callStartedAt) return;
       aggregates[name].cumulativeDurationMs += elapsedMs(callStartedAt);
+      if (options.gallery) aggregates[name].lastEndedAt = process.hrtime.bigint();
     },
     endAggregate(name, details = {}) {
       const aggregate = aggregates[name];
@@ -150,6 +155,7 @@ function createWrestlingPeopleRequestTrace(res) {
       log(`${name}_end`, {
         durationMs: Number(elapsedMs(aggregate.startedAt).toFixed(3)),
         cumulativeCallDurationMs: Number(aggregate.cumulativeDurationMs.toFixed(3)),
+        ...(options.gallery && aggregate.lastEndedAt ? { callWindowMs: Number((Number(aggregate.lastEndedAt - aggregate.startedAt) / 1e6).toFixed(3)) } : {}),
         calls: aggregate.calls,
         ...details
       });
@@ -176,6 +182,11 @@ function createWrestlingPeopleRequestTrace(res) {
 
 function getActiveWrestlingPeopleRequestTrace() {
   return wrestlingPeopleTraceStorage.getStore() || null;
+}
+
+function getActiveWrestlingMatchGalleryTrace() {
+  const trace = getActiveWrestlingPeopleRequestTrace();
+  return trace && trace.gallery ? trace : null;
 }
 const MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS = Math.max(
   60_000,
@@ -697,6 +708,7 @@ async function fetchSmugJson(endpoint, options = {}) {
     if (peopleTrace) {
       peopleTrace.increment('smugmug_request_attempts');
       if (isImagePageRequest) peopleTrace.increment('image_page_requests');
+      if (peopleTrace.gallery && /\/image\/[^/?#]+(?:$|\?)/i.test(normalizeSmugEndpoint(endpoint))) peopleTrace.increment('image_detail_requests');
       if (attempt > 0) peopleTrace.increment('smugmug_retry_count');
     }
 
@@ -1176,7 +1188,10 @@ function getSmugImageKeywordValues(image) {
 }
 
 async function buildSmugWrestlingAlbumPhotoItemForResponse(image) {
+  const galleryTrace = getActiveWrestlingMatchGalleryTrace();
+  const hydrationStartedAt = galleryTrace && galleryTrace.startAggregateCall('image_detail_hydration');
   const hydrated = await hydrateSmugAlbumPhotoImage(image);
+  if (galleryTrace) galleryTrace.endAggregateCall('image_detail_hydration', hydrationStartedAt);
   const sourceImage = hydrated.image || image;
   const item = buildSmugAlbumPhotoItem(sourceImage, {
     hydrated: hydrated.hydrated,
@@ -6931,9 +6946,17 @@ async function fetchSmugWrestlingAlbumPhotos(albumId) {
     let start = 1;
     for (let page = 0; page < SMUG_WRESTLING_MATCH_PHOTOS_MAX_PAGES; page += 1) {
       const endpoint = `/album/${encodeURIComponent(cleanAlbumId)}!images?count=${SMUG_WRESTLING_MATCH_PHOTOS_PAGE_LIMIT}&start=${start}&_accept=application/json&_expand=Image`;
-      const json = await fetchSmugJson(endpoint);
+      const galleryTrace = getActiveWrestlingMatchGalleryTrace();
+      const pageStartedAt = galleryTrace && galleryTrace.startAggregateCall('smugmug_photo_pages');
+      let json;
+      try {
+        json = await fetchSmugJson(endpoint);
+      } finally {
+        if (galleryTrace) galleryTrace.endAggregateCall('smugmug_photo_pages', pageStartedAt);
+      }
       const images = getSmugAlbumImages(json);
       if (!images.length) break;
+      if (galleryTrace) galleryTrace.increment('photos_fetched', images.length);
 
       const items = await buildSmugWrestlingAlbumPhotoItemsForResponse(images);
       photos.push(...items.map((item) => ({ ...item, album_id: cleanAlbumId })));
@@ -7011,13 +7034,23 @@ async function enrichWrestlingShowItemWithMatchPhotos(item, row, options = {}) {
   if (Array.isArray(item.matches)) {
     let showPhotoCount = 0;
     const requestedMatchUrl = String(options.matchUrl || '').trim().toLowerCase();
+    const galleryTrace = getActiveWrestlingMatchGalleryTrace();
+    if (galleryTrace) {
+      const selectionStartedAt = galleryTrace.startStage('exact_match_selection');
+      const selectedMatches = item.matches.filter((match) => !requestedMatchUrl || String(match && match.match_url || '').trim().toLowerCase() === requestedMatchUrl);
+      galleryTrace.increment('matches_hydrated', selectedMatches.length);
+      galleryTrace.endStage('exact_match_selection', selectionStartedAt, { matchesConsidered: item.matches.length, matchesSelected: selectedMatches.length });
+    }
 
     item.matches = await mapWithConcurrency(item.matches, SMUG_REQUEST_CONCURRENCY, async (match) => {
       if (requestedMatchUrl && String(match && match.match_url || '').trim().toLowerCase() !== requestedMatchUrl) {
         return match;
       }
 
+      if (galleryTrace) galleryTrace.increment('albums_considered');
+      const albumStartedAt = galleryTrace && galleryTrace.startAggregateCall('album_resolution');
       const resolvedAlbum = await resolveSmugWrestlingMatchAlbum(match, row, item);
+      if (galleryTrace) galleryTrace.endAggregateCall('album_resolution', albumStartedAt);
       const albumId = resolvedAlbum.albumId || '';
       if (!albumId) {
         return {
@@ -7028,7 +7061,13 @@ async function enrichWrestlingShowItemWithMatchPhotos(item, row, options = {}) {
         };
       }
 
+      if (galleryTrace) galleryTrace.increment('albums_resolved');
+      const photoStartedAt = galleryTrace && galleryTrace.startAggregateCall('photo_aggregation');
       const matchedPhotos = await fetchSmugWrestlingAlbumPhotos(albumId);
+      if (galleryTrace) {
+        galleryTrace.endAggregateCall('photo_aggregation', photoStartedAt);
+        galleryTrace.increment('photos_returned', matchedPhotos.length);
+      }
 
       showPhotoCount += matchedPhotos.length;
       return {
@@ -7334,6 +7373,8 @@ function buildWrestlingShowsDbQueryOptions(query) {
 }
 
 async function handleWrestlingShowsDbRequest(req, res) {
+  const galleryTrace = getActiveWrestlingMatchGalleryTrace();
+  if (galleryTrace) galleryTrace.log('handler_entry', {}, true);
   try {
     if (!String(process.env.DATABASE_URL || '').trim()) {
       throw new Error('Missing DATABASE_URL environment variable.');
@@ -7346,6 +7387,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
     const options = buildWrestlingShowsDbQueryOptions(req.query);
     const includePhotos = shouldIncludeWrestlingMatchPhotos(req.query);
     const matchUrl = includePhotos ? String(req.query.match_url || '').trim() : '';
+    const showLookupStartedAt = galleryTrace && galleryTrace.startStage('show_lookup', {}, true);
     const countResult = await dbPool.query(
       `SELECT count(*)::int AS total FROM wrestling_shows ${options.whereSql}`,
       options.values
@@ -7364,13 +7406,22 @@ async function handleWrestlingShowsDbRequest(req, res) {
       dataValues
     );
     const venueDetailsMap = await getWrestlingVenueDetailsMap(result.rows.map((row) => row.venue_id));
+    if (galleryTrace) galleryTrace.endStage('show_lookup', showLookupStartedAt, { showCount: result.rows.length }, true);
+    const hydrationStartedAt = galleryTrace && galleryTrace.startStage('photo_hydration');
     const data = await mapWithConcurrency(
       result.rows,
       includePhotos ? 1 : 4,
       (row) => buildWrestlingShowDbApiItem(row, venueDetailsMap, { includePhotos, matchUrl })
     );
+    if (galleryTrace) {
+      galleryTrace.endStage('photo_hydration', hydrationStartedAt);
+      ['album_resolution', 'photo_aggregation', 'smugmug_photo_pages', 'image_detail_hydration'].forEach((name) => galleryTrace.endAggregate(name));
+    }
+    const assemblyStartedAt = galleryTrace && galleryTrace.startStage('response_assembly');
     const pagination = buildPaginationMeta(page, limit, total, data.length);
+    if (galleryTrace) galleryTrace.endStage('response_assembly', assemblyStartedAt);
 
+    const serializationStartedAt = galleryTrace && galleryTrace.startStage('serialization');
     res.json({
       ok: true,
       route: '/api/wrestling/shows/db',
@@ -7399,6 +7450,7 @@ async function handleWrestlingShowsDbRequest(req, res) {
       },
       data
     });
+    if (galleryTrace) galleryTrace.endStage('serialization', serializationStartedAt);
   } catch (err) {
     res.status(500).json(buildApiError('/api/wrestling/shows/db', err, {
       source: 'PostgreSQL:wrestling_shows',
@@ -24071,7 +24123,16 @@ app.get('/api/music/shows/stats', async (req, res) => {
 });
 
 app.get('/api/wrestling/shows/db', async (req, res) => {
-  return handleWrestlingShowsDbRequest(req, res);
+  const shouldTraceGallery = WRESTLING_MATCH_GALLERY_TRACE_ENABLED
+    && shouldIncludeWrestlingMatchPhotos(req.query)
+    && String(req.query.match_url || '').trim();
+  if (!shouldTraceGallery) return handleWrestlingShowsDbRequest(req, res);
+  const galleryTrace = createWrestlingPeopleRequestTrace(res, {
+    enabled: true,
+    gallery: true,
+    logLabel: 'wrestling-match-gallery-trace'
+  });
+  return wrestlingPeopleTraceStorage.run(galleryTrace, () => handleWrestlingShowsDbRequest(req, res));
 });
 
 app.get('/api/wrestling/shows/stats', async (req, res) => {
