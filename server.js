@@ -1283,9 +1283,24 @@ function recordSmugWrestlingAlbumPhotoMetadataTrace(image, trace) {
   if (missingRequiredFieldCount > 1) trace.increment('metadata_multiple_required_fields_missing');
 }
 
-async function buildSmugWrestlingAlbumPhotoItemForResponse(image) {
+async function buildSmugWrestlingAlbumPhotoItemForResponse(image, options = {}) {
   const galleryTrace = getActiveWrestlingMatchGalleryTrace();
   recordSmugWrestlingAlbumPhotoMetadataTrace(image, galleryTrace);
+  if (options.initialGrid) {
+    const thumbnailUrl = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS.thumbnail);
+    if (getSmugAlbumPhotoImageKey(image) && isLikelySmugImageUrl(thumbnailUrl) && getSmugImageCaption(image)) {
+      if (galleryTrace) galleryTrace.increment('image_detail_skips');
+      const item = buildSmugAlbumPhotoItem(image, { hydrated: false });
+      // Scoped grids use supplied media URLs; absent larger variants remain explicit.
+      item.thumbnail_url = thumbnailUrl;
+      ['small', 'medium', 'large'].forEach((size) => {
+        const url = getSmugAlbumPhotoDirectUrl(image, SMUG_ALBUM_PHOTO_URL_FIELDS[size]);
+        item[`${size}_url`] = isLikelySmugImageUrl(url) && isSmugImageUrlAtLeast(url, { small: 'S', medium: 'M', large: 'L' }[size]) ? url : '';
+      });
+      item.keywords = getSmugImageKeywordValues(image);
+      return item;
+    }
+  }
   if (hasSmugWrestlingAlbumPhotoRequiredMetadata(image)) {
     if (galleryTrace) galleryTrace.increment('image_detail_skips');
     const item = buildSmugAlbumPhotoItem(image, { hydrated: false });
@@ -1308,8 +1323,8 @@ async function buildSmugWrestlingAlbumPhotoItemForResponse(image) {
   return item;
 }
 
-async function buildSmugWrestlingAlbumPhotoItemsForResponse(images) {
-  return mapWithConcurrency(images, SMUG_REQUEST_CONCURRENCY, buildSmugWrestlingAlbumPhotoItemForResponse);
+async function buildSmugWrestlingAlbumPhotoItemsForResponse(images, options = {}) {
+  return mapWithConcurrency(images, SMUG_REQUEST_CONCURRENCY, (image) => buildSmugWrestlingAlbumPhotoItemForResponse(image, options));
 }
 function getSmugAlbumPhotosCacheKey(albumId, limit, start) {
   return `${SMUG_ALBUM_PHOTOS_CACHE_VERSION}:${albumId}:${limit}:${start}`;
@@ -7036,14 +7051,16 @@ function setCachedSmugWrestlingAlbumPhotos(albumId, photos) {
   });
 }
 
-async function fetchSmugWrestlingAlbumPhotos(albumId) {
+async function fetchSmugWrestlingAlbumPhotos(albumId, options = {}) {
   const cleanAlbumId = String(albumId || '').trim();
   if (!cleanAlbumId || !isSmugMugConfigured()) return [];
 
-  const cached = getCachedSmugWrestlingAlbumPhotos(cleanAlbumId);
+  // Keep grid-only media separate from fully hydrated results and in-flight work.
+  const cacheAlbumId = options.initialGrid ? `grid:${cleanAlbumId}` : cleanAlbumId;
+  const cached = getCachedSmugWrestlingAlbumPhotos(cacheAlbumId);
   if (cached) return cached;
-  if (smugWrestlingMatchPhotosInFlight.has(cleanAlbumId)) {
-    return smugWrestlingMatchPhotosInFlight.get(cleanAlbumId);
+  if (smugWrestlingMatchPhotosInFlight.has(cacheAlbumId)) {
+    return smugWrestlingMatchPhotosInFlight.get(cacheAlbumId);
   }
 
   const run = (async () => {
@@ -7063,24 +7080,24 @@ async function fetchSmugWrestlingAlbumPhotos(albumId) {
       if (!images.length) break;
       if (galleryTrace) galleryTrace.increment('photos_fetched', images.length);
 
-      const items = await buildSmugWrestlingAlbumPhotoItemsForResponse(images);
+      const items = await buildSmugWrestlingAlbumPhotoItemsForResponse(images, options);
       photos.push(...items.map((item) => ({ ...item, album_id: cleanAlbumId })));
 
       const pageCount = getSmugPageCount(json) || images.length;
       if (!hasSmugNextPage(json) || pageCount <= 0) break;
       start += pageCount;
     }
-    setCachedSmugWrestlingAlbumPhotos(cleanAlbumId, photos);
+    setCachedSmugWrestlingAlbumPhotos(cacheAlbumId, photos);
     return photos;
   })().catch((err) => {
     console.warn(`Wrestling SmugMug album photos failed for ${cleanAlbumId}:`, err && err.message ? err.message : String(err));
-    setCachedSmugWrestlingAlbumPhotos(cleanAlbumId, []);
+    setCachedSmugWrestlingAlbumPhotos(cacheAlbumId, []);
     return [];
   }).finally(() => {
-    smugWrestlingMatchPhotosInFlight.delete(cleanAlbumId);
+    smugWrestlingMatchPhotosInFlight.delete(cacheAlbumId);
   });
 
-  smugWrestlingMatchPhotosInFlight.set(cleanAlbumId, run);
+  smugWrestlingMatchPhotosInFlight.set(cacheAlbumId, run);
   return run;
 }
 
@@ -7168,7 +7185,7 @@ async function enrichWrestlingShowItemWithMatchPhotos(item, row, options = {}) {
 
       if (galleryTrace) galleryTrace.increment('albums_resolved');
       const photoStartedAt = galleryTrace && galleryTrace.startAggregateCall('photo_aggregation');
-      const matchedPhotos = await fetchSmugWrestlingAlbumPhotos(albumId);
+      const matchedPhotos = await fetchSmugWrestlingAlbumPhotos(albumId, { initialGrid: !!requestedMatchUrl });
       if (galleryTrace) {
         galleryTrace.endAggregateCall('photo_aggregation', photoStartedAt);
         galleryTrace.increment('photos_returned', matchedPhotos.length);
