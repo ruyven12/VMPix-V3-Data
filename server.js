@@ -18713,7 +18713,7 @@ function buildSmugImageDetailEndpoint(imageKey) {
 async function fetchSmugImageDetail(imageKey, options = {}) {
   const attemptedImageKeys = getSmugImageKeyCandidates(imageKey);
   const endpoints = buildSmugImageDetailEndpoints(imageKey).map((endpoint) => options.includeSizes
-    ? endpoint.replace('_expand=Image', '_expand=ImageSizes')
+    ? endpoint.replace('_expand=Image', '_expand=ImageSizeDetails')
     : endpoint);
   let lastError = null;
 
@@ -24269,10 +24269,10 @@ async function handleWrestlingImageDetailRequest(req, res) {
         if (!image || getBareSmugImageKey(getSmugAlbumPhotoImageKey(image)) !== imageKey) {
           throw new Error('Image detail unavailable');
         }
-        const sizeLink = image.Uris && image.Uris.ImageSizes;
+        const sizeLink = image.Uris && image.Uris.ImageSizeDetails;
         const expansion = sizeLink && detail.json.Expansions && detail.json.Expansions[sizeLink.Uri];
-        const sizes = image.ImageSizes || (sizeLink && sizeLink.ImageSizes)
-          || (expansion && expansion.ImageSizes) || {};
+        const sizes = image.ImageSizeDetails || (sizeLink && sizeLink.ImageSizeDetails)
+          || (expansion && expansion.ImageSizeDetails) || {};
         const photo = buildSmugAlbumPhotoItem(image);
         // Only actual returned size URLs; do not synthesize CDN paths.
         const aliases = {
@@ -24281,9 +24281,14 @@ async function handleWrestlingImageDetailRequest(req, res) {
           medium: ['MediumImageUrl'],
           large: ['LargestImageUrl', 'X5LargeImageUrl', 'X4LargeImageUrl', 'X3LargeImageUrl', 'X2LargeImageUrl', 'XLargeImageUrl', 'LargeImageUrl', 'OriginalImageUrl']
         };
+        const sizeNames = {
+          thumbnail: ['Thumb', 'Tiny'], small: ['Small'], medium: ['Medium'],
+          large: ['X5Large', 'X4Large', 'X3Large', 'X2Large', 'XLarge', 'Large', 'Original']
+        };
         for (const size of Object.keys(aliases)) {
           const fields = [...SMUG_ALBUM_PHOTO_URL_FIELDS[size], ...aliases[size]];
-          const url = getSmugAlbumPhotoDirectUrl(sizes, fields) || getSmugAlbumPhotoDirectUrl(image, fields);
+          const sizedUrl = sizeNames[size].map((name) => sizes[`ImageSize${name}`]?.Url).find(isLikelySmugImageUrl);
+          const url = sizedUrl || getSmugAlbumPhotoDirectUrl(sizes, fields) || getSmugAlbumPhotoDirectUrl(image, fields);
           photo[`${size}_url`] = isLikelySmugImageUrl(url) ? url : '';
         }
         if (smugWrestlingImageDetailCache.size >= 256) {
