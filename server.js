@@ -6040,6 +6040,51 @@ async function getMusicBandsDbStats() {
   return result.rows && result.rows[0] ? result.rows[0] : {};
 }
 
+// Read-only, independently settled archive totals. Photos retain the established stats authority.
+async function buildMusicTelemetryResponse() {
+  const queryRow = async (sql) => {
+    if (!String(process.env.DATABASE_URL || '').trim()) throw new Error('Database unavailable');
+    const result = await dbPool.query(sql);
+    return result.rows?.[0] || {};
+  };
+  const jobs = [
+    async () => {
+      if (!String(process.env.DATABASE_URL || '').trim()) throw new Error('Database unavailable');
+      return getMusicBandsDbStats();
+    },
+    ...['music_bands', 'music_shows', 'music_people', 'music_venues'].map((table) =>
+      () => queryRow(`SELECT count(*)::int AS value FROM ${table}`)),
+    () => queryRow(`SELECT coalesce(sum(archived_sets), 0) AS archived_sets,
+      coalesce(sum(total_sets), 0) AS total_sets FROM music_bands`),
+    () => queryRow(`SELECT count(*) FILTER (WHERE total_sets > 0 AND archived_sets >= total_sets)::int AS fully_archived,
+      count(*) FILTER (WHERE total_sets > 0 AND archived_sets >= 0 AND archived_sets < total_sets)::int AS in_progress,
+      (count(*) - count(*) FILTER (WHERE total_sets > 0 AND archived_sets >= total_sets)
+        - count(*) FILTER (WHERE total_sets > 0 AND archived_sets >= 0 AND archived_sets < total_sets))::int AS awaiting_archive
+      FROM music_bands`),
+    () => queryRow(`SELECT extract(year FROM min(show_date))::int AS first_year,
+      extract(year FROM max(show_date))::int AS last_year FROM music_shows`),
+  ];
+  const results = await Promise.allSettled(jobs.map((job) => job()));
+  const field = (index, name) => {
+    const raw = results[index].status === 'fulfilled' ? results[index].value[name] : null;
+    if (raw === null || raw === undefined || raw === '') return null;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) ? value : null;
+  };
+  const photos = field(0, 'photos_total');
+  const failures = results.filter((result) => result.status === 'rejected').length;
+  return {
+    ok: true, route: '/api/music/telemetry',
+    status: failures === results.length ? 'unavailable' : failures ? 'partial' : 'live',
+    generatedAt: new Date().toISOString(),
+    photoTotals: { photosTotal: photos === null ? null : toIntegerCount(photos) },
+    totals: { bands: field(1, 'value'), shows: field(2, 'value'), people: field(3, 'value'), venues: field(4, 'value') },
+    archive: { archivedSets: field(5, 'archived_sets'), totalSets: field(5, 'total_sets'),
+      fullyArchived: field(6, 'fully_archived'), inProgress: field(6, 'in_progress'), awaitingArchive: field(6, 'awaiting_archive') },
+    span: { firstYear: field(7, 'first_year'), lastYear: field(7, 'last_year') },
+  };
+}
+
 async function buildMusicBandsDbStatsResponse(forceRefresh) {
   const generated = new Date();
   const dbStats = await getMusicBandsDbStats();
@@ -24204,6 +24249,11 @@ app.get('/api/music/bands/db', async (req, res) => {
 
 app.get('/api/v3/music/bands/db', async (req, res) => {
   return handleMusicBandsDbRequest(req, res, '/api/v3/music/bands/db');
+});
+
+app.get('/api/music/telemetry', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(await buildMusicTelemetryResponse());
 });
 
 app.get('/api/music/bands/stats', async (req, res) => {
