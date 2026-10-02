@@ -273,7 +273,8 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/stats/summary',
     '/api/admin/stats/rebuild',
     '/api/admin/stats/rebuild/music',
-    '/api/admin/stats/rebuild/wrestling'
+    '/api/admin/stats/rebuild/wrestling',
+    '/api/admin/stats/rebuild/wrestling/photos'
   ]),
   imports: Object.freeze([
     '/admin/import/music/bands',
@@ -7847,6 +7848,7 @@ async function buildWrestlingShowsDbStatsResponse() {
     ok: true,
     route: '/api/wrestling/shows/stats',
     source: 'PostgreSQL:wrestling_shows',
+    photoTotals: await readWrestlingArchivePhotoTotals(),
     generatedAt: generated.toISOString(),
     generatedTime: formatEasternGeneratedTime(generated),
     totals: {
@@ -20038,6 +20040,252 @@ async function buildStatsSnapshotData({ section, category, generated, existingTa
   return buildTableStatsSnapshotData({ section, category, config, generated, existingTables, columnsByTable });
 }
 
+// Wrestling archive photo totals: explicit enumeration only; ordinary stats only read snapshots.
+function canonicalWrestlingArchiveImageKey(value) {
+  const key = String(value || '').trim().replace(/^i-/i, '');
+  return /^[A-Za-z0-9]+$/.test(key) ? key : '';
+}
+
+function projectWrestlingArchivePhotoTotals(rows = []) {
+  const verified = rows.find((row) => row.snapshot_key === 'photos_verified')?.data;
+  const attempt = rows.find((row) => row.snapshot_key === 'photos_attempt')?.data;
+  const valid = verified?.definition === 'unique_wrestling_image_keys_v1'
+    && verified.status === 'complete' && Number.isSafeInteger(verified.photosTotal) && verified.photosTotal >= 0;
+  return {
+    photosTotal: valid ? verified.photosTotal : null,
+    status: valid ? (attempt && attempt.status !== 'complete' ? 'stale' : 'complete') : (attempt?.status === 'partial' ? 'partial' : 'unavailable'),
+    complete: !!valid,
+    calculatedAt: valid ? verified.calculatedAt : null,
+    source: 'stats_snapshots',
+    coverage: valid ? verified.coverage : null,
+    lastAttempt: attempt ? {
+      status: attempt.status, calculatedAt: attempt.calculatedAt,
+      observedUniquePhotos: attempt.coverage?.uniqueCanonicalImageKeys ?? null,
+      coverage: attempt.coverage
+    } : null
+  };
+}
+
+async function readWrestlingArchivePhotoTotals() {
+  try {
+    // No ensure/migration helper and no SmugMug calls on the public read path.
+    const result = await dbPool.query(`
+      SELECT snapshot_key, data FROM stats_snapshots
+      WHERE section = 'wrestling' AND category = 'shows'
+        AND snapshot_key IN ('photos_verified', 'photos_attempt')
+    `);
+    return projectWrestlingArchivePhotoTotals(result.rows);
+  } catch (_) {
+    return { ...projectWrestlingArchivePhotoTotals(), warning: 'Photo aggregate snapshot unavailable.' };
+  }
+}
+
+function addWrestlingArchivePhotoIssue(result, reason, ref = {}) {
+  result.coverage.issueCount += 1;
+  if (result.issues.length < 50) result.issues.push({ reason, ...ref });
+}
+
+function wrestlingArchivePhotoSourceFingerprint(rows) {
+  return crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+}
+
+async function readWrestlingArchivePhotoSource(client = dbPool) {
+  return (await client.query('SELECT * FROM wrestling_shows ORDER BY id')).rows;
+}
+
+async function enumerateWrestlingArchivePhotoAlbum(albumId, result, photoKeys, deadline) {
+  const coverage = result.coverage;
+  const seenInAlbum = new Set();
+  let start = 1;
+  let expectedTotal = null;
+  let encountered = 0;
+  for (let page = 0; page < coverage.maxPagesPerAlbum; page += 1) {
+    if (Date.now() >= deadline) throw new Error('refresh_deadline_reached');
+    const json = await fetchSmugJson(`/album/${encodeURIComponent(albumId)}!images?count=${SMUG_WRESTLING_MATCH_PHOTOS_PAGE_LIMIT}&start=${start}&_accept=application/json&_expand=Image`);
+    coverage.imagePagesFetched += 1;
+    const response = json?.Response || json;
+    const pages = response?.Pages;
+    const totalValue = pages?.Total ?? pages?.total;
+    const total = totalValue === '' || totalValue == null ? NaN : Number(totalValue);
+    if (!Number.isSafeInteger(total) || total < 0) throw new Error('pagination_total_unavailable');
+    if (expectedTotal != null && total !== expectedTotal) throw new Error('album_changed_during_refresh');
+    expectedTotal = total;
+    if (pages.Start != null && Number(pages.Start) !== start) throw new Error('unexpected_page_start');
+    const images = getSmugAlbumImages(json);
+    coverage.rawImageReferences += images.length;
+    encountered += images.length;
+    for (const image of images) {
+      // Keys only: never substitute a URL, caption, album ID or relationship ID.
+      const key = canonicalWrestlingArchiveImageKey(getSmugNestedField(image, ['ImageKey', 'imageKey', 'image_key']));
+      if (!key) {
+        coverage.missingImageKeys += 1;
+        addWrestlingArchivePhotoIssue(result, 'missing_image_key', { album_id: albumId });
+        continue;
+      }
+      if (seenInAlbum.has(key)) throw new Error('duplicate_image_on_album_pages');
+      seenInAlbum.add(key);
+      const video = getSmugNestedRawField(image, ['IsVideo', 'is_video']);
+      if (video === true || video === 'true' || video === 1 || video === '1') {
+        coverage.videosExcluded += 1;
+        continue;
+      }
+      if (![false, 'false', 0, '0'].includes(video)) {
+        coverage.unknownMediaTypes += 1;
+        addWrestlingArchivePhotoIssue(result, 'unknown_media_type', { album_id: albumId });
+        continue;
+      }
+      coverage.photoImageReferences += 1;
+      photoKeys.add(key);
+    }
+    const next = pages.NextPage || pages.nextPage;
+    if (!next && encountered === total) return;
+    if (!images.length || encountered >= total || !next) throw new Error('incomplete_album_pagination');
+    start += images.length;
+  }
+  throw new Error('album_page_limit_reached');
+}
+
+async function buildWrestlingArchivePhotoAggregate(rows, deadline) {
+  const result = {
+    definition: 'unique_wrestling_image_keys_v1', status: 'partial', photosTotal: null,
+    calculatedAt: null, sourceFingerprint: wrestlingArchivePhotoSourceFingerprint(rows),
+    coverage: {
+      showsExamined: rows.length, matchesExamined: 0, mappedShows: 0, mappedMatches: 0,
+      showsUnresolved: 0, matchesUnresolved: 0, showSourcesUnresolved: 0,
+      albumsDiscovered: 0, albumsEnumerated: 0, albumsFailed: 0,
+      imagePagesFetched: 0, rawImageReferences: 0, photoImageReferences: 0,
+      uniqueCanonicalImageKeys: 0, duplicateImageReferences: 0,
+      videosExcluded: 0, missingImageKeys: 0, unknownMediaTypes: 0, issueCount: 0,
+      maxPagesPerAlbum: getIntegerEnv('WRESTLING_ARCHIVE_PHOTO_MAX_PAGES', 200, 1, 1000)
+    },
+    issues: []
+  };
+  const albums = new Set();
+  const photoKeys = new Set();
+  const coverage = result.coverage;
+  for (const row of rows) {
+    let mapped = false;
+    const addAlbum = (value) => {
+      const key = String(value || '').trim();
+      if (!/^[A-Za-z0-9]+$/.test(key)) return false;
+      albums.add(key);
+      mapped = true;
+      return true;
+    };
+    // Explicit show album/gallery sources only. Poster and portrait fields are never read here.
+    const showIds = getWrestlingShowAlbumIdCandidates(row);
+    const showUrls = getWrestlingShowPhotoSourceUrls(row);
+    for (const source of [...showIds, ...showUrls]) {
+      try {
+        if (Date.now() >= deadline) throw new Error('refresh_deadline_reached');
+        const key = showIds.includes(source) ? source : await resolveSmugWrestlingAlbumIdFromSourceUrl(source);
+        if (!addAlbum(key)) throw new Error('unresolved_show_album');
+      } catch (_) {
+        coverage.showSourcesUnresolved += 1;
+        addWrestlingArchivePhotoIssue(result, 'unresolved_show_album', { show_id: row.show_id });
+      }
+    }
+    const matches = Array.isArray(row.matches) ? row.matches : [];
+    if (!Array.isArray(row.matches)) addWrestlingArchivePhotoIssue(result, 'invalid_matches', { show_id: row.show_id });
+    coverage.matchesExamined += matches.length;
+    await mapWithConcurrency(matches, SMUG_REQUEST_CONCURRENCY, async (match) => {
+      try {
+        if (Date.now() >= deadline) throw new Error('refresh_deadline_reached');
+        const resolved = await resolveSmugWrestlingMatchAlbum(match, row, row);
+        if (!addAlbum(resolved?.albumId)) throw new Error('unresolved_match_album');
+        coverage.mappedMatches += 1;
+      } catch (_) {
+        coverage.matchesUnresolved += 1;
+        addWrestlingArchivePhotoIssue(result, 'unresolved_match_album', { show_id: row.show_id, match_url: match?.match_url || null });
+      }
+    });
+    if (mapped) coverage.mappedShows += 1;
+    else {
+      coverage.showsUnresolved += 1;
+      addWrestlingArchivePhotoIssue(result, 'show_has_no_mapped_album', { show_id: row.show_id });
+    }
+  }
+  coverage.albumsDiscovered = albums.size;
+  await mapWithConcurrency([...albums], SMUG_REQUEST_CONCURRENCY, async (albumId) => {
+    try {
+      await enumerateWrestlingArchivePhotoAlbum(albumId, result, photoKeys, deadline);
+      coverage.albumsEnumerated += 1;
+    } catch (err) {
+      coverage.albumsFailed += 1;
+      const reasons = ['refresh_deadline_reached', 'pagination_total_unavailable', 'album_changed_during_refresh', 'unexpected_page_start', 'duplicate_image_on_album_pages', 'incomplete_album_pagination', 'album_page_limit_reached'];
+      addWrestlingArchivePhotoIssue(result, reasons.includes(err.message) ? err.message : 'album_fetch_failed', { album_id: albumId });
+    }
+  });
+  coverage.uniqueCanonicalImageKeys = photoKeys.size;
+  coverage.duplicateImageReferences = coverage.photoImageReferences - photoKeys.size;
+  result.status = coverage.issueCount ? 'partial' : 'complete';
+  result.photosTotal = result.status === 'complete' ? photoKeys.size : null;
+  result.calculatedAt = new Date().toISOString();
+  return result;
+}
+
+async function persistWrestlingArchivePhotoAggregate(result, lock) {
+  const client = await dbPool.connect();
+  try {
+    await client.query('BEGIN');
+    const lease = await client.query("SELECT id FROM import_locks WHERE id = $1 AND status = 'running' AND expires_at > NOW() FOR UPDATE", [lock.id]);
+    if (!lease.rows.length) throw new Error('Photo refresh lock expired; snapshot not saved.');
+    await client.query('LOCK TABLE wrestling_shows IN SHARE MODE');
+    if (wrestlingArchivePhotoSourceFingerprint(await readWrestlingArchivePhotoSource(client)) !== result.sourceFingerprint) {
+      addWrestlingArchivePhotoIssue(result, 'archive_changed_during_refresh');
+      result.status = 'partial';
+      result.photosTotal = null;
+    }
+    // A partial attempt has a separate key; it can never replace the verified snapshot.
+    const keys = result.status === 'complete' ? ['photos_attempt', 'photos_verified'] : ['photos_attempt'];
+    for (const key of keys) {
+      await client.query(`INSERT INTO stats_snapshots (section, category, snapshot_key, data, generated_at, meta)
+        VALUES ('wrestling', 'shows', $1, $2::jsonb, $3, $4::jsonb)
+        ON CONFLICT (section, category, snapshot_key) DO UPDATE SET
+          data = EXCLUDED.data, generated_at = EXCLUDED.generated_at, meta = EXCLUDED.meta`,
+      [key, JSON.stringify(result), result.calculatedAt, JSON.stringify({ refreshedBy: 'admin', photoAggregate: true })]);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function handleWrestlingArchivePhotoRefresh(req, res) {
+  // Require a credential even when other admin routes allow a local-development bypass.
+  const secrets = getConfiguredAdminSecrets();
+  if (!secrets.length || !getRequestAdminTokens(req).some((token) => adminTokenMatches(token, secrets))) {
+    return res.status(secrets.length ? 401 : 503).json({ ok: false, error: 'Admin credentials required for photo refresh.' });
+  }
+  if (!String(process.env.DATABASE_URL || '').trim() || !isSmugMugConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Database and SmugMug configuration required.' });
+  }
+  let lock;
+  let result;
+  let saved = false;
+  try {
+    const acquired = await acquireImportLock({ section: 'wrestling', category: 'shows', owner: getImportLockOwner(), meta: { operation: 'archive_photo_refresh' } });
+    if (!acquired.acquired) return res.status(409).json({ ok: false, error: 'Wrestling Shows import or photo refresh already running.' });
+    if (acquired.bypassed || !acquired.lock) throw new Error('Photo refresh requires an active database lock.');
+    lock = acquired.lock;
+    const deadline = new Date(lock.expires_at).getTime() - 5000;
+    if (!Number.isFinite(deadline) || Date.now() >= deadline) throw new Error('Photo refresh lock expired.');
+    await ensureStatsSnapshotsTable();
+    const rows = await readWrestlingArchivePhotoSource();
+    result = await buildWrestlingArchivePhotoAggregate(rows, deadline);
+    await persistWrestlingArchivePhotoAggregate(result, lock);
+    saved = true;
+    return res.json({ ok: true, ...result, photoTotals: await readWrestlingArchivePhotoTotals() });
+  } catch (_) {
+    return res.status(503).json({ ok: false, error: 'Photo refresh failed; previous verified snapshot preserved.' });
+  } finally {
+    if (lock) await releaseImportLock(lock.id, saved && result?.status === 'complete' ? 'completed' : 'failed', { operation: 'archive_photo_refresh', aggregateStatus: saved ? result.status : 'error' });
+  }
+}
+
 async function rebuildStatsSnapshot({ section, category }) {
   const cleanSection = String(section || '').trim().toLowerCase();
   const cleanCategory = String(category || '').trim().toLowerCase();
@@ -24125,6 +24373,8 @@ app.get('/api/admin/stats/rebuild/music', async (req, res) => {
 app.get('/api/admin/stats/rebuild/wrestling', async (req, res) => {
   return handleStatsRebuildRequest(req, res, 'wrestling');
 });
+
+app.post('/api/admin/stats/rebuild/wrestling/photos', handleWrestlingArchivePhotoRefresh);
 
 app.get('/api/admin/overview', async (req, res) => {
   try {
