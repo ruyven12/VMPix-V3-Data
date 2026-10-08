@@ -21,7 +21,7 @@ const aggregateSource = source.slice(
 );
 function harness(overrides = {}) {
   const context = vm.createContext({
-    crypto, process: { env: { DATABASE_URL: 'test-only' } },
+    crypto, console: { warn() {} }, process: { env: { DATABASE_URL: 'test-only' } }, SMUG_NICKNAME: 'vmpix',
     SMUG_REQUEST_CONCURRENCY: 2, SMUG_WRESTLING_MATCH_PHOTOS_PAGE_LIMIT: 200,
     getIntegerEnv: (_name, fallback) => fallback,
     getWrestlingShowAlbumIdCandidates: (row) => row.album_id ? [row.album_id] : [],
@@ -32,7 +32,8 @@ function harness(overrides = {}) {
     dbPool: { query: async () => { throw new Error('Unexpected DB query'); } },
     ...overrides
   });
-  vm.runInContext(['getSmugAlbumImages', 'getSmugNestedField', 'getSmugNestedRawField', 'mapWithConcurrency']
+  vm.runInContext(['getSmugAlbumImages', 'getSmugAlbums', 'getSmugAlbumKey', 'getSmugAlbumImageCount',
+    'getSmugPageTotal', 'getSmugAlbumTotalPhotos', 'getSmugNestedField', 'getSmugNestedRawField', 'mapWithConcurrency']
     .map(functionSource).join('\n') + '\n' + aggregateSource, context);
   return context;
 }
@@ -130,7 +131,7 @@ test('unknown is null, verified zero is zero, and partial refresh retains verifi
   assert.equal(project([verified]).photosTotal, 0);
   verified.data.photosTotal = 123;
   const attempt = { snapshot_key: 'photos_attempt', data: {
-    status: 'partial', calculatedAt: 'later', coverage: { uniqueCanonicalImageKeys: 10 }
+    definition: 'unique_wrestling_image_keys_v1', status: 'partial', calculatedAt: 'later', coverage: { uniqueCanonicalImageKeys: 10 }
   } };
   const projected = project([verified, attempt]);
   assert.equal(projected.photosTotal, 123);
@@ -184,8 +185,8 @@ test('public stats reads snapshots only, preserves existing totals, and handles 
     assert.doesNotMatch(sql, /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE)\b/i);
     if (sql.includes('FROM stats_snapshots')) {
       snapshotReads++;
-      return { rows: [{ snapshot_key: 'photos_verified', data: {
-        definition: 'unique_wrestling_image_keys_v1', status: 'complete', photosTotal: 123
+      return { rows: [{ snapshot_key: 'folder_photos_verified', data: {
+        definition: 'wrestling_folder_album_sum_v1', status: 'complete', photosTotal: 123
       } }] };
     }
     return { rows: [{ shows_total: 47, matches_total: 369 }] };
@@ -219,11 +220,184 @@ test('refresh requires explicit auth and a real lock; failed persistence release
     context.buildWrestlingArchivePhotoAggregate = async () => { enumerations++; return { status: 'complete' }; };
     context.persistWrestlingArchivePhotoAggregate = async () => { throw new Error('DB failure'); };
     const res = { code: 200, status(code) { this.code = code; return this; }, json(body) { this.body = body; return this; } };
-    await context.handleWrestlingArchivePhotoRefresh({}, res);
+    await context.handleWrestlingArchivePhotoRefresh({ query: { scope: 'mapped' } }, res);
     assert.equal(res.body.ok, false);
     assert.equal(enumerations, mode === 'persist_failed' ? 1 : 0);
     if (mode === 'persist_failed') assert.equal(releasedStatus, 'failed');
     if (mode === 'busy') assert.equal(res.code, 409);
   }
   assert.ok(source.includes("app.post('/api/admin/stats/rebuild/wrestling/photos', handleWrestlingArchivePhotoRefresh)"));
+});
+
+const folderPage = (kind, items, total = items.length, start = 1, next = false) => ({ Response: {
+  [kind === 'folders' ? 'Folder' : 'Album']: items,
+  Pages: { Total: total, Start: start, Count: items.length, ...(next ? { NextPage: 'ignored-safe-cursor' } : {}) }
+} });
+const folderRun = (context) => context.buildWrestlingFolderPhotoAggregate(Date.now() + 60000);
+
+test('folder hierarchy and both listing types paginate; albums are counted once across folders', async () => {
+  const calls = [];
+  const context = harness({ fetchSmugJson: async (endpoint) => {
+    calls.push(endpoint);
+    const url = new URL(endpoint, 'https://api.smugmug.com');
+    const [path, kind] = url.pathname.split('!');
+    const start = Number(url.searchParams.get('start'));
+    assert.ok(path.startsWith('/folder/user/vmpix/Wrestling'));
+    if (path.endsWith('/Wrestling') && kind === 'folders') {
+      return folderPage(kind, [{ UrlName: start === 1 ? 'Limitless' : 'Other' }], 2, start, start === 1);
+    }
+    if (path.endsWith('/Limitless') && kind === 'folders') return folderPage(kind, [{
+      Uri: '/api/v2/folder/user/vmpix/Wrestling/Limitless/050826'
+    }]);
+    if (path.endsWith('/050826') && kind === 'albums') return start === 1
+      ? folderPage(kind, [{ AlbumKey: 'A', ImageCount: 12 }], 2, 1, true)
+      : folderPage(kind, [{ AlbumKey: 'B', ImageCount: 30 }], 2, 2);
+    if (path.endsWith('/Other') && kind === 'albums') return folderPage(kind, [{ AlbumKey: 'A', ImageCount: 12 }]);
+    return folderPage(kind, []);
+  } });
+  const result = await folderRun(context);
+  assert.equal(result.status, 'complete');
+  assert.equal(result.photosTotal, 42);
+  assert.equal(result.coverage.foldersDiscovered, 4);
+  assert.equal(result.coverage.foldersEnumerated, 4);
+  assert.equal(result.coverage.folderPagesFetched, 5);
+  assert.equal(result.coverage.albumPagesFetched, 5);
+  assert.equal(result.coverage.albumsCounted, 2);
+  assert.equal(result.coverage.duplicateAlbumReferences, 1);
+  assert.equal(calls.length, 10);
+});
+
+test('missing album metadata uses one-image pagination total, never image array length', async () => {
+  const calls = [];
+  const context = harness({ fetchSmugJson: async (endpoint) => {
+    calls.push(endpoint);
+    if (endpoint.startsWith('/album/')) return page([image('A')], 77, 1, true);
+    return endpoint.includes('!folders') ? folderPage('folders', [])
+      : folderPage('albums', [{ AlbumKey: 'AlbumA' }]);
+  } });
+  const result = await folderRun(context);
+  assert.equal(result.photosTotal, 77);
+  assert.equal(calls.filter((url) => url.startsWith('/album/')).length, 1);
+  for (const json of [{ Response: { AlbumImage: [image('A')] } }, page([], 0)]) {
+    const count = await harness({ fetchSmugJson: async () => json }).getSmugAlbumTotalPhotos({ AlbumKey: 'A' }, { requireComplete: true });
+    assert.equal(count, json.Response.Pages ? 0 : null);
+  }
+  // Existing Music callers retain their established fallback.
+  const music = harness({ fetchSmugJson: async () => ({ Response: { AlbumImage: [image('A')] } }) });
+  assert.equal(await music.getSmugAlbumTotalPhotos({ AlbumKey: 'A' }), 1);
+  for (const invalid of [null, '', ' ', false, [], {}, -1, 1.5]) {
+    const context = harness({ fetchSmugJson: async () => page([], invalid) });
+    assert.equal(await context.getSmugAlbumTotalPhotos({ AlbumKey: 'A' }, { requireComplete: true }), null);
+  }
+});
+
+test('failed album, unknown counts and explicit zero remain distinguishable', async () => {
+  for (const mode of ['failure', 'unknown', 'zero', 'empty']) {
+    const context = harness({ fetchSmugJson: async (endpoint) => {
+      if (endpoint.startsWith('/album/')) {
+        if (mode === 'failure') throw new Error('secret credentials');
+        return { Response: { AlbumImage: [] } };
+      }
+      if (endpoint.includes('!folders')) return folderPage('folders', []);
+      return folderPage('albums', mode === 'empty' ? [] : [{ AlbumKey: 'A', ImageCount: mode === 'zero' ? 0 : null }]);
+    } });
+    const result = await folderRun(context);
+    const complete = ['zero', 'empty'].includes(mode);
+    assert.equal(result.status, complete ? 'complete' : 'partial');
+    assert.equal(result.photosTotal, complete ? 0 : null);
+    assert.equal(result.coverage.albumsFailed, complete ? 0 : 1);
+    assert.doesNotMatch(JSON.stringify(result), /secret credentials/);
+  }
+});
+
+test('bad pagination, duplicate pages, listing errors and out-of-tree paths stay partial', async () => {
+  for (const mode of ['truncated', 'no_total', 'duplicate', 'outside', 'traversal', 'failure']) {
+    const calls = [];
+    const context = harness({ fetchSmugJson: async (endpoint) => {
+      calls.push(endpoint);
+      if (endpoint.includes('!albums')) {
+        if (mode === 'truncated') return folderPage('albums', [{ AlbumKey: 'A', ImageCount: 9 }], 2);
+        if (mode === 'no_total') return { Response: { Album: [] } };
+        if (mode === 'failure') throw new Error('secret');
+        if (mode === 'duplicate') {
+          const start = Number(new URL(endpoint, 'https://example.test').searchParams.get('start'));
+          return folderPage('albums', [{ AlbumKey: 'A', ImageCount: 9 }], 2, start, start === 1);
+        }
+        return folderPage('albums', []);
+      }
+      return folderPage('folders', mode === 'outside' ? [{ Uri: '/api/v2/folder/user/vmpix/Music' }]
+        : mode === 'traversal' ? [{ UrlName: '..' }] : []);
+    } });
+    const result = await folderRun(context);
+    assert.equal(result.status, 'partial', mode);
+    assert.equal(result.photosTotal, null, mode);
+    assert.ok(calls.every((url) => url.startsWith('/folder/user/vmpix/Wrestling!')));
+    assert.doesNotMatch(JSON.stringify(result), /secret/);
+  }
+});
+
+test('listing limits and refresh deadline cannot certify partial discovery', async () => {
+  const context = harness({ fetchSmugJson: async () => folderPage('albums', [{ AlbumKey: 'A' }], 2, 1, true) });
+  const result = { coverage: { maxPagesPerList: 1, albumPagesFetched: 0, issueCount: 0 }, issues: [] };
+  await assert.rejects(context.listWrestlingPhotoFolderItems('Wrestling', 'albums', result, Date.now() + 60000, () => {}), /page_limit/);
+  const expired = await harness().buildWrestlingFolderPhotoAggregate(0);
+  assert.equal(expired.status, 'partial');
+  assert.equal(expired.photosTotal, null);
+});
+
+test('folder snapshots never read or replace mapped-image snapshots; partial saves preserve verified', async () => {
+  const snapshots = new Map([
+    ['photos_verified', { definition: 'unique_wrestling_image_keys_v1', status: 'complete', photosTotal: 999 }],
+    ['photos_attempt', { definition: 'unique_wrestling_image_keys_v1', status: 'complete', photosTotal: 999 }]
+  ]);
+  let reads = 0;
+  const query = async (sql, args) => {
+    assert.doesNotMatch(sql, /FROM wrestling_shows|LOCK TABLE wrestling_shows/);
+    if (sql.includes('SELECT id FROM import_locks')) return { rows: [{ id: 1 }] };
+    if (sql.startsWith('INSERT INTO stats_snapshots')) snapshots.set(args[0], JSON.parse(args[1]));
+    if (sql.includes('FROM stats_snapshots')) {
+      reads++;
+      assert.deepEqual(Array.from(args[0]), ['folder_photos_verified', 'folder_photos_attempt']);
+      return { rows: args[0].filter((key) => snapshots.has(key)).map((key) => ({ snapshot_key: key, data: snapshots.get(key) })) };
+    }
+    return { rows: [] };
+  };
+  const context = harness({ dbPool: { query, connect: async () => ({ query, release() {} }) } });
+  assert.equal((await context.readWrestlingArchivePhotoTotals()).photosTotal, null);
+  const complete = { definition: 'wrestling_folder_album_sum_v1', status: 'complete', photosTotal: 42,
+    calculatedAt: '2026-10-08T12:00:00Z', coverage: { summedAlbumPhotos: 42, issueCount: 0 }, issues: [] };
+  await context.persistWrestlingArchivePhotoAggregate(complete, { id: 1 });
+  const partial = { ...complete, status: 'partial', photosTotal: null, calculatedAt: '2026-10-08T13:00:00Z',
+    coverage: { summedAlbumPhotos: 3, issueCount: 1 } };
+  await context.persistWrestlingArchivePhotoAggregate(partial, { id: 1 });
+  const response = await context.readWrestlingArchivePhotoTotals();
+  assert.equal(response.photosTotal, 42);
+  assert.equal(response.status, 'stale');
+  assert.equal(response.calculatedAt, complete.calculatedAt);
+  assert.equal(response.lastAttempt.observedAlbumPhotoSum, 3);
+  assert.equal(snapshots.get('photos_verified').photosTotal, 999);
+  assert.equal(snapshots.get('photos_attempt').photosTotal, 999);
+  assert.equal(reads, 2);
+  assert.equal(context.projectWrestlingArchivePhotoTotals([{ snapshot_key: 'folder_photos_attempt', data: partial }], true).photosTotal, null);
+});
+
+test('existing admin endpoint defaults to folder refresh; mapped mode stays opt-in', async () => {
+  for (const scope of [undefined, 'folder', 'mapped', 'invalid']) {
+    const calls = [];
+    const context = harness({
+      getConfiguredAdminSecrets: () => ['test'], getRequestAdminTokens: () => ['test'], adminTokenMatches: () => true,
+      isSmugMugConfigured: () => true, getImportLockOwner: () => 'test',
+      acquireImportLock: async () => ({ acquired: true, lock: { id: 1, expires_at: new Date(Date.now() + 60000).toISOString() } }),
+      ensureStatsSnapshotsTable: async () => true, releaseImportLock: async () => {}
+    });
+    context.readWrestlingArchivePhotoSource = async () => { calls.push('DB shows'); return []; };
+    context.buildWrestlingFolderPhotoAggregate = async () => { calls.push('folder'); return { status: 'complete' }; };
+    context.buildWrestlingArchivePhotoAggregate = async () => { calls.push('mapped'); return { status: 'complete' }; };
+    context.persistWrestlingArchivePhotoAggregate = async () => {};
+    context.readWrestlingArchivePhotoTotals = async (folderWide) => ({ folderWide });
+    const res = { code: 200, status(code) { this.code = code; return this; }, json(body) { this.body = body; return this; } };
+    await context.handleWrestlingArchivePhotoRefresh({ query: { scope } }, res);
+    assert.deepEqual(calls, scope === 'invalid' ? [] : scope === 'mapped' ? ['DB shows', 'mapped'] : ['folder']);
+    assert.equal(res.code, scope === 'invalid' ? 400 : 200);
+  }
 });

@@ -2082,8 +2082,14 @@ function buildMusicBandParentAlbumsEndpoint(target) {
     .join('/');
   return `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!albums?_accept=application/json`;
 }
-async function getSmugAlbumTotalPhotos(album) {
-  const directCount = getSmugAlbumImageCount(album);
+async function getSmugAlbumTotalPhotos(album, { requireComplete = false } = {}) {
+  // Folder totals need authoritative counts, not a one-image sample or null coerced to zero.
+  const countFields = ['ImageCount', 'imageCount', 'image_count', 'PhotoCount', 'photoCount', 'photo_count', 'TotalPhotos', 'totalPhotos', 'TotalImages', 'totalImages'];
+  const countSource = requireComplete ? Object.fromEntries(countFields.map((key) =>
+    [key, album?.[key] ?? album?.Stats?.[key]]).filter(([, value]) =>
+    (typeof value === 'number' || typeof value === 'string' && value.trim() !== '')
+      && Number.isSafeInteger(Number(value)) && Number(value) >= 0)) : album;
+  const directCount = getSmugAlbumImageCount(countSource);
   if (directCount != null) return directCount;
 
   const albumKey = getSmugAlbumKey(album);
@@ -2091,6 +2097,12 @@ async function getSmugAlbumTotalPhotos(album) {
 
   try {
     const json = await fetchSmugJson(`/album/${encodeURIComponent(albumKey)}!images?count=1&start=1&_accept=application/json`);
+    if (requireComplete) {
+      const pages = (json?.Response || json)?.Pages;
+      const raw = pages?.Total ?? pages?.total;
+      const total = typeof raw === 'number' || typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
+      return Number.isSafeInteger(total) && total >= 0 ? total : null;
+    }
     const pageTotal = getSmugPageTotal(json);
     if (pageTotal != null) return pageTotal;
     return getSmugAlbumImages(json).length;
@@ -20046,10 +20058,12 @@ function canonicalWrestlingArchiveImageKey(value) {
   return /^[A-Za-z0-9]+$/.test(key) ? key : '';
 }
 
-function projectWrestlingArchivePhotoTotals(rows = []) {
-  const verified = rows.find((row) => row.snapshot_key === 'photos_verified')?.data;
-  const attempt = rows.find((row) => row.snapshot_key === 'photos_attempt')?.data;
-  const valid = verified?.definition === 'unique_wrestling_image_keys_v1'
+function projectWrestlingArchivePhotoTotals(rows = [], folderWide = false) {
+  const prefix = folderWide ? 'folder_photos' : 'photos';
+  const definition = folderWide ? 'wrestling_folder_album_sum_v1' : 'unique_wrestling_image_keys_v1';
+  const verified = rows.find((row) => row.snapshot_key === `${prefix}_verified`)?.data;
+  const attempt = rows.find((row) => row.snapshot_key === `${prefix}_attempt` && row.data?.definition === definition)?.data;
+  const valid = verified?.definition === definition
     && verified.status === 'complete' && Number.isSafeInteger(verified.photosTotal) && verified.photosTotal >= 0;
   return {
     photosTotal: valid ? verified.photosTotal : null,
@@ -20057,26 +20071,28 @@ function projectWrestlingArchivePhotoTotals(rows = []) {
     complete: !!valid,
     calculatedAt: valid ? verified.calculatedAt : null,
     source: 'stats_snapshots',
+    ...(folderWide ? { definition, folder: 'Wrestling' } : {}),
     coverage: valid ? verified.coverage : null,
     lastAttempt: attempt ? {
       status: attempt.status, calculatedAt: attempt.calculatedAt,
-      observedUniquePhotos: attempt.coverage?.uniqueCanonicalImageKeys ?? null,
+      ...(folderWide ? { observedAlbumPhotoSum: attempt.coverage?.summedAlbumPhotos ?? null }
+        : { observedUniquePhotos: attempt.coverage?.uniqueCanonicalImageKeys ?? null }),
       coverage: attempt.coverage
     } : null
   };
 }
 
-async function readWrestlingArchivePhotoTotals() {
+async function readWrestlingArchivePhotoTotals(folderWide = true) {
   try {
     // No ensure/migration helper and no SmugMug calls on the public read path.
     const result = await dbPool.query(`
       SELECT snapshot_key, data FROM stats_snapshots
       WHERE section = 'wrestling' AND category = 'shows'
-        AND snapshot_key IN ('photos_verified', 'photos_attempt')
-    `);
-    return projectWrestlingArchivePhotoTotals(result.rows);
+        AND snapshot_key = ANY($1::text[])
+    `, [folderWide ? ['folder_photos_verified', 'folder_photos_attempt'] : ['photos_verified', 'photos_attempt']]);
+    return projectWrestlingArchivePhotoTotals(result.rows, folderWide);
   } catch (_) {
-    return { ...projectWrestlingArchivePhotoTotals(), warning: 'Photo aggregate snapshot unavailable.' };
+    return { ...projectWrestlingArchivePhotoTotals([], folderWide), warning: 'Photo aggregate snapshot unavailable.' };
   }
 }
 
@@ -20224,20 +20240,144 @@ async function buildWrestlingArchivePhotoAggregate(rows, deadline) {
   return result;
 }
 
+function getWrestlingPhotoChildFolderPath(folder, parent) {
+  // Only direct descendants of the requested Wrestling folder may enter the queue.
+  const uri = String(folder?.Uri || '').replace(/^\/api\/v2/, '');
+  const prefix = `/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${parent}/`;
+  let name = String(folder?.UrlName || '').trim();
+  if (uri) {
+    if (!uri.startsWith(prefix)) throw new Error('folder_outside_parent');
+    name = decodeURIComponent(uri.slice(prefix.length));
+  }
+  if (!name || name === '.' || name === '..' || /[\/\\?!#%\x00-\x1f]/.test(name)) throw new Error('invalid_child_folder');
+  return `${parent}/${encodeURIComponent(name)}`;
+}
+
+async function listWrestlingPhotoFolderItems(path, kind, result, deadline, consume) {
+  const coverage = result.coverage;
+  let start = 1;
+  let expectedTotal = null;
+  const seen = new Set();
+  for (let page = 0; page < coverage.maxPagesPerList; page += 1) {
+    if (Date.now() >= deadline) throw new Error('refresh_deadline_reached');
+    const json = await fetchSmugJson(`/folder/user/${encodeURIComponent(SMUG_NICKNAME)}/${path}!${kind}?count=100&start=${start}&_accept=application/json`);
+    coverage[kind === 'albums' ? 'albumPagesFetched' : 'folderPagesFetched'] += 1;
+    const response = json?.Response || json;
+    const pages = response?.Pages;
+    const rawTotal = pages?.Total ?? pages?.total;
+    const total = typeof rawTotal === 'number' || typeof rawTotal === 'string' && rawTotal.trim() !== '' ? Number(rawTotal) : NaN;
+    if (!Number.isSafeInteger(total) || total < 0) throw new Error('pagination_total_unavailable');
+    if (expectedTotal != null && total !== expectedTotal) throw new Error('folder_changed_during_refresh');
+    expectedTotal = total;
+    if (pages.Start != null && Number(pages.Start) !== start) throw new Error('unexpected_page_start');
+    const folders = response?.Folder || response?.Folders;
+    const items = kind === 'albums' ? getSmugAlbums(json) : Array.isArray(folders) ? folders : folders && typeof folders === 'object' ? [folders] : [];
+    if (pages.Count != null && Number(pages.Count) !== items.length) throw new Error('incomplete_folder_pagination');
+    for (const item of items) {
+      const identity = kind === 'albums' ? getSmugAlbumKey(item) : getWrestlingPhotoChildFolderPath(item, path);
+      if (!identity || kind === 'albums' && !/^[A-Za-z0-9]+$/.test(identity)) throw new Error('invalid_album_key');
+      // Repeated records within a paged listing can hide skipped records during edits.
+      if (seen.has(identity)) {
+        addWrestlingArchivePhotoIssue(result, 'duplicate_in_paged_listing', { folder: path, kind });
+        continue;
+      }
+      seen.add(identity);
+      consume(identity, item);
+    }
+    const encountered = start - 1 + items.length;
+    const next = pages.NextPage || pages.nextPage;
+    if (!next && encountered === total) return;
+    if (!items.length || encountered >= total || !next) throw new Error('incomplete_folder_pagination');
+    start += items.length;
+  }
+  throw new Error('folder_page_limit_reached');
+}
+
+async function buildWrestlingFolderPhotoAggregate(deadline) {
+  const result = {
+    definition: 'wrestling_folder_album_sum_v1', folder: 'Wrestling',
+    status: 'partial', photosTotal: null, calculatedAt: null,
+    coverage: {
+      foldersDiscovered: 1, foldersEnumerated: 0, folderListsFailed: 0,
+      folderPagesFetched: 0, albumPagesFetched: 0,
+      albumsDiscovered: 0, albumsCounted: 0, albumsFailed: 0,
+      duplicateAlbumReferences: 0, summedAlbumPhotos: 0, issueCount: 0,
+      maxPagesPerList: 1000, maxFolders: 10000, maxAlbums: 100000
+    },
+    issues: []
+  };
+  const coverage = result.coverage;
+  const folders = new Set(['Wrestling']);
+  const albums = new Map();
+  const safeReasons = ['refresh_deadline_reached', 'pagination_total_unavailable', 'folder_changed_during_refresh',
+    'unexpected_page_start', 'incomplete_folder_pagination', 'folder_page_limit_reached',
+    'folder_outside_parent', 'invalid_child_folder', 'invalid_album_key', 'folder_limit_reached', 'album_limit_reached'];
+  for (const path of folders) {
+    if (Date.now() >= deadline) {
+      addWrestlingArchivePhotoIssue(result, 'refresh_deadline_reached');
+      break;
+    }
+    let complete = true;
+    for (const kind of ['folders', 'albums']) {
+      try {
+        await listWrestlingPhotoFolderItems(path, kind, result, deadline, (identity, item) => {
+          if (kind === 'folders') {
+            if (folders.has(identity)) return;
+            if (folders.size >= coverage.maxFolders) throw new Error('folder_limit_reached');
+            folders.add(identity);
+          } else {
+            if (albums.has(identity)) { coverage.duplicateAlbumReferences += 1; return; }
+            if (albums.size >= coverage.maxAlbums) throw new Error('album_limit_reached');
+            albums.set(identity, item);
+          }
+        });
+      } catch (err) {
+        complete = false;
+        coverage.folderListsFailed += 1;
+        addWrestlingArchivePhotoIssue(result, safeReasons.includes(err.message) ? err.message : 'folder_listing_failed', { folder: path, kind });
+      }
+    }
+    if (complete) coverage.foldersEnumerated += 1;
+  }
+  coverage.foldersDiscovered = folders.size;
+  coverage.albumsDiscovered = albums.size;
+  await mapWithConcurrency([...albums], SMUG_REQUEST_CONCURRENCY, async ([albumId, album]) => {
+    try {
+      if (Date.now() >= deadline) throw new Error('refresh_deadline_reached');
+      const count = await getSmugAlbumTotalPhotos(album, { requireComplete: true });
+      if (!Number.isSafeInteger(count) || count < 0) throw new Error('album_count_unavailable');
+      if (!Number.isSafeInteger(coverage.summedAlbumPhotos + count)) throw new Error('album_count_overflow');
+      coverage.summedAlbumPhotos += count;
+      coverage.albumsCounted += 1;
+    } catch (err) {
+      coverage.albumsFailed += 1;
+      addWrestlingArchivePhotoIssue(result, err.message === 'refresh_deadline_reached' ? err.message : 'album_count_unavailable', { album_id: albumId });
+    }
+  });
+  result.status = coverage.issueCount ? 'partial' : 'complete';
+  result.photosTotal = result.status === 'complete' ? coverage.summedAlbumPhotos : null;
+  result.calculatedAt = new Date().toISOString();
+  return result;
+}
+
 async function persistWrestlingArchivePhotoAggregate(result, lock) {
+  const folderWide = result.definition === 'wrestling_folder_album_sum_v1';
   const client = await dbPool.connect();
   try {
     await client.query('BEGIN');
     const lease = await client.query("SELECT id FROM import_locks WHERE id = $1 AND status = 'running' AND expires_at > NOW() FOR UPDATE", [lock.id]);
     if (!lease.rows.length) throw new Error('Photo refresh lock expired; snapshot not saved.');
-    await client.query('LOCK TABLE wrestling_shows IN SHARE MODE');
-    if (wrestlingArchivePhotoSourceFingerprint(await readWrestlingArchivePhotoSource(client)) !== result.sourceFingerprint) {
-      addWrestlingArchivePhotoIssue(result, 'archive_changed_during_refresh');
-      result.status = 'partial';
-      result.photosTotal = null;
+    if (!folderWide) {
+      await client.query('LOCK TABLE wrestling_shows IN SHARE MODE');
+      if (wrestlingArchivePhotoSourceFingerprint(await readWrestlingArchivePhotoSource(client)) !== result.sourceFingerprint) {
+        addWrestlingArchivePhotoIssue(result, 'archive_changed_during_refresh');
+        result.status = 'partial';
+        result.photosTotal = null;
+      }
     }
     // A partial attempt has a separate key; it can never replace the verified snapshot.
-    const keys = result.status === 'complete' ? ['photos_attempt', 'photos_verified'] : ['photos_attempt'];
+    const prefix = folderWide ? 'folder_photos' : 'photos';
+    const keys = result.status === 'complete' ? [`${prefix}_attempt`, `${prefix}_verified`] : [`${prefix}_attempt`];
     for (const key of keys) {
       await client.query(`INSERT INTO stats_snapshots (section, category, snapshot_key, data, generated_at, meta)
         VALUES ('wrestling', 'shows', $1, $2::jsonb, $3, $4::jsonb)
@@ -20263,6 +20403,9 @@ async function handleWrestlingArchivePhotoRefresh(req, res) {
   if (!String(process.env.DATABASE_URL || '').trim() || !isSmugMugConfigured()) {
     return res.status(503).json({ ok: false, error: 'Database and SmugMug configuration required.' });
   }
+  const scope = String(req.query?.scope || 'folder');
+  if (!['folder', 'mapped'].includes(scope)) return res.status(400).json({ ok: false, error: 'scope must be folder or mapped.' });
+  const folderWide = scope === 'folder';
   let lock;
   let result;
   let saved = false;
@@ -20274,11 +20417,11 @@ async function handleWrestlingArchivePhotoRefresh(req, res) {
     const deadline = new Date(lock.expires_at).getTime() - 5000;
     if (!Number.isFinite(deadline) || Date.now() >= deadline) throw new Error('Photo refresh lock expired.');
     await ensureStatsSnapshotsTable();
-    const rows = await readWrestlingArchivePhotoSource();
-    result = await buildWrestlingArchivePhotoAggregate(rows, deadline);
+    result = folderWide ? await buildWrestlingFolderPhotoAggregate(deadline)
+      : await buildWrestlingArchivePhotoAggregate(await readWrestlingArchivePhotoSource(), deadline);
     await persistWrestlingArchivePhotoAggregate(result, lock);
     saved = true;
-    return res.json({ ok: true, ...result, photoTotals: await readWrestlingArchivePhotoTotals() });
+    return res.json({ ok: true, ...result, photoTotals: await readWrestlingArchivePhotoTotals(folderWide) });
   } catch (_) {
     return res.status(503).json({ ok: false, error: 'Photo refresh failed; previous verified snapshot preserved.' });
   } finally {
