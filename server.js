@@ -400,9 +400,15 @@ function buildAdminAccessError(req, error, message) {
   };
 }
 
-function requireAdminAccess(req, res, next) {
+async function requireAdminAccess(req, res, next) {
   const configuredSecrets = getConfiguredAdminSecrets();
   const protectionStatus = getAdminProtectionStatus();
+
+  // Valid legacy credentials retain their original behavior and do not touch V3 sessions.
+  if (configuredSecrets.length && getRequestAdminTokens(req).some((token) => adminTokenMatches(token, configuredSecrets))) return next();
+  const v3Access = await v3AdminAuthRouter.authorizeSession(req, res);
+  if (v3Access === true) { res.locals.v3AdminSessionAuthorized = true; return next(); }
+  if (v3Access === false) return;
 
   if (!configuredSecrets.length) {
     if (!protectionStatus.required) {
@@ -441,9 +447,10 @@ function requireAdminAccess(req, res, next) {
 }
 
 function requireRefreshAdminAccess(req, res, next) {
+  const protectedPath = String(req.path || '').toLowerCase().replace(/\/+$/, '') || '/';
   const isProtectedRefresh = req.query &&
     req.query.refresh === '1' &&
-    Object.prototype.hasOwnProperty.call(ROUTES, req.path);
+    Object.prototype.hasOwnProperty.call(ROUTES, protectedPath);
 
   if (!isProtectedRefresh) return next();
   return requireAdminAccess(req, res, next);
@@ -498,6 +505,7 @@ function isControlPlaneRequest(req) {
 }
 
 function allowCors(req, res, next) {
+  if (res.locals.v3AdminCors === true) return next();
   const origin = req.headers.origin || '';
   const allowList = String(process.env.CORS_ALLOW_ORIGINS || '')
     .split(/[,;]+/)
@@ -567,7 +575,19 @@ function logStartupEnvironmentWarnings() {
   warnings.forEach((warning) => console.warn(`Startup warning: ${warning}`));
 }
 
-app.use('/api/v3/admin/auth', createV3AdminAuthRouter({ db: dbPool }));
+const v3AdminAuthRouter = createV3AdminAuthRouter({ db: dbPool });
+app.use('/api/v3/admin/auth', v3AdminAuthRouter);
+app.use((req, res, next) => {
+  const protectedPath = String(req.path || '').toLowerCase().replace(/\/+$/, '') || '/';
+  const guarded = ['/api/admin', '/admin/import', '/admin/smug'].some((prefix) =>
+    protectedPath === prefix || protectedPath.startsWith(`${prefix}/`)) ||
+    protectedPath === '/api/wrestling/people/import' || protectedPath === '/admin/enrich/music/venues/geocode' ||
+    (req.query && req.query.refresh === '1' && Object.prototype.hasOwnProperty.call(ROUTES, protectedPath));
+  if (!guarded) return next();
+  const secrets = getConfiguredAdminSecrets();
+  if (secrets.length && getRequestAdminTokens(req).some((token) => adminTokenMatches(token, secrets))) return next();
+  return v3AdminAuthRouter.controlPlaneCors(req, res, next);
+});
 app.use(allowCors);
 app.use(['/api/admin', '/admin/import', '/admin/smug', '/api/wrestling/people/import'], requireAdminAccess);
 app.use(requireRefreshAdminAccess);
@@ -20399,7 +20419,7 @@ async function persistWrestlingArchivePhotoAggregate(result, lock) {
 async function handleWrestlingArchivePhotoRefresh(req, res) {
   // Require a credential even when other admin routes allow a local-development bypass.
   const secrets = getConfiguredAdminSecrets();
-  if (!secrets.length || !getRequestAdminTokens(req).some((token) => adminTokenMatches(token, secrets))) {
+  if (res.locals.v3AdminSessionAuthorized !== true && (!secrets.length || !getRequestAdminTokens(req).some((token) => adminTokenMatches(token, secrets)))) {
     return res.status(secrets.length ? 401 : 503).json({ ok: false, error: 'Admin credentials required for photo refresh.' });
   }
   if (!String(process.env.DATABASE_URL || '').trim() || !isSmugMugConfigured()) {
@@ -24437,7 +24457,7 @@ async function handleSmugMusicShowRepairRequest(req, res) {
   let importLock = null;
   try {
     const dryRun = isSmugMusicShowRepairDryRun(req.query || {});
-    if (!dryRun && !getConfiguredAdminSecrets().length) {
+    if (!dryRun && res.locals.v3AdminSessionAuthorized !== true && !getConfiguredAdminSecrets().length) {
       return res.status(503).json(buildAdminAccessError(
         req,
         'ADMIN_PROTECTION_NOT_CONFIGURED',
