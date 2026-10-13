@@ -630,3 +630,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS wrestling_venues_venue_id_key
     ON wrestling_venues (venue_id);
 
 
+-- Inactive Admin session storage; no login/logout behavior is enabled here.
+-- Future application code supplies UUIDs and stores SHA-256 digests of high-entropy
+-- tokens, never raw tokens; it must enforce expiry, activity and revocation checks.
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    session_id UUID PRIMARY KEY,
+    token_digest BYTEA NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at TIMESTAMPTZ,
+    CONSTRAINT admin_sessions_token_digest_length_check
+        CHECK (octet_length(token_digest) = 32),
+    CONSTRAINT admin_sessions_expiry_check
+        CHECK (expires_at > created_at),
+    CONSTRAINT admin_sessions_activity_check
+        CHECK (last_activity_at >= created_at AND last_activity_at < expires_at),
+    CONSTRAINT admin_sessions_revocation_check
+        CHECK (revoked_at IS NULL OR revoked_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS admin_sessions_expires_at_idx
+    ON admin_sessions (expires_at);
+
+CREATE INDEX IF NOT EXISTS admin_sessions_active_last_activity_at_idx
+    ON admin_sessions (last_activity_at)
+    WHERE revoked_at IS NULL;
