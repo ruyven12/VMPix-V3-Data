@@ -5,6 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
+const { createV3AdminAuthRouter } = require('./v3-admin-auth');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -566,6 +567,7 @@ function logStartupEnvironmentWarnings() {
   warnings.forEach((warning) => console.warn(`Startup warning: ${warning}`));
 }
 
+app.use('/api/v3/admin/auth', createV3AdminAuthRouter({ db: dbPool }));
 app.use(allowCors);
 app.use(['/api/admin', '/admin/import', '/admin/smug', '/api/wrestling/people/import'], requireAdminAccess);
 app.use(requireRefreshAdminAccess);
