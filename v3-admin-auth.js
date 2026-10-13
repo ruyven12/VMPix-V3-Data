@@ -1,7 +1,6 @@
 "use strict";
 
 const express = require("express");
-const net = require("node:net");
 const { verifyV3AdminPassword } = require("./v3-admin-password");
 const { createV3AdminSessionManager } = require("./v3-admin-session");
 
@@ -64,44 +63,11 @@ function validPasswordBody(body) {
   finally { bytes.fill(0); }
 }
 
-// Exact immediate-peer addresses only; never infer a trusted proxy from platform/Host/Origin headers.
-// Operators must verify ingress ownership and header rewriting before configuring this optional set.
-function trustedProxyAddresses(value) {
-  const list = new net.BlockList();
-  if (value === undefined || value === "") return list;
-  if (typeof value !== "string" || value.length > 2048) throw new Error("Invalid proxy configuration.");
-  const addresses = value.split(",").map((address) => address.trim());
-  if (!addresses.length || addresses.length > 32 || addresses.some((address) => address.includes("%") || !net.isIP(address))) {
-    throw new Error("Invalid proxy configuration.");
-  }
-  const unspecified = new net.BlockList();
-  unspecified.addAddress("0.0.0.0", "ipv4");
-  unspecified.addAddress("::", "ipv6");
-  for (const address of addresses) {
-    const kind = net.isIP(address) === 4 ? "ipv4" : "ipv6";
-    if (unspecified.check(address, kind)) throw new Error("Invalid proxy configuration.");
-    list.addAddress(address, kind);
-  }
-  return list;
-}
-function verifiedHttps(req, trustedPeers) {
-  if (req.socket?.encrypted === true) return true;
-  const peer = req.socket?.remoteAddress;
-  if (typeof peer !== "string" || peer.includes("%")) return false;
-  const kind = typeof peer === "string" ? net.isIP(peer) : 0;
-  if (!kind || !trustedPeers.check(peer, kind === 4 ? "ipv4" : "ipv6") ||
-      req.headers["x-forwarded-proto"] !== "https") return false;
-  const raw = req.rawHeaders || [];
-  let count = 0;
-  for (let index = 0; index < raw.length; index += 2) {
-    if (String(raw[index]).toLowerCase() === "x-forwarded-proto") {
-      if (raw[index + 1] !== "https") return false;
-      count += 1;
-    }
-  }
-  return count === 1;
-}
-
+// Operator-approved public boundary: Render handles HTTPS TLS and HTTP redirects.
+// Node/private HTTP is not independently TLS-verified; use only trusted internal networks.
+// Never send credentials over untrusted HTTP; workspace/private-service compromise is residual risk.
+// Forwarded headers, socket properties and Origin are not authentication proof:
+// genuine password/session verification remains required; the feature defaults off.
 // Configuration is read only at factory creation. Missing/malformed configuration fails closed.
 function createV3AdminAuthRouter({ db, env = process.env, verifyPassword = verifyV3AdminPassword,
   sessions, now = Date.now, limiterState = DEFAULT_LIMITER } = {}) {
@@ -117,8 +83,7 @@ function createV3AdminAuthRouter({ db, env = process.env, verifyPassword = verif
       if (typeof hash === "string" && hash.length === 107 && HASH_PATTERN.test(hash) &&
           origin === FRONTEND_ORIGIN && typeof verifyPassword === "function" && typeof now === "function" &&
           limiterState?.peers instanceof Map && limiterState.global) {
-        configuration = Object.freeze({ hash, origin,
-          trustedPeers: trustedProxyAddresses(env.V3_ADMIN_AUTH_TRUSTED_PROXY_IPS) });
+        configuration = Object.freeze({ hash, origin });
       }
     }
   } catch { /* Enabled requests remain unavailable; no supplied value is logged. */ }
@@ -148,7 +113,7 @@ function createV3AdminAuthRouter({ db, env = process.env, verifyPassword = verif
     securityHeaders(res);
     if (!enabled) { respond(req, res, 404, "not_found"); return false; }
     if (!configuration) { respond(req, res, 503, "authentication_unavailable"); return false; }
-    if (!verifiedHttps(req, configuration.trustedPeers) || !uniqueHeaders(req) ||
+    if (!uniqueHeaders(req) ||
         req.headers.origin !== configuration.origin ||
         !preflight && req.headers["x-v3-admin-request"] !== "1") {
       res.removeHeader("Access-Control-Allow-Origin");
