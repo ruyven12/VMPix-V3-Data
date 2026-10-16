@@ -15024,7 +15024,7 @@ function buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable) {
   };
 }
 
-async function inspectSmugMusicSnapshotFields(warnings) {
+async function inspectSmugMusicSnapshotFields(warnings, { readOnly = false } = {}) {
   if (!String(process.env.DATABASE_URL || '').trim()) {
     warnings.push('DATABASE_URL is not configured; snapshot field inspection skipped.');
     return {
@@ -15035,9 +15035,14 @@ async function inspectSmugMusicSnapshotFields(warnings) {
   }
 
   try {
-    await ensureSmugMusicSnapshotColumns(warnings);
+    if (readOnly !== true) await ensureSmugMusicSnapshotColumns(warnings);
     const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
     const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
+    if (readOnly === true) {
+      const status = buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable);
+      if (status.missing.length > 0) warnings.push(`Missing SmugMug snapshot fields: ${status.missing.join(', ')}`);
+      return status;
+    }
     return buildSmugMusicSnapshotFieldStatus(existingTables, columnsByTable);
   } catch (err) {
     warnings.push(`Unable to inspect SmugMug snapshot fields: ${err && err.message ? err.message : String(err)}`);
@@ -15061,7 +15066,7 @@ async function buildSmugMusicConfigResponse() {
   const generated = new Date();
   const warnings = [];
   const smugConfig = getSmugMugConfigDiagnostics();
-  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings, { readOnly: true });
 
   return buildAdminResponse({
     route: '/admin/smug/music/config',
@@ -15379,7 +15384,7 @@ async function buildSmugMusicShowDiagnostics(existingTables, columnsByTable, war
 async function buildSmugMusicDiagnosticsResponse() {
   const generated = new Date();
   const warnings = [];
-  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings);
+  const snapshotFields = await inspectSmugMusicSnapshotFields(warnings, { readOnly: true });
   const response = buildAdminResponse({
     route: '/admin/smug/music/diagnostics',
     generated,
@@ -15404,7 +15409,6 @@ async function buildSmugMusicDiagnosticsResponse() {
   }
 
   try {
-    await ensureSmugMusicSnapshotColumns(warnings);
     const existingTables = await getExistingPublicTables(SMUG_MUSIC_SNAPSHOT_TABLES);
     const columnsByTable = await getExistingPublicColumns(SMUG_MUSIC_SNAPSHOT_TABLES);
     response.summary.databaseConnected = true;
