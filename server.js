@@ -7,6 +7,7 @@ const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 const { createV3AdminAuthRouter } = require('./v3-admin-auth');
 const { buildWrestlingMissingDataResponse } = require('./wrestling-missing-data');
+const { buildExactDuplicatesResponse } = require('./exact-duplicates');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -250,6 +251,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics',
     '/api/admin/diagnostics/imports',
     '/api/admin/diagnostics/music',
+    '/api/admin/diagnostics/music/exact-duplicates',
     '/api/admin/diagnostics/music/bands',
     '/api/admin/diagnostics/music/shows',
     '/api/admin/diagnostics/music/smugmug-shows/classification',
@@ -258,6 +260,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics/music/venues',
     '/api/admin/diagnostics/wrestling',
     '/api/admin/diagnostics/wrestling/missing-data',
+    '/api/admin/diagnostics/wrestling/exact-duplicates',
     '/api/admin/diagnostics/wrestling/people/photo-aggregation',
     '/api/admin/diagnostics/relationships',
     '/api/admin/diagnostics/music/relationships',
@@ -24643,6 +24646,42 @@ app.get('/api/admin/diagnostics/music/people', async (req, res) => {
 
 app.get('/api/admin/diagnostics/music/venues', async (req, res) => {
   return handleMusicDiagnosticsSectionRequest(req, res, 'venues');
+});
+
+app.get('/api/admin/diagnostics/music/exact-duplicates', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const result = await buildExactDuplicatesResponse({ db: dbPool, archive: 'music' });
+    return res.status(result.database.connected ? 200 : 503).json(result);
+  } catch (_) {
+    return res.status(503).json({
+      ok: false,
+      route: '/api/admin/diagnostics/music/exact-duplicates',
+      source: 'postgres',
+      archive: 'music',
+      database: { connected: false },
+      state: 'Unavailable',
+      error: 'Exact-identifier diagnostics are unavailable.'
+    });
+  }
+});
+
+app.get('/api/admin/diagnostics/wrestling/exact-duplicates', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const result = await buildExactDuplicatesResponse({ db: dbPool, archive: 'wrestling' });
+    return res.status(result.database.connected ? 200 : 503).json(result);
+  } catch (_) {
+    return res.status(503).json({
+      ok: false,
+      route: '/api/admin/diagnostics/wrestling/exact-duplicates',
+      source: 'postgres',
+      archive: 'wrestling',
+      database: { connected: false },
+      state: 'Unavailable',
+      error: 'Exact-identifier diagnostics are unavailable.'
+    });
+  }
 });
 
 app.get('/api/admin/diagnostics/wrestling/missing-data', async (req, res) => {
