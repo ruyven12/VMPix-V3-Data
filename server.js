@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 const { createV3AdminAuthRouter } = require('./v3-admin-auth');
+const { buildWrestlingMissingDataResponse } = require('./wrestling-missing-data');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -256,6 +257,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics/music/people',
     '/api/admin/diagnostics/music/venues',
     '/api/admin/diagnostics/wrestling',
+    '/api/admin/diagnostics/wrestling/missing-data',
     '/api/admin/diagnostics/wrestling/people/photo-aggregation',
     '/api/admin/diagnostics/relationships',
     '/api/admin/diagnostics/music/relationships',
@@ -24641,6 +24643,23 @@ app.get('/api/admin/diagnostics/music/people', async (req, res) => {
 
 app.get('/api/admin/diagnostics/music/venues', async (req, res) => {
   return handleMusicDiagnosticsSectionRequest(req, res, 'venues');
+});
+
+app.get('/api/admin/diagnostics/wrestling/missing-data', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const result = await buildWrestlingMissingDataResponse({ db: dbPool });
+    return res.status(result.database.connected ? 200 : 503).json(result);
+  } catch (_) {
+    return res.status(503).json({
+      ok: false,
+      route: '/api/admin/diagnostics/wrestling/missing-data',
+      source: 'postgres',
+      database: { connected: false },
+      state: 'Unavailable',
+      error: 'Wrestling missing-data diagnostics are unavailable.'
+    });
+  }
 });
 
 app.get('/api/admin/diagnostics/wrestling', async (req, res) => {
