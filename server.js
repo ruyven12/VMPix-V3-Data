@@ -8,6 +8,7 @@ const express = require('express');
 const { createV3AdminAuthRouter } = require('./v3-admin-auth');
 const { buildWrestlingMissingDataResponse } = require('./wrestling-missing-data');
 const { buildExactDuplicatesResponse } = require('./exact-duplicates');
+const { buildPossibleDuplicatesResponse } = require('./possible-duplicates');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -252,6 +253,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics/imports',
     '/api/admin/diagnostics/music',
     '/api/admin/diagnostics/music/exact-duplicates',
+    '/api/admin/diagnostics/music/possible-duplicates',
     '/api/admin/diagnostics/music/bands',
     '/api/admin/diagnostics/music/shows',
     '/api/admin/diagnostics/music/smugmug-shows/classification',
@@ -261,6 +263,7 @@ const ADMIN_ROUTE_INVENTORY = Object.freeze({
     '/api/admin/diagnostics/wrestling',
     '/api/admin/diagnostics/wrestling/missing-data',
     '/api/admin/diagnostics/wrestling/exact-duplicates',
+    '/api/admin/diagnostics/wrestling/possible-duplicates',
     '/api/admin/diagnostics/wrestling/people/photo-aggregation',
     '/api/admin/diagnostics/relationships',
     '/api/admin/diagnostics/music/relationships',
@@ -24680,6 +24683,44 @@ app.get('/api/admin/diagnostics/wrestling/exact-duplicates', async (req, res) =>
       database: { connected: false },
       state: 'Unavailable',
       error: 'Exact-identifier diagnostics are unavailable.'
+    });
+  }
+});
+
+app.get('/api/admin/diagnostics/music/possible-duplicates', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const result = await buildPossibleDuplicatesResponse({ db: dbPool, archive: 'music' });
+    return res.status(result.database.connected ? 200 : 503).json(result);
+  } catch (_) {
+    return res.status(503).json({
+      ok: false,
+      route: '/api/admin/diagnostics/music/possible-duplicates',
+      source: 'postgres',
+      archive: 'music',
+      mode: 'manual',
+      database: { connected: false },
+      state: 'Unavailable',
+      error: 'Possible-match diagnostics are unavailable.'
+    });
+  }
+});
+
+app.get('/api/admin/diagnostics/wrestling/possible-duplicates', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const result = await buildPossibleDuplicatesResponse({ db: dbPool, archive: 'wrestling' });
+    return res.status(result.database.connected ? 200 : 503).json(result);
+  } catch (_) {
+    return res.status(503).json({
+      ok: false,
+      route: '/api/admin/diagnostics/wrestling/possible-duplicates',
+      source: 'postgres',
+      archive: 'wrestling',
+      mode: 'manual',
+      database: { connected: false },
+      state: 'Unavailable',
+      error: 'Possible-match diagnostics are unavailable.'
     });
   }
 });
