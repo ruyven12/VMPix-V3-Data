@@ -9,6 +9,7 @@ const { createV3AdminAuthRouter } = require('./v3-admin-auth');
 const { buildWrestlingMissingDataResponse } = require('./wrestling-missing-data');
 const { buildExactDuplicatesResponse } = require('./exact-duplicates');
 const { buildPossibleDuplicatesResponse } = require('./possible-duplicates');
+const importReporting = require('./import-reporting');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -12553,39 +12554,7 @@ function getImportSyncStatus(status) {
 }
 
 function buildImportHistoryApiItem(row) {
-  const meta = row.meta && typeof row.meta === 'object' && !Array.isArray(row.meta) ? row.meta : {};
-  const errors = Array.isArray(row.errors) ? row.errors : [];
-  const errorMessage = row.error_message || errors[0] || '';
-
-  return {
-    id: toIntegerCount(row.id),
-    dataset: `${row.section || ''}.${row.category || ''}`,
-    section: row.section || '',
-    category: row.category || '',
-    source: row.source || '',
-    source_identifier: row.source_identifier || '',
-    import_type: row.import_type || '',
-    status: row.status || '',
-    sync_health: getImportSyncStatus(row.status),
-    started_at: formatStatusTimestamp(row.started_at),
-    startedAt: formatStatusTimestamp(row.started_at),
-    finished_at: formatStatusTimestamp(row.finished_at),
-    finishedAt: formatStatusTimestamp(row.finished_at),
-    duration_ms: row.duration_ms == null ? null : toIntegerCount(row.duration_ms),
-    duration: row.duration_ms == null ? null : `${toIntegerCount(row.duration_ms)}ms`,
-    rows_fetched: toIntegerCount(row.rows_fetched),
-    rows_imported: toIntegerCount(row.rows_imported),
-    rows_inserted: row.rows_inserted == null ? null : toIntegerCount(row.rows_inserted),
-    rows_updated: row.rows_updated == null ? null : toIntegerCount(row.rows_updated),
-    rows_skipped: toIntegerCount(row.rows_skipped),
-    total_rows_after_import: row.total_rows_after_import == null ? null : toIntegerCount(row.total_rows_after_import),
-    refresh: !!meta.refresh,
-    error_message: errorMessage,
-    warnings: Array.isArray(row.warnings) ? row.warnings : [],
-    errors,
-    meta,
-    created_at: formatStatusTimestamp(row.created_at)
-  };
+  return importReporting.projectImportHistoryItem(row);
 }
 
 function buildImportHistoryQueryOptions(query, fixedSection) {
@@ -12622,86 +12591,44 @@ function buildImportHistoryQueryOptions(query, fixedSection) {
 }
 
 async function handleImportHistoryRequest(req, res, fixedSection) {
+  const route = fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history';
+  res.set('Cache-Control', 'no-store');
   try {
-    if (!String(process.env.DATABASE_URL || '').trim()) {
-      throw new Error('Missing DATABASE_URL environment variable.');
+    if (!String(process.env.DATABASE_URL || '').trim()) throw new Error('Database unavailable.');
+    const schema = await importReporting.readImportHistorySchema(dbPool);
+    if (!schema.available) {
+      return res.json({ ok: true, route, source: 'postgres', availability: 'Unavailable', items: [],
+        count: 0, total: null, warnings: ['Import history table or required reporting columns are unavailable.'] });
     }
-
-    await ensureImportHistoryTable();
-
     const generated = new Date();
-    const limit = getClampedLimit(req.query.limit);
+    const limit = Math.min(25, getClampedLimit(req.query.limit));
     const page = getPageNumber(req.query.page);
     const offset = (page - 1) * limit;
+    if (!Number.isSafeInteger(offset) || offset > 10000) {
+      return res.status(400).json({ ok: false, route, error: 'IMPORT_HISTORY_PAGE_LIMIT', items: [] });
+    }
     const options = buildImportHistoryQueryOptions(req.query, fixedSection);
-    const countResult = await dbPool.query(
-      `SELECT count(*)::int AS total FROM import_history ${options.whereSql}`,
-      options.values
-    );
-    const total = toIntegerCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    const countResult = await importReporting.query(dbPool,
+      `SELECT count(*)::text AS total FROM public.import_history ${options.whereSql}`, options.values);
+    const total = importReporting.safeCount(countResult.rows && countResult.rows[0] && countResult.rows[0].total);
+    if (total == null) throw new Error('History count unavailable.');
     const dataValues = options.values.concat([limit, offset]);
-    const limitIdx = dataValues.length - 1;
-    const offsetIdx = dataValues.length;
-    const result = await dbPool.query(
-      `SELECT
-         id,
-         section,
-         category,
-         source,
-         status,
-         started_at,
-         finished_at,
-         duration_ms,
-         import_type,
-         source_identifier,
-         rows_fetched,
-         rows_imported,
-         rows_inserted,
-         rows_updated,
-         rows_skipped,
-         total_rows_after_import,
-         error_message,
-         warnings,
-         errors,
-         meta,
-         created_at
-       FROM import_history
-       ${options.whereSql}
-       ORDER BY started_at DESC NULLS LAST, id DESC
-       LIMIT $${limitIdx}
-       OFFSET $${offsetIdx}`,
-      dataValues
-    );
-    const pagination = buildPaginationMeta(page, limit, total, result.rows.length);
-
-    res.json({
-      ok: true,
-      route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
-      generatedAt: generated.toISOString(),
-      generatedTime: formatEasternGeneratedTime(generated),
-      section: fixedSection || undefined,
-      count: pagination.count,
-      total,
-      page,
-      limit,
-      totalPages: pagination.totalPages,
-      hasNextPage: pagination.hasNextPage,
-      hasPrevPage: pagination.hasPrevPage,
+    const result = await importReporting.query(dbPool,
+      `SELECT ${importReporting.getImportReportingSelect(schema)} FROM public.import_history
+       ${options.whereSql} ORDER BY started_at DESC NULLS LAST, id DESC
+       LIMIT $${dataValues.length - 1} OFFSET $${dataValues.length}`, dataValues);
+    const items = (Array.isArray(result.rows) ? result.rows : []).slice(0, limit).map(buildImportHistoryApiItem);
+    const pagination = buildPaginationMeta(page, limit, total, items.length);
+    res.json({ ok: true, route, source: 'postgres', availability: 'Available',
+      generatedAt: generated.toISOString(), generatedTime: formatEasternGeneratedTime(generated),
+      section: fixedSection || undefined, count: pagination.count, total, page, limit,
+      totalPages: pagination.totalPages, hasNextPage: pagination.hasNextPage, hasPrevPage: pagination.hasPrevPage,
       filters: options.filters,
-      meta: buildListMeta({ route: fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history', source: 'postgres', pagination, filters: options.filters }),
-      items: result.rows.map(buildImportHistoryApiItem)
-    });
-  } catch (err) {
-    res.status(500).json(buildApiError(
-      fixedSection ? `/api/admin/import-history/${fixedSection}` : '/api/admin/import-history',
-      err,
-      {
-        source: 'postgres',
-        section: fixedSection || 'admin',
-        type: 'import-history',
-        error: 'IMPORT_HISTORY_ERROR'
-      }
-    ));
+      warnings: schema.missing.length ? [`Some stored reporting fields are unavailable: ${schema.missing.join(', ')}.`] : [],
+      meta: buildListMeta({ route, source: 'postgres', pagination, filters: options.filters }), items });
+  } catch (_) {
+    res.status(503).json({ ok: false, route, source: 'postgres', availability: 'Unavailable',
+      error: 'IMPORT_HISTORY_UNAVAILABLE', items: [], total: null });
   }
 }
 
@@ -12769,27 +12696,14 @@ async function buildLatestImportHistoryItems(section) {
 }
 
 async function handleLatestImportHistoryRequest(req, res) {
-  try {
-    if (!String(process.env.DATABASE_URL || '').trim()) {
-      throw new Error('Missing DATABASE_URL environment variable.');
-    }
-
-    await ensureImportHistoryTable();
-    const generated = new Date();
-    res.json({
-      ok: true,
-      route: '/api/admin/import-history/latest',
-      generatedAt: generated.toISOString(),
-      generatedTime: formatEasternGeneratedTime(generated),
-      items: await buildLatestImportHistoryItems()
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      route: '/api/admin/import-history/latest',
-      error: err && err.message ? err.message : String(err)
-    });
+  res.set('Cache-Control', 'no-store');
+  if (!String(process.env.DATABASE_URL || '').trim()) {
+    return res.status(503).json({ ok: false, route: '/api/admin/import-history/latest',
+      source: 'postgres', availability: 'Unavailable', error: 'IMPORT_HISTORY_UNAVAILABLE', items: [] });
   }
+  const report = await importReporting.buildLatestImportReportingResponse(dbPool, req.query.section);
+  report.generatedTime = report.generatedAt ? formatEasternGeneratedTime(new Date(report.generatedAt)) : undefined;
+  return res.status(report.error === 'INVALID_SECTION' ? 400 : (report.ok ? 200 : 503)).json(report);
 }
 
 function createEmptyImportHealth() {
@@ -12864,30 +12778,8 @@ async function buildImportHealth(section) {
   }
 }
 
-function getImportHistoryStatusSelect() {
-  return `
-    id,
-    section,
-    category,
-    source,
-    status,
-    started_at,
-    finished_at,
-    duration_ms,
-    import_type,
-    source_identifier,
-    rows_fetched,
-    rows_imported,
-    rows_inserted,
-    rows_updated,
-    rows_skipped,
-    total_rows_after_import,
-    error_message,
-    warnings,
-    errors,
-    meta,
-    created_at
-  `;
+function getImportHistoryStatusSelect(schema) {
+  return importReporting.getImportReportingSelect(schema);
 }
 
 function buildImportStatusHistoryWhere(section) {
@@ -12906,41 +12798,17 @@ function buildImportStatusHistoryWhere(section) {
   };
 }
 
-async function getDistinctImportHistoryItems(section, statusFilter) {
-  const options = buildImportStatusHistoryWhere(section);
-  const values = options.values.slice();
-  const where = options.whereSql ? [options.whereSql.replace(/^WHERE\s+/i, '')] : [];
-
-  if (Array.isArray(statusFilter) && statusFilter.length) {
-    values.push(statusFilter.map((status) => String(status).trim().toLowerCase()).filter(Boolean));
-    where.push(`lower(trim(coalesce(status, ''))) = ANY($${values.length}::text[])`);
-  }
-
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const result = await dbPool.query(`
-    SELECT DISTINCT ON (section, category)
-      ${getImportHistoryStatusSelect()}
-    FROM import_history
-    ${whereSql}
-    ORDER BY section, category, started_at DESC NULLS LAST, id DESC
-  `, values);
-
-  return result.rows.map(buildImportHistoryApiItem);
+async function getDistinctImportHistoryItems(section, statusFilter, schema) {
+  return importReporting.readLatestImportItems(dbPool, schema, section, statusFilter);
 }
 
-async function getRecentImportHistoryItems(section, limit = 25) {
+async function getRecentImportHistoryItems(section, limit = 25, schema) {
   const options = buildImportStatusHistoryWhere(section);
-  const values = options.values.concat([Math.min(100, Math.max(1, toIntegerCount(limit) || 25))]);
-  const limitIdx = values.length;
-  const result = await dbPool.query(`
-    SELECT ${getImportHistoryStatusSelect()}
-    FROM import_history
-    ${options.whereSql}
-    ORDER BY started_at DESC NULLS LAST, id DESC
-    LIMIT $${limitIdx}
-  `, values);
-
-  return result.rows.map(buildImportHistoryApiItem);
+  const values = options.values.concat([Math.min(25, Math.max(1, toIntegerCount(limit) || 25))]);
+  const result = await importReporting.query(dbPool, `SELECT ${getImportHistoryStatusSelect(schema)}
+    FROM public.import_history ${options.whereSql}
+    ORDER BY started_at DESC NULLS LAST, id DESC LIMIT $${values.length}`, values);
+  return (Array.isArray(result.rows) ? result.rows : []).slice(0, 25).map(buildImportHistoryApiItem);
 }
 
 function getImportStatusFromLatest(latest, stale) {
@@ -13013,21 +12881,39 @@ async function buildImportStatusReport(section) {
   }
 
   try {
-    await dbPool.query('SELECT 1');
+    await importReporting.query(dbPool, 'SELECT 1');
     report.database.connected = true;
   } catch (err) {
-    errors.push(`Database disconnected: ${err && err.message ? err.message : String(err)}`);
+    errors.push('Database connection could not be verified.');
     report.summary.overallStatus = 'failed';
     return report;
   }
 
-  await ensureImportHistoryTable();
+  const historySchema = await importReporting.readImportHistorySchema(dbPool);
+  if (!historySchema.available || !historySchema.latestIndexUsable) {
+    warnings.push('Import history schema or its lookup index is unavailable. No structures were created.');
+    report.availability = 'Unavailable';
+    report.summary.unknown = datasets.length;
+    for (const dataset of datasets) {
+      const key = `${dataset.section}.${dataset.category}`;
+      report.modules[key] = { dataset: key, section: dataset.section, category: dataset.category,
+        source: dataset.source, route: dataset.route, table: dataset.table,
+        tableExists: null, rowCount: null, status: 'unknown', stale: false,
+        staleReason: 'Import history is unavailable.', latestImport: null,
+        lastSuccessfulImportAt: null, lastFailedImportAt: null, latestFailureReason: null };
+      report.rowCounts[key] = null;
+    }
+    return report;
+  }
+  if (historySchema.missing.length) warnings.push(`Some stored reporting fields are unavailable: ${historySchema.missing.join(', ')}.`);
 
   const tableNames = datasets.map((dataset) => dataset.table).concat(['import_history']);
-  const existingTables = await getExistingPublicTables(tableNames);
-  const latestItems = await getDistinctImportHistoryItems(requestedSection || null);
-  const latestSuccessItems = await getDistinctImportHistoryItems(requestedSection || null, ['success', 'warning']);
-  const latestFailureItems = await getDistinctImportHistoryItems(requestedSection || null, ['failed', 'error']);
+  const tableResult = await importReporting.query(dbPool,
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name = ANY($1::text[])", [tableNames]);
+  const existingTables = new Set((tableResult.rows || []).map(row => row.table_name));
+  const latestItems = await getDistinctImportHistoryItems(requestedSection || null, null, historySchema);
+  const latestSuccessItems = await getDistinctImportHistoryItems(requestedSection || null, ['success', 'warning'], historySchema);
+  const latestFailureItems = await getDistinctImportHistoryItems(requestedSection || null, ['failed', 'error'], historySchema);
   const latestByDataset = new Map(latestItems.map((item) => [getImportDatasetKey(item.section, item.category), item]));
   const successByDataset = new Map(latestSuccessItems.map((item) => [getImportDatasetKey(item.section, item.category), item]));
   const failureByDataset = new Map(latestFailureItems.map((item) => [getImportDatasetKey(item.section, item.category), item]));
@@ -13038,7 +12924,13 @@ async function buildImportStatusReport(section) {
   for (const dataset of datasets) {
     const key = getImportDatasetKey(dataset.section, dataset.category);
     const tableExists = existingTables.has(dataset.table);
-    const rowCount = tableExists ? await getImportTableTotalRows(dataset.table) : null;
+    let rowCount = null;
+    if (tableExists) {
+      try {
+        const countResult = await importReporting.query(dbPool, `SELECT count(*)::text AS count FROM public.${dataset.table}`);
+        rowCount = importReporting.safeCount(countResult.rows && countResult.rows[0] && countResult.rows[0].count);
+      } catch (_) { warnings.push(`Archive row count is unavailable for ${dataset.section}.${dataset.category}.`); }
+    }
     const latest = latestByDataset.get(key) || null;
     const latestSuccess = successByDataset.get(key) || null;
     const latestFailure = failureByDataset.get(key) || null;
@@ -13093,7 +12985,7 @@ async function buildImportStatusReport(section) {
   report.summary.overallStatus = report.summary.failed > 0
     ? 'failed'
     : (report.summary.warning > 0 || report.summary.stale > 0 ? 'warning' : (report.summary.unknown > 0 ? 'unknown' : 'healthy'));
-  report.recentHistory = await getRecentImportHistoryItems(requestedSection || null, 25);
+  report.recentHistory = await getRecentImportHistoryItems(requestedSection || null, 25, historySchema);
 
   return report;
 }
@@ -13151,6 +13043,7 @@ async function handleAdminStatusRequest(req, res) {
 }
 
 async function handleAdminImportStatusRequest(req, res, routeOverride) {
+  res.set('Cache-Control', 'no-store');
   try {
     const report = await buildImportStatusReport(req.query.section);
     report.route = routeOverride || report.route;
@@ -13162,7 +13055,7 @@ async function handleAdminImportStatusRequest(req, res, routeOverride) {
       source: 'postgres',
       section: 'admin',
       type: 'import-status',
-      error: err && err.message ? err.message : String(err)
+      error: 'IMPORT_STATUS_UNAVAILABLE'
     });
   }
 }
@@ -24116,6 +24009,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'vmpix-v3-data',
+    importReportingReadOnly: 1,
     time: new Date().toISOString(),
     sheetConfigured: !!SHEET_ID,
     routes: Object.keys(ROUTES)
