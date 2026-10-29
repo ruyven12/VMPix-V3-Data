@@ -10,6 +10,7 @@ const { buildWrestlingMissingDataResponse } = require('./wrestling-missing-data'
 const { buildExactDuplicatesResponse } = require('./exact-duplicates');
 const { buildPossibleDuplicatesResponse } = require('./possible-duplicates');
 const importReporting = require('./import-reporting');
+const { createCalendar } = require('./todoist-calendar');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -38,6 +39,7 @@ function loadLocalEnv() {
 loadLocalEnv();
 
 const dbPool = require('./db');
+const calendar = createCalendar({ db: dbPool });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24016,6 +24018,21 @@ async function buildAdminDiagnosticsResponse() {
   return response;
 }
 
+// CAL-03: separate from sheet routes. Public reads never initiate integration work.
+function requireCalendarAdminCredential(req, res, next) {
+  if (res.locals.v3AdminSessionAuthorized === true) return next();
+  const bearer = String(req.get('authorization') || '').match(/^Bearer\s+(\S+)$/i);
+  const headers = [req.get('x-admin-token'), bearer && bearer[1]].filter(Boolean);
+  const secrets = getConfiguredAdminSecrets();
+  if (secrets.length && headers.some(token => adminTokenMatches(token, secrets))) return next();
+  res.set('Cache-Control', 'no-store');
+  return res.status(401).json({ ok: false, error: 'ADMIN_ACCESS_REQUIRED' });
+}
+app.get('/api/calendar', calendar.publicHandler);
+app.get('/api/admin/calendar/status', requireCalendarAdminCredential, calendar.diagnosticsHandler);
+app.post('/api/admin/calendar/oauth/start', requireCalendarAdminCredential, calendar.oauthStartHandler);
+app.get('/api/calendar/oauth/callback', calendar.oauthCallbackHandler);
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -24987,9 +25004,16 @@ async function startServer() {
   await applyRuntimeDatabaseMigrations();
   app.listen(PORT, () => {
     console.log(`VMPix V3 Data API listening on ${PORT}`);
+    calendar.start();
   });
 }
 
+// Existing signal behavior is unchanged while Calendar is disabled.
+if (calendar.config.configured) {
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.once(signal, () => { void calendar.stop().finally(() => process.exit(0)); });
+  }
+}
 startServer();
 
 

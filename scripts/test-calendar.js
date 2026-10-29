@@ -1,0 +1,430 @@
+'use strict';
+
+// Synthetic fixtures only. Never import server.js: its startup applies migrations.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { EventEmitter } = require('node:events');
+const vm = require('node:vm');
+const crypto = require('node:crypto');
+const { createCalendar, normalizeTask, normalizeTasks, localInstant, publicDescription } = require('../todoist-calendar');
+const { PROJECT_ID, readConfig, requestJson, withDbLock } = require('../todoist-auth');
+
+const BASE_NOW = Date.parse('2026-10-01T12:00:00Z');
+const ENV = { TODOIST_CALENDAR_ENABLED: '1', DATABASE_URL: 'postgres://fixture.invalid/not-connected',
+  TODOIST_CLIENT_ID: 'synthetic-client', TODOIST_CLIENT_SECRET: 'synthetic-client-secret',
+  TODOIST_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'),
+  TODOIST_REDIRECT_URI: 'https://fixture.invalid/api/calendar/oauth/callback', NODE_ENV: 'production' };
+const task = (overrides = {}) => ({ id: 'taskA', project_id: PROJECT_ID, content: 'Synthetic Concert',
+  checked: false, is_deleted: false, parent_id: null, labels: ['public-confirmed'],
+  due: { date: '2026-11-14', timezone: null, is_recurring: false },
+  description: 'Location: Test Hall — Example City, NY\nPrivate: DO-NOT-PUBLISH\nPublic: Doors open before the performance.',
+  assignee_id: 'PRIVATE-ASSIGNEE', comments: ['PRIVATE-COMMENT'], ...overrides });
+
+class MockDb {
+  constructor() { this.snapshot = null; this.credential = null; this.locks = new Map(); this.calls = []; this.fail = null; }
+  async connect() {
+    if (this.connectFailure) throw Error('PRIVATE DATABASE FAILURE');
+    const client = new EventEmitter();
+    client.query = args => this.execute(args, client);
+    client.release = destroy => { if (destroy) for (const [key, owner] of this.locks) if (owner === client) this.locks.delete(key); };
+    return client;
+  }
+  async query(args) { return this.execute(args); }
+  async execute(args, client) {
+    const sql = (typeof args === 'string' ? args : args.text).replace(/\s+/g, ' ').trim();
+    const p = args.values || [];
+    this.calls.push({ sql, p });
+    if (this.fail?.(sql, p)) throw Error('PRIVATE DATABASE FAILURE WITH SECRET');
+    const rows = value => ({ rows: value });
+    if (sql.startsWith('SELECT pg_try_advisory_lock')) {
+      if (this.locks.has(p[1])) return rows([{ locked: false }]);
+      this.locks.set(p[1], client); return rows([{ locked: true }]);
+    }
+    if (sql.startsWith('SELECT pg_advisory_unlock')) { this.locks.delete(p[1]); return rows([{}]); }
+    if (sql === 'BEGIN') { client.before = structuredClone(this.snapshot); return rows([]); }
+    if (sql === 'COMMIT') { client.before = null; return rows([]); }
+    if (sql === 'ROLLBACK') { this.snapshot = client.before; client.before = null; return rows([]); }
+    if (sql.startsWith('SELECT * FROM todoist_oauth_credentials')) return rows(this.credential ? [structuredClone(this.credential)] : []);
+    if (sql.startsWith('INSERT INTO todoist_oauth_credentials')) {
+      this.credential ||= { id: 1, encrypted_tokens: null, blocked: false, refresh_in_progress: false, credential_version: null };
+      Object.assign(this.credential, { oauth_state_hash: p[0], oauth_state_expires_at: p[1], pending_authorization: p[2] }); return rows([]);
+    }
+    if (sql.startsWith('UPDATE todoist_oauth_credentials SET oauth_state_hash')) {
+      Object.assign(this.credential, { oauth_state_hash: null, oauth_state_expires_at: null, pending_authorization: null }); return rows([]);
+    }
+    if (sql.startsWith('UPDATE todoist_oauth_credentials SET encrypted_tokens')) {
+      Object.assign(this.credential, { encrypted_tokens: p[0], access_expires_at: p[1], scope: 'data:read',
+        configuration_id: p[2], credential_version: p[3], blocked: false, refresh_in_progress: false, last_error_code: null }); return rows([]);
+    }
+    if (sql.startsWith('UPDATE todoist_oauth_credentials SET blocked')) {
+      Object.assign(this.credential, { blocked: true, last_error_code: p[0], refresh_in_progress: false }); return rows([]);
+    }
+    if (sql.startsWith('UPDATE todoist_oauth_credentials SET refresh_in_progress')) {
+      this.credential.refresh_in_progress = sql.includes('TRUE'); return rows([]);
+    }
+    if (sql.startsWith('INSERT INTO calendar_publication_snapshot')) {
+      this.snapshot ||= { id: 1, events: [], verified_at: null, published_at: null, next_attempt_at: null,
+        attempt_credential_version: null, credential_version: null, refresh_status: 'idle' }; return rows([]);
+    }
+    if (sql.startsWith('SELECT s.*, c.credential_version')) {
+      if (!this.snapshot) return rows([]);
+      return rows([{ ...structuredClone(this.snapshot), current_credential_version: this.credential?.credential_version || null,
+        credentials_ready: !!this.credential?.encrypted_tokens && !this.credential.blocked && this.credential.configuration_id === p[0] }]);
+    }
+    if (sql.startsWith('UPDATE calendar_publication_snapshot SET refresh_status')) {
+      Object.assign(this.snapshot, { refresh_status: 'running', attempt_started_at: p[0], attempt_credential_version: p[1], next_attempt_at: p[2] }); return rows([]);
+    }
+    if (sql.startsWith('SELECT credential_version FROM todoist_oauth_credentials')) {
+      return rows(this.credential?.credential_version === p[0] && this.credential.configuration_id === p[1] &&
+        !this.credential.blocked ? [{ credential_version: p[0] }] : []);
+    }
+    if (sql.startsWith('UPDATE calendar_publication_snapshot SET events')) {
+      Object.assign(this.snapshot, { events: JSON.parse(p[0]), verified_at: p[1], published_at: p[2], valid_until: p[3],
+        credential_version: p[4], policy_version: p[5], last_error_code: null, refresh_status: 'idle', next_attempt_at: p[6], attempt_credential_version: p[4] }); return rows([]);
+    }
+    if (sql.startsWith('UPDATE calendar_publication_snapshot SET last_error_code')) {
+      Object.assign(this.snapshot, { last_error_code: p[0], refresh_status: p[1], next_attempt_at: p[2] }); return rows([]);
+    }
+    throw Error(`Unhandled mock query: ${sql}`);
+  }
+}
+
+function fixture({ db = new MockDb(), env = ENV } = {}) {
+  let now = BASE_NOW, tokenSequence = 0;
+  const calls = [], logs = [], timers = new Map();
+  const f = { db, calls, logs, timers, pages: () => ({ results: [task()], next_cursor: null }),
+    now: () => now, advance: ms => { now += ms; }, setNow: value => { now = Date.parse(value); } };
+  f.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    if (String(url).endsWith('/oauth/access_token')) {
+      tokenSequence++;
+      if (f.tokenResponse) return f.tokenResponse(url, options);
+      return Response.json({ access_token: `synthetic-access-${tokenSequence}`, refresh_token: `synthetic-refresh-${tokenSequence}`,
+        token_type: 'Bearer', scope: 'data:read', expires_in: 3600 });
+    }
+    const response = await f.pages(new URL(url), options);
+    return response instanceof Response ? response : Response.json(response);
+  };
+  f.app = createCalendar({ db, env, fetchImpl: f.fetch, clock: f.now, logger: { info: (...args) => logs.push(args) },
+    setTimer: (fn, delay) => { const key = { unref() {} }; timers.set(key, { fn, delay }); return key; }, clearTimer: key => timers.delete(key) });
+  f.authorize = async () => {
+    const start = await f.app.auth.beginAuthorization();
+    const url = new URL(start.authorization_url);
+    assert.equal(url.searchParams.get('scope'), 'data:read');
+    assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+    await f.app.auth.completeAuthorization({ state: url.searchParams.get('state'), code: 'synthetic-code' });
+    return url;
+  };
+  return f;
+}
+
+const tests = [];
+const test = (name, run) => tests.push({ name, run });
+const rejected = (promise, code) => assert.rejects(promise, error => error.code === code);
+const taskCalls = f => f.calls.filter(call => new URL(call.url).pathname === '/api/v1/tasks');
+
+test('exact project + explicit approval; every exclusion fails closed', () => {
+  assert(normalizeTask(task(), BASE_NOW));
+  for (const change of [{ project_id: 'other-project' }, { labels: [] }, { labels: ['PUBLIC-CONFIRMED'] },
+    ...['draft', 'tentative', 'cancelled', 'Cancelled'].map(label => ({ labels: ['public-confirmed', label] })),
+    { checked: true }, { checked: undefined }, { completed_at: '2026-09-01T00:00:00Z' }, { is_completed: true },
+    { is_deleted: true }, { is_deleted: undefined }, { parent_id: 'parent' }, { parent_id: undefined },
+    { content: '' }, { id: 'tmp-placeholder' }, { labels: [42, 'public-confirmed'] }, { due: null },
+    { due: { date: '2026-11-14', is_recurring: true } }, { due: { date: '2026-11-14' } }]) {
+    assert.equal(normalizeTask(task(change), BASE_NOW), null, JSON.stringify(change));
+  }
+  assert.equal(normalizeTask(null, BASE_NOW), null);
+});
+
+test('public fields only, bounded single-line descriptions and missing values', () => {
+  const result = normalizeTask(task(), BASE_NOW).event;
+  assert.deepEqual(Object.keys(result).sort(), ['event_id', 'title', 'date', 'start_time', 'all_day', 'location', 'status', 'description'].sort());
+  assert.equal(result.location, 'Test Hall — Example City, NY');
+  assert(!JSON.stringify(result).includes('PRIVATE'));
+  assert(!JSON.stringify(result).includes('DO-NOT-PUBLISH'));
+  assert.deepEqual(publicDescription('Location: one\nLocation: two\nPublic: visible\nnot public'), { location: null, description: 'visible' });
+  assert.deepEqual(publicDescription(null), { location: null, description: null });
+  assert.equal(normalizeTask(task({ description: 'private notes only' }), BASE_NOW).event.description, null);
+});
+
+test('NY all-day boundaries, past events, malformed dates and floating times', () => {
+  const t = task({ due: { date: '2026-10-01', is_recurring: false } });
+  assert(normalizeTask(t, Date.parse('2026-10-02T03:59:59Z')));
+  assert.equal(normalizeTask(t, Date.parse('2026-10-02T04:00:00Z')), null);
+  for (const date of ['2026-02-30', '2026-13-01', '2026-11-01T25:00', 'yesterday', '2026-00-00', '2026-10-01T10:60'])
+    assert.equal(normalizeTask(task({ due: { date, is_recurring: false } }), BASE_NOW), null);
+  const timed = normalizeTask(task({ due: { date: '2026-10-01T18:30:00', timezone: null, is_recurring: false } }), BASE_NOW);
+  assert.equal(timed.timing.instant, Date.parse('2026-10-01T22:30:00Z'));
+  assert.equal(timed.event.start_time, '18:30');
+  assert.equal(normalizeTask(task({ due: { date: '2026-10-01T08:00:00', is_recurring: false } }), BASE_NOW), null);
+});
+
+test('DST gap/fold withheld; fixed instants convert without shifting all-day dates', () => {
+  assert.equal(localInstant('2026-03-08', '02:30'), null);
+  assert.equal(localInstant('2026-11-01', '01:30'), null);
+  assert.equal(localInstant('2026-03-08', '03:30'), Date.parse('2026-03-08T07:30:00Z'));
+  const fixed = normalizeTask(task({ due: { date: '2026-11-01T06:30:00Z', timezone: 'America/New_York', is_recurring: false } }), BASE_NOW);
+  assert.equal(fixed.event.date, '2026-11-01'); assert.equal(fixed.event.start_time, '01:30');
+  const midnight = normalizeTask(task({ due: { date: '2026-10-02T02:30:00Z', is_recurring: false } }), BASE_NOW);
+  assert.equal(midnight.event.date, '2026-10-01'); assert.equal(midnight.event.start_time, '22:30');
+});
+
+test('chronological order with all-day first and stable ID tie-break', () => {
+  const dates = [['later', '2026-12-01'], ['timedB', '2026-11-14T20:00:00'], ['day', '2026-11-14'], ['timedA', '2026-11-14T20:00:00']];
+  assert.deepEqual(normalizeTasks(dates.map(([id, date]) => task({ id, due: { date, is_recurring: false } })), BASE_NOW)
+    .map(item => item.event.event_id), ['day', 'timedA', 'timedB', 'later']);
+});
+
+test('disabled/missing configuration is unavailable without database or network work', async () => {
+  for (const env of [{}, { ...ENV, TODOIST_CALENDAR_ENABLED: '0' }, { ...ENV, TODOIST_TOKEN_ENCRYPTION_KEY: 'bad' },
+    { ...ENV, TODOIST_REDIRECT_URI: 'http://example.com/api/calendar/oauth/callback' },
+    { ...ENV, TODOIST_REDIRECT_URI: ENV.TODOIST_REDIRECT_URI + '?redirect=evil' }]) {
+    const f = fixture({ env });
+    assert.equal((await f.app.readPublic()).httpStatus, 503);
+    assert.equal((await f.app.refresh()).status, 'disabled'); f.app.start();
+    assert.equal(f.calls.length, 0); assert.equal(f.db.calls.length, 0); assert.equal(f.timers.size, 0);
+  }
+  assert(readConfig(ENV).configured);
+});
+
+test('OAuth state/PKCE/redirect, one-use callback and authenticated encryption', async () => {
+  const f = fixture(); const url = await f.authorize();
+  const tokenCall = f.calls[0];
+  assert.equal(tokenCall.options.body.get('redirect_uri'), ENV.TODOIST_REDIRECT_URI);
+  assert(tokenCall.options.body.get('code_verifier').length >= 43);
+  assert(!f.db.credential.encrypted_tokens.includes('synthetic-access'));
+  assert(!f.db.credential.encrypted_tokens.includes('synthetic-refresh'));
+  assert.equal(f.db.credential.pending_authorization, null);
+  await rejected(f.app.auth.completeAuthorization({ state: url.searchParams.get('state'), code: 'synthetic-code' }), 'AUTH_STATE');
+  await rejected(f.app.auth.completeAuthorization({ state: ['malformed'], code: 'x' }), 'AUTH_STATE');
+  const start = await f.app.auth.beginAuthorization(); f.advance(600001);
+  await rejected(f.app.auth.completeAuthorization({ state: new URL(start.authorization_url).searchParams.get('state'), code: 'x' }), 'AUTH_STATE');
+});
+
+test('OAuth write scope is rejected and no tokens saved', async () => {
+  const f = fixture();
+  f.tokenResponse = () => Response.json({ access_token: 'private', refresh_token: 'private', token_type: 'Bearer', scope: 'data:read_write', expires_in: 3600 });
+  await rejected(f.authorize(), 'AUTH_SCOPE'); assert.equal(f.db.credential.encrypted_tokens, null);
+});
+
+test('token reuse, expiration, rotation and serialization', async () => {
+  const f = fixture(); await f.authorize();
+  assert.equal((await f.app.auth.getAccessToken()).token, 'synthetic-access-1'); assert.equal(f.calls.length, 1);
+  f.advance(3600000);
+  const results = await Promise.allSettled([f.app.auth.getAccessToken(), f.app.auth.getAccessToken()]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'AUTH_BUSY');
+  assert.equal(f.calls.length, 2); assert.equal((await f.app.auth.getAccessToken()).token, 'synthetic-access-2');
+  assert.equal(f.db.credential.refresh_in_progress, false);
+});
+
+test('token rate limit preserves the unconsumed token; 401 recovers exactly once', async () => {
+  const f = fixture(); await f.authorize(); f.advance(3600000);
+  f.tokenResponse = () => new Response('PRIVATE', { status: 429, headers: { 'Retry-After': '600' } });
+  await rejected(f.app.auth.getAccessToken(), 'RATE_LIMIT');
+  assert.equal(f.db.credential.blocked, false); assert.equal(f.db.credential.refresh_in_progress, false);
+  f.tokenResponse = null;
+  let first = true;
+  f.pages = () => { if (first) { first = false; return new Response('PRIVATE', { status: 401 }); }
+    return { results: [task()], next_cursor: null }; };
+  assert.equal((await f.app.refresh()).status, 'success'); assert.equal(taskCalls(f).length, 2);
+  assert.equal(f.db.credential.blocked, false);
+});
+
+test('interrupted rotation and corrupt ciphertext require reauthorization, not replay', async () => {
+  for (const kind of ['pending', 'corrupt', 'network']) {
+    const f = fixture(); await f.authorize(); f.advance(3600000);
+    if (kind === 'pending') f.db.credential.refresh_in_progress = true;
+    if (kind === 'corrupt') f.db.credential.encrypted_tokens += 'tamper';
+    if (kind === 'network') f.tokenResponse = () => { throw Error('PRIVATE network body'); };
+    await rejected(f.app.auth.getAccessToken(), 'AUTH_REAUTHORIZE');
+    const calls = f.calls.length;
+    await rejected(f.app.auth.getAccessToken(), 'AUTH_REAUTHORIZE');
+    assert.equal(f.calls.length, calls); assert(f.db.credential.blocked);
+  }
+});
+
+test('project-filtered pagination, deduplication and atomic public snapshot', async () => {
+  const f = fixture(); await f.authorize();
+  f.pages = url => url.searchParams.has('cursor') ? { results: [Object.fromEntries(Object.entries(task()).reverse()), task({ id: 'taskB' })], next_cursor: null }
+    : { results: [task()], next_cursor: 'opaque-cursor' };
+  assert.equal((await f.app.refresh()).count, 2);
+  for (const call of taskCalls(f)) {
+    const url = new URL(call.url); assert.equal(url.searchParams.get('project_id'), PROJECT_ID);
+    assert.equal(url.searchParams.get('limit'), '50'); assert(!url.search.includes('token'));
+    assert.match(call.options.headers.Authorization, /^Bearer synthetic-access-/); assert.equal(call.options.redirect, 'error');
+  }
+  assert.equal(taskCalls(f).length, 2);
+  assert(f.db.calls.some(call => call.sql === 'BEGIN')); assert(f.db.calls.some(call => call.sql === 'COMMIT'));
+  const before = f.db.calls.length, requests = f.calls.length;
+  const response = await f.app.readPublic();
+  assert.equal(response.httpStatus, 200); assert.equal(response.body.status, 'ready');
+  assert.match(response.cache, /max-age=30/); assert(!response.cache.includes('stale-while-revalidate'));
+  assert(f.db.calls.slice(before).every(call => call.sql.startsWith('SELECT')));
+  assert.equal(f.calls.length, requests);
+  assert(!JSON.stringify(response).match(/synthetic-access|DO-NOT-PUBLISH|PRIVATE|project_id|assignee/));
+});
+
+test('approval withdrawal and complete successful empty scans replace old events', async () => {
+  const f = fixture(); await f.authorize(); await f.app.refresh(); f.advance(300000);
+  f.pages = () => ({ results: [task({ labels: [] })], next_cursor: null });
+  assert.equal((await f.app.refresh()).count, 0); assert.equal((await f.app.readPublic()).body.status, 'empty');
+  f.advance(300000); f.pages = () => ({ results: [], next_cursor: null });
+  assert.equal((await f.app.refresh()).count, 0); assert.equal((await f.app.readPublic()).httpStatus, 200);
+});
+
+test('partial pages, loops, conflicts, foreign projects and malformed results retain snapshot freshness', async () => {
+  for (const kind of ['partial', 'loop', 'limit', 'conflict', 'foreign', 'malformed']) {
+    const f = fixture(); await f.authorize(); await f.app.refresh(); const saved = structuredClone(f.db.snapshot); f.advance(300000);
+    let count = 0;
+    f.pages = url => {
+      count++;
+      if (kind === 'partial' && url.searchParams.has('cursor')) return new Response('PRIVATE ERROR', { status: 500 });
+      if (kind === 'foreign') return { results: [task({ project_id: 'personal-project' })], next_cursor: null };
+      if (kind === 'malformed') return { items: [task()] };
+      return { results: [task({ content: kind === 'conflict' && count > 1 ? 'changed' : 'Synthetic Concert' })],
+        next_cursor: kind === 'limit' ? `cursor-${count}` : 'repeating' };
+    };
+    assert.notEqual((await f.app.refresh()).status, 'success', kind);
+    assert.deepEqual(f.db.snapshot.events, saved.events); assert.deepEqual(f.db.snapshot.verified_at, saved.verified_at);
+    assert.equal((await f.app.readPublic()).body.status, 'stale'); assert(count <= 20);
+  }
+});
+
+test('database lock and publication failures fail closed; concurrent instances do not rescan', async () => {
+  const f = fixture(); await f.authorize();
+  f.db.locks.set(1, 'other-instance'); assert.equal((await f.app.refresh()).status, 'busy'); assert.equal(taskCalls(f).length, 0);
+  f.db.locks.delete(1); f.db.connectFailure = true;
+  assert.equal((await f.app.refresh()).code, 'DATABASE'); assert.equal(taskCalls(f).length, 0);
+  f.db.connectFailure = false; await f.app.refresh(); const saved = structuredClone(f.db.snapshot); f.advance(300000);
+  f.db.fail = sql => sql === 'COMMIT';
+  assert.equal((await f.app.refresh()).code, 'DATABASE'); assert.deepEqual(f.db.snapshot.events, saved.events);
+  assert.deepEqual(f.db.snapshot.verified_at, saved.verified_at); assert.equal(f.db.locks.size, 0);
+  f.db.fail = null; f.db.snapshot.next_attempt_at = null;
+  const second = fixture({ db: f.db }); second.setNow(new Date(f.now()).toISOString());
+  const results = await Promise.all([f.app.refresh(), second.app.refresh()]);
+  assert.equal(results.filter(r => r.status === 'success').length, 1);
+  const count = f.calls.length + second.calls.length;
+  await second.app.refresh(); assert.equal(f.calls.length + second.calls.length, count);
+});
+
+test('rate limits persist retry delay; persistent authentication failures halt external requests', async () => {
+  const f = fixture(); await f.authorize();
+  f.pages = () => new Response('private rate-limit message', { status: 429, headers: { 'Retry-After': '900' } });
+  const result = await f.app.refresh(); assert.equal(result.code, 'RATE_LIMIT'); assert.equal(result.delay, 900000);
+  const count = f.calls.length; f.advance(300000); assert.equal((await f.app.refresh()).status, 'waiting'); assert.equal(f.calls.length, count);
+  f.advance(600000); f.pages = () => new Response('private auth error', { status: 401 });
+  assert.equal((await f.app.refresh()).code, 'AUTH_REAUTHORIZE'); assert(f.db.credential.blocked);
+  const blockedCount = f.calls.length; f.advance(300000); await f.app.refresh(); assert.equal(f.calls.length, blockedCount);
+  assert(!JSON.stringify(f.logs).match(/private|synthetic-access|synthetic-refresh|secret/i));
+});
+
+test('fresh/empty/stale/unavailable, cache expiry, tampered snapshots and configuration changes', async () => {
+  const f = fixture(); assert.equal((await f.app.readPublic()).body.status, 'unavailable'); await f.authorize(); await f.app.refresh();
+  f.advance(299001); assert.match((await f.app.readPublic()).cache, /max-age=0/);
+  f.advance(999); let response = await f.app.readPublic(); assert.equal(response.body.status, 'stale'); assert.deepEqual(response.body.events, []); assert.equal(response.cache, 'no-store');
+  f.advance(1); await f.app.refresh(); f.db.snapshot.events[0].raw_task = 'PRIVATE';
+  response = await f.app.readPublic(); assert.equal(response.httpStatus, 503); assert(!JSON.stringify(response).includes('PRIVATE'));
+  delete f.db.snapshot.events[0].raw_task;
+  Object.assign(f.db.snapshot.events[0], { all_day: false, start_time: ['12:00'] });
+  assert.equal((await f.app.readPublic()).httpStatus, 503);
+  f.db.fail = () => true; assert.equal((await f.app.readPublic()).body.status, 'unavailable'); f.db.fail = null;
+  const different = fixture({ db: f.db, env: { ...ENV, TODOIST_CLIENT_SECRET: 'changed-synthetic-secret' } });
+  assert.equal((await different.app.readPublic()).httpStatus, 503);
+});
+
+test('snapshot expiry prevents overdue publication, including fixed DST-fold instants', async () => {
+  const f = fixture(); await f.authorize(); f.setNow('2026-11-01T05:29:00Z');
+  f.pages = () => ({ results: [task({ due: { date: '2026-11-01T05:30:00Z', is_recurring: false } }),
+    task({ id: 'second-fold', due: { date: '2026-11-01T06:30:00Z', is_recurring: false } })], next_cursor: null });
+  assert.equal((await f.app.refresh()).count, 2); assert.equal(Date.parse(f.db.snapshot.valid_until), Date.parse('2026-11-01T05:30:00Z'));
+  f.advance(60000); assert.equal((await f.app.readPublic()).body.status, 'stale');
+  assert.equal((await f.app.refresh()).count, 1); assert.equal((await f.app.readPublic()).body.events[0].event_id, 'second-fold');
+});
+
+test('bounded timeout/response size and abort cleanup', async () => {
+  await rejected(requestJson((url, options) => new Promise((resolve, reject) =>
+    options.signal.addEventListener('abort', () => reject(Error('private failure')), { once: true })), 'https://fixture.invalid', { timeoutMs: 5 }), 'TIMEOUT');
+  await rejected(requestJson(async () => new Response('x'.repeat(100)), 'https://fixture.invalid', { maxBytes: 8 }), 'RESPONSE_LIMIT');
+  const f = fixture(); await f.authorize();
+  let entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  f.pages = (url, options) => new Promise((resolve, reject) => { entered(); options.signal.addEventListener('abort', () => reject(Error('private')), { once: true }); });
+  const work = f.app.refresh(); await waiting; assert.equal((await f.app.refresh()).status, 'busy'); await f.app.stop(); await work;
+  assert.equal(f.db.locks.size, 0); assert.equal(f.db.snapshot.verified_at, null);
+});
+
+test('one scheduler, stop/restart and protected diagnostics do not leak or ingest', async () => {
+  const f = fixture(); await f.authorize(); f.app.start(); f.app.start(); assert.equal(f.timers.size, 1);
+  await f.app.stop(); assert.equal(f.timers.size, 0); f.app.start(); assert.equal(f.timers.size, 1); await f.app.stop();
+  await f.app.refresh(); let body, code, headers = {};
+  const res = { set: (k, v) => { headers[k] = v; }, status: n => { code = n; return res; }, json: value => { body = value; return res; } };
+  const requests = f.calls.length; await f.app.publicHandler({}, res);
+  assert.equal(code, 200); assert.equal(headers['X-Content-Type-Options'], 'nosniff');
+  await f.app.diagnosticsHandler({}, res); assert.equal(headers['Cache-Control'], 'no-store');
+  assert.equal(body.published_event_count, 1); assert.equal(f.calls.length, requests);
+  assert(!JSON.stringify(body).match(/synthetic|PRIVATE|token|project_id/));
+});
+
+test('integration wiring stays outside legacy Sheets and preserves Admin middleware', () => {
+  const root = path.resolve(__dirname, '..');
+  const source = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  assert.match(source, /app\.get\('\/api\/calendar', calendar\.publicHandler\)/);
+  assert.match(source, /app\.get\('\/api\/admin\/calendar\/status', requireCalendarAdminCredential, calendar\.diagnosticsHandler\)/);
+  assert.match(source, /app\.post\('\/api\/admin\/calendar\/oauth\/start', requireCalendarAdminCredential, calendar\.oauthStartHandler\)/);
+  assert(!source.slice(source.indexOf('const ROUTES ='), source.indexOf('const ADMIN_ROUTE_INVENTORY')).includes("'/api/calendar'"));
+  assert.match(source, /app\.use\(\['\/api\/admin', '\/admin\/import', '\/admin\/smug', '\/api\/wrestling\/people\/import'\], requireAdminAccess\)/);
+  for (const name of ['todoist-calendar.js', 'todoist-auth.js']) {
+    const module = fs.readFileSync(path.join(root, name), 'utf8');
+    assert.doesNotMatch(module, /CREATE TABLE|ALTER TABLE|loadLocalEnv\(|require\(['"]\.\/server/);
+  }
+});
+
+test('actual Express Calendar handlers and setup credential guard (isolated local HTTP)', async () => {
+  const express = require('express');
+  const source = fs.readFileSync(path.resolve(__dirname, '../server.js'), 'utf8');
+  const extract = name => {
+    const start = source.indexOf(`function ${name}(`);
+    const end = source.indexOf('\n}', start);
+    return source.slice(start, end + 2);
+  };
+  const context = vm.createContext({ crypto, Buffer, getConfiguredAdminSecrets: () => ['synthetic-admin-header'] });
+  vm.runInContext(extract('adminTokenMatches') + '\n' + extract('requireCalendarAdminCredential'), context);
+  const f = fixture(); await f.authorize(); await f.app.refresh();
+  const app = express();
+  app.get('/api/calendar', f.app.publicHandler);
+  app.get('/api/admin/calendar/status', context.requireCalendarAdminCredential, f.app.diagnosticsHandler);
+  app.post('/api/admin/calendar/oauth/start', context.requireCalendarAdminCredential, f.app.oauthStartHandler);
+  app.get('/api/calendar/oauth/callback', f.app.oauthCallbackHandler);
+  const server = await new Promise(resolve => { const listener = app.listen(0, '127.0.0.1', () => resolve(listener)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const requests = f.calls.length;
+    let response = await fetch(base + '/api/calendar?refresh=1');
+    assert.equal(response.status, 200); assert.equal((await response.json()).status, 'ready');
+    assert.equal(f.calls.length, requests); assert.match(response.headers.get('cache-control'), /max-age=30/);
+    for (const query of ['', '?admin_token=synthetic-admin-header']) {
+      response = await fetch(base + '/api/admin/calendar/status' + query);
+      assert.equal(response.status, 401); assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
+    response = await fetch(base + '/api/admin/calendar/status', { headers: { Authorization: 'Bearer synthetic-admin-header' } });
+    assert.equal(response.status, 200); assert.equal((await response.json()).published_event_count, 1);
+    response = await fetch(base + '/api/admin/calendar/oauth/start', { method: 'POST' }); assert.equal(response.status, 401);
+    response = await fetch(base + '/api/calendar/oauth/callback?state=bad&code=private');
+    assert.equal(response.status, 400); assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+    assert(!(await response.text()).includes('private')); assert.equal(f.calls.length, requests);
+    const res = { locals: { v3AdminSessionAuthorized: true } };
+    let passed = false; context.requireCalendarAdminCredential({}, res, () => { passed = true; }); assert(passed);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+(async () => {
+  let failed = 0;
+  for (const item of tests) {
+    try { await item.run(); console.log(`PASS ${item.name}`); }
+    catch (error) { failed++; console.error(`FAIL ${item.name}: ${error.stack}`); }
+  }
+  console.log(`${tests.length - failed}/${tests.length} CAL-03 checks passed (mocked; no live Todoist or PostgreSQL).`);
+  process.exitCode = failed ? 1 : 0;
+})();

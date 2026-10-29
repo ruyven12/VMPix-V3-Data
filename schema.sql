@@ -656,3 +656,40 @@ CREATE INDEX IF NOT EXISTS admin_sessions_expires_at_idx
 CREATE INDEX IF NOT EXISTS admin_sessions_active_last_activity_at_idx
     ON admin_sessions (last_activity_at)
     WHERE revoked_at IS NULL;
+
+-- CAL-03: inactive until explicitly configured. No Music/Wrestling data changes.
+-- Only normalized public events and operational metadata belong in this row.
+CREATE TABLE IF NOT EXISTS calendar_publication_snapshot (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    events JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(events) = 'array'),
+    verified_at TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    valid_until TIMESTAMPTZ,
+    credential_version UUID,
+    policy_version TEXT,
+    attempt_started_at TIMESTAMPTZ,
+    attempt_credential_version UUID,
+    next_attempt_at TIMESTAMPTZ,
+    refresh_status TEXT NOT NULL DEFAULT 'idle'
+        CHECK (refresh_status IN ('idle', 'running', 'failed', 'auth_required')),
+    last_error_code TEXT,
+    CHECK (valid_until IS NULL OR (verified_at IS NOT NULL AND valid_until > verified_at))
+);
+
+-- Tokens and PKCE material are AES-256-GCM ciphertext; keys stay in deployment secrets.
+-- This table must never be exposed through public endpoints or generic diagnostics.
+CREATE TABLE IF NOT EXISTS todoist_oauth_credentials (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    encrypted_tokens TEXT,
+    access_expires_at TIMESTAMPTZ,
+    scope TEXT CHECK (scope IS NULL OR scope = 'data:read'),
+    configuration_id TEXT,
+    credential_version UUID,
+    blocked BOOLEAN NOT NULL DEFAULT FALSE,
+    refresh_in_progress BOOLEAN NOT NULL DEFAULT FALSE,
+    last_error_code TEXT,
+    oauth_state_hash TEXT CHECK (oauth_state_hash IS NULL OR length(oauth_state_hash) = 64),
+    oauth_state_expires_at TIMESTAMPTZ,
+    pending_authorization TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
