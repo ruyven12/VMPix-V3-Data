@@ -100,12 +100,69 @@ Deployment checklist:
 
 This repo is backend-only. Public data routes are read-only. Admin/import/stats rebuild/control routes are protected by `ADMIN_TOKEN` in Render/production.
 
-## Calendar / Todoist (CAL-03, disabled by default)
+## Calendar / Todoist (CAL-03 through CAL-08, disabled by default)
 
 Calendar uses the verified **Voodoo Gigs** project `6gRQ3CfW6Ww7V2fF`. No frontend,
 Google Sheets route, existing Admin authentication, or Music/Wrestling import is changed.
 `GET /api/calendar` reads PostgreSQL only; visitors never trigger Todoist requests,
 schema creation, OAuth refresh, or ingestion. There is no public `refresh=1` bypass.
+
+### Independent integration and public visibility controls (CAL-08)
+
+Both flags default off. `TODOIST_CALENDAR_ENABLED=1` explicitly enables the existing
+integration; other values leave it off. `TODOIST_CALENDAR_PUBLIC_ENABLED=true` (or `1`)
+explicitly permits public reads; missing, `false`, `0`, and all other values leave them off.
+Enabling backend integration is **not authorization to expose Calendar events publicly**.
+
+| Master integration | Public visibility | Behavior |
+| --- | --- | --- |
+| Off | Off | Integration off; public unavailable |
+| Off | On | Integration off; public unavailable |
+| On | Off | Configured OAuth, refresh and protected diagnostics work privately; public unavailable |
+| On | On | Existing public API behavior, subject to configuration, authorization and freshness |
+
+With exposure disabled, every request reaching `GET /api/calendar` returns
+503 / `unavailable`, `events: []`, `freshness: null`, and `Cache-Control: no-store`.
+The gate runs before database acquisition. Conditional cache validators, query parameters
+and Admin credentials do not bypass it. No snapshot contents or diagnostics are returned,
+and public requests never initiate Todoist calls.
+
+The public flag is separate from the credential fingerprint, scheduler, publication
+transaction and snapshot freshness. Changing it does not invalidate authorization, reset
+the persisted refresh deadline, bypass provider backoff or modify the stored snapshot.
+The existing worker resumes against that persisted schedule after a process restart.
+
+Flags are read when the Calendar service is created, not hot-reloaded from environment
+changes. Apply an approved configuration deployment/restart to **all** running instances
+and verify their effective settings. On Render, use the workflow that applies saved
+environment changes; do not assume restarting an older deployment picks them up.
+Previously issued successful responses can remain in client/proxy caches for their
+remaining lifetime (at most 30 seconds). Disabling visibility cannot revoke bytes already
+delivered; origin responses after the new configuration takes effect are always no-store.
+
+### Private validation and public-disable rollback
+
+After separately approved schema, secrets and deployment setup, keep
+`TODOIST_CALENDAR_PUBLIC_ENABLED=false` while enabling the master and performing explicitly
+authorized OAuth setup. Use the existing authenticated `/api/admin/calendar/status` for
+configuration, authorization, refresh status, count and freshness checks. It exposes
+`integration_enabled` and `public_enabled` as configured booleans; `configured` and
+`authorized` separately describe readiness. A public flag alone does not imply availability.
+There is no public preview endpoint or new privileged access mechanism.
+
+Allow the existing bounded worker to perform the approved initial scan, privately validate
+only normalized snapshot fields through separately authorized database inspection, then
+observe at least two coordinated refresh cycles. Confirm the public endpoint stays
+503/unavailable/no-store throughout. Never inspect credentials or raw private tasks.
+Only a separate public-exposure approval permits setting the public flag to `true` and
+deploying that configuration; then verify the eight-field contract and cache limits.
+
+To withdraw public visibility, set only `TODOIST_CALENDAR_PUBLIC_ENABLED=false`, apply it
+to every instance and verify 503/unavailable/no-store, including conditional requests.
+OAuth and synchronization may continue privately. If integration must also stop, separately
+disable the master flag. Retain the encryption key, credentials and snapshot; do not drop
+tables. A code rollback to a version before CAL-08 lacks this gate: disable the master too
+before such a rollback. Review startup migrations and environment settings for any deploy.
 
 ### Publication contract
 
@@ -147,8 +204,9 @@ Admin token or a personal Todoist token as the Todoist access token.
 The redirect must exactly match the registered URL and end with
 `/api/calendar/oauth/callback`, with no query, fragment, or embedded credentials.
 HTTPS is required except loopback HTTP outside production/Render. Configuration
-changes invalidate stored authorization; reauthorize after changing the client,
+changes to credential configuration invalidate stored authorization; reauthorize after changing the client,
 secret, redirect, or encryption key. Preserve the encryption key across restarts.
+Changing only `TODOIST_CALENDAR_PUBLIC_ENABLED` does not require reauthorization.
 
 After separately approving deployment/schema setup:
 
@@ -161,7 +219,8 @@ After separately approving deployment/schema setup:
    consumes a 10-minute, single-use hashed state and encrypted PKCE verifier, exchanges
    the code, and durably stores AES-256-GCM-encrypted access/refresh tokens. No token is
    returned. Authorization alone is not proof of publication or project accessibility.
-4. The next coordinated refresh validates project access and publishes eligible tasks.
+4. The next coordinated refresh validates project access and writes eligible tasks to
+   the PostgreSQL snapshot. Keep public visibility disabled during this private validation.
 
 Token refresh is serialized with a separate PostgreSQL advisory lock. Replacement
 refresh tokens are saved atomically. A durable in-progress marker makes an interrupted
@@ -199,14 +258,15 @@ Public response states:
 | 200 | `ready` | Validated public events |
 | 200 | `empty` | `[]`, from a fresh successful snapshot |
 | 503 | `stale` | `[]`, expired snapshot |
-| 503 | `unavailable` | `[]`, disabled/misconfigured, unauthorized, missing/invalid snapshot or DB failure |
+| 503 | `unavailable` | `[]`, integration/public visibility disabled, misconfigured, unauthorized, missing/invalid snapshot or DB failure |
 
 The envelope includes `timezone`, `events`, and `freshness` (`verified_at`, `expires_at`,
 `age_seconds`, or null). Public caching is capped at 30 seconds and remaining freshness;
 there is no stale-while-revalidate allowance. Errors are no-store. Clients show loading
 while awaiting the request and must not treat an error as an empty calendar.
 
-`GET /api/admin/calendar/status` is protected and no-store. It reports configuration,
+`GET /api/admin/calendar/status` is protected and no-store. It reports the integration
+and public-visibility flags, configuration,
 authorization availability, last success, snapshot age/count, refresh status, and a
 sanitized error code. It does not query Todoist or expose task/token payloads. Operational
 logs contain status/error codes only. The global error serializer is not used here.
@@ -220,7 +280,10 @@ refresh. Do not promise uninterrupted availability without verifying hosting beh
 
 `node scripts/test-calendar.js` uses synthetic credentials and injected fetch/database
 fixtures. It does not start the server, load `.env`, contact Todoist, or connect to a real
-database. It covers API handlers, publication, OAuth, locking and scheduling failures.
+database. It covers API handlers, the independent public gate and conditional requests,
+publication, OAuth, locking and scheduling failures. Public-response fixtures explicitly
+opt in to visibility; private/default-off fixtures do not. Isolated PostgreSQL tests must
+also explicitly select public visibility when verifying ready/empty/stale responses.
 
 **`npm start` / `npm run dev` apply schema and runtime migrations.** Do not use them for
 local verification with a production `DATABASE_URL`. Additive table definitions require
@@ -320,8 +383,9 @@ or stale 503 response must not become the whole service's health check.
 ### Controlled activation checklist — not executed
 
 Every production write, configuration change, authorization or deploy below requires
-separate user approval. Complete the two failing checks and isolated PostgreSQL tests
-before proceeding. Do not create live test tasks.
+separate user approval. CAL-05A/B and CAL-06A/B/C address the earlier failing checks and
+isolated PostgreSQL verification; they do not establish live Render/Todoist readiness.
+Do not create live test tasks.
 
 1. **Migration approval:** verify the target service/database and pending migrations.
    Apply only the two additive CAL-03 definitions under a reviewed transaction with
@@ -331,7 +395,8 @@ before proceeding. Do not create live test tasks.
 2. **Render configuration approval:** verify a continuously running service, correct
    Node runtime (18+), direct PostgreSQL URL, adequate connection capacity, intended
    workspace/region and existing Admin/CORS settings. Keep `TODOIST_CALENDAR_ENABLED=0`
-   throughout preparation. No new service or scheduler is required by this plan.
+   and `TODOIST_CALENDAR_PUBLIC_ENABLED=false` throughout preparation. No new service or
+   scheduler is required by this plan.
 3. **Encryption-key approval:** provision `TODOIST_TOKEN_ENCRYPTION_KEY` as canonical
    base64 for 32 cryptographically random bytes in Render secrets. Preserve it securely
    across restarts/rollbacks; do not rotate it casually or print it. Configuration/key
@@ -340,11 +405,11 @@ before proceeding. Do not create live test tasks.
    with refresh tokens enabled, `data:read` only, and an exact HTTPS redirect ending in
    `/api/calendar/oauth/callback`. Provision `TODOIST_CLIENT_ID`, `TODOIST_CLIENT_SECRET`
    and `TODOIST_REDIRECT_URI`. Preserve the existing `DATABASE_URL` and Admin credentials.
-5. **Account authorization and activation approval:** the current single enable flag
-   gates OAuth setup, the worker and public reads together. Setting it to 1 and completing
-   `POST /api/admin/calendar/oauth/start` plus consent can lead directly to publication
-   on the next worker scan. Approve that combined activation explicitly; there is no
-   separate production dry-run/publication gate. Do not add one without a separate pass.
+5. **Private integration and account authorization approval:** enable only
+   `TODOIST_CALENDAR_ENABLED=1`, keeping `TODOIST_CALENDAR_PUBLIC_ENABLED=false`.
+   Complete the protected OAuth start and explicit account consent. CAL-08 separates
+   public exposure from integration: the worker can write the validated snapshot while
+   public reads remain unavailable. This is private validation, not a database dry run.
 6. **Initial real scan:** allow the existing bounded worker to retrieve only project
    `6gRQ3CfW6Ww7V2fF`; verify approval/exclusion behavior against existing approved tasks.
    Confirm no personal tasks, raw descriptions or extra fields reach storage/output.
@@ -355,12 +420,16 @@ before proceeding. Do not create live test tasks.
    status logs across at least two refresh cycles. Check expiry/cache behavior, retries,
    restart recovery and absence of overlapping workers. Inspect query-string logging
    so OAuth callback codes/state are not retained in proxy/access logs.
-9. **Public API verification:** check the approved production URL for ready or verified
+9. **Public exposure approval and verification:** only after private validation, set
+   `TODOIST_CALENDAR_PUBLIC_ENABLED=true` and deploy the approved configuration to all
+   instances. Check the approved production URL for ready or verified
    empty, exact eight-field records, New York dates and bounded cache headers. Exercise
    stale/unavailable and failure injection in staging, not by disrupting production.
    No frontend Calendar changes are part of this activation.
-10. **Rollback approval:** set `TODOIST_CALENDAR_ENABLED=0` and deploy that configuration;
-    verify workers stop and `/api/calendar` returns 503/unavailable/no-store. Allow the
+10. **Rollback approval:** set `TODOIST_CALENDAR_PUBLIC_ENABLED=false` and deploy that
+    configuration; verify `/api/calendar` returns 503/unavailable/no-store. Disable
+    `TODOIST_CALENDAR_ENABLED` as well if synchronization must stop or code is rolled back
+    to a version without the public gate. Allow the
     existing public-cache window (at most 30 seconds) to expire. Retain both additive
     tables, snapshot and encrypted credentials; do not drop tables or alter archive data.
     If code rollback is also needed, verify configuration and schema compatibility first:

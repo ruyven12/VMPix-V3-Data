@@ -135,7 +135,10 @@ const READ_SNAPSHOT = `SELECT s.*, c.credential_version AS current_credential_ve
 
 function createCalendar({ db, env = process.env, fetchImpl = global.fetch, clock = Date.now,
   logger = console, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
-  const config = readConfig(env);
+  // Public exposure is independent of OAuth configuration and the refresh worker.
+  // Deliberately excluded from readConfig's credential fingerprint.
+  const config = { ...readConfig(env),
+    publicEnabled: env.TODOIST_CALENDAR_PUBLIC_ENABLED === 'true' || env.TODOIST_CALENDAR_PUBLIC_ENABLED === '1' };
   const auth = createTodoistAuth({ db, config, fetchImpl, clock });
   let timer = null, running = null, controller = null, stopped = true;
   const note = (status, code) => logger.info?.('Calendar refresh', { status, code });
@@ -313,7 +316,8 @@ function createCalendar({ db, env = process.env, fetchImpl = global.fetch, clock
   }
 
   async function readPublic() {
-    if (!config.configured) return unavailable();
+    // Gate before database access, including requests carrying cached validators.
+    if (!config.configured || !config.publicEnabled) return unavailable();
     try {
       const row = (await readPublicSnapshot()).rows?.[0];
       if (!row?.credentials_ready || !row.verified_at || row.policy_version !== POLICY_VERSION ||
@@ -339,11 +343,13 @@ function createCalendar({ db, env = process.env, fetchImpl = global.fetch, clock
 
   async function diagnosticsHandler(req, res) {
     res.set('Cache-Control', 'no-store');
+    const configuration = { integration_enabled: config.enabled, public_enabled: config.publicEnabled,
+      configured: config.configured };
     let row;
     try { if (config.configured) row = (await query(db, READ_SNAPSHOT, [config.configurationId])).rows?.[0]; }
-    catch { return res.status(503).json({ configured: config.configured, refresh_status: 'unavailable', last_error_code: 'DATABASE' }); }
+    catch { return res.status(503).json({ ...configuration, refresh_status: 'unavailable', last_error_code: 'DATABASE' }); }
     const verified = Date.parse(row?.verified_at);
-    return res.json({ configured: config.configured, authorized: !!row?.credentials_ready,
+    return res.json({ ...configuration, authorized: !!row?.credentials_ready,
       last_successful_refresh: row?.published_at || null,
       snapshot_age_seconds: Number.isFinite(verified) ? Math.max(0, Math.floor((clock() - verified) / 1000)) : null,
       published_event_count: Array.isArray(row?.events) ? row.events.length : 0,

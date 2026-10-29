@@ -68,7 +68,7 @@ function fixture(db, { env: suppliedEnv, now: initialNow = BASE_NOW } = {}) {
   // Explicit injected configuration, never inherited production configuration.
   // This inert URL only satisfies configured-state validation; db is the guarded
   // test pool. Encryption keys/tokens are synthetic and are never logged.
-  const env = suppliedEnv || { TODOIST_CALENDAR_ENABLED: '1', DATABASE_URL: 'postgres://fixture.invalid/not-connected',
+  const env = suppliedEnv || { TODOIST_CALENDAR_ENABLED: '1', TODOIST_CALENDAR_PUBLIC_ENABLED: 'true', DATABASE_URL: 'postgres://fixture.invalid/not-connected',
     TODOIST_CLIENT_ID: 'cal06b-synthetic-client', TODOIST_CLIENT_SECRET: 'cal06b-synthetic-secret',
     TODOIST_TOKEN_ENCRYPTION_KEY: crypto.randomBytes(32).toString('base64'),
     TODOIST_REDIRECT_URI: 'https://fixture.invalid/api/calendar/oauth/callback', NODE_ENV: 'test' };

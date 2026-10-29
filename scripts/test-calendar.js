@@ -12,7 +12,8 @@ const { createCalendar, normalizeTask, normalizeTasks, localInstant, publicDescr
 const { PROJECT_ID, readConfig, requestJson, withDbLock } = require('../todoist-auth');
 
 const BASE_NOW = Date.parse('2026-10-01T12:00:00Z');
-const ENV = { TODOIST_CALENDAR_ENABLED: '1', DATABASE_URL: 'postgres://fixture.invalid/not-connected',
+const ENV = { TODOIST_CALENDAR_ENABLED: '1', TODOIST_CALENDAR_PUBLIC_ENABLED: 'true',
+  DATABASE_URL: 'postgres://fixture.invalid/not-connected',
   TODOIST_CLIENT_ID: 'synthetic-client', TODOIST_CLIENT_SECRET: 'synthetic-client-secret',
   TODOIST_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'),
   TODOIST_REDIRECT_URI: 'https://fixture.invalid/api/calendar/oauth/callback', NODE_ENV: 'production' };
@@ -187,6 +188,92 @@ test('disabled/missing configuration is unavailable without database or network 
     assert.equal(f.calls.length, 0); assert.equal(f.db.calls.length, 0); assert.equal(f.timers.size, 0);
   }
   assert(readConfig(ENV).configured);
+});
+
+test('CAL-08: both flags default off; public exposure requires an explicit value and the master', async () => {
+  const defaults = fixture({ env: {} });
+  assert.equal(defaults.app.config.enabled, false); assert.equal(defaults.app.config.publicEnabled, false);
+  for (const value of [undefined, '', 'false', '0', 'yes', 'TRUE', ' true ', true, 1]) {
+    const f = fixture({ env: { ...ENV, TODOIST_CALENDAR_PUBLIC_ENABLED: value } });
+    assert.equal(f.app.config.configured, true); assert.equal(f.app.config.publicEnabled, false);
+    let acquisitions = 0;
+    f.db.connect = () => { acquisitions++; throw Error('Public-disabled reads must never acquire a connection'); };
+    const result = await f.app.readPublic();
+    assert.equal(result.httpStatus, 503); assert.equal(result.cache, 'no-store');
+    assert.equal(result.body.status, 'unavailable'); assert.deepEqual(result.body.events, []);
+    assert.equal(result.body.freshness, null); assert.equal(f.calls.length, 0); assert.equal(f.db.calls.length, 0);
+    assert.equal(acquisitions, 0);
+  }
+  for (const master of [undefined, '0', '1']) for (const publicFlag of ['false', 'true', '1']) {
+    const f = fixture({ env: { ...ENV, TODOIST_CALENDAR_ENABLED: master, TODOIST_CALENDAR_PUBLIC_ENABLED: publicFlag } });
+    assert.equal(f.app.config.enabled, master === '1');
+    assert.equal(f.app.config.publicEnabled, publicFlag !== 'false');
+    if (master !== '1') {
+      assert.equal((await f.app.refresh()).status, 'disabled');
+      await rejected(f.app.auth.beginAuthorization(), 'CONFIGURATION');
+      assert.equal((await f.app.readPublic()).body.status, 'unavailable'); f.app.start();
+      assert.equal(f.db.calls.length, 0); assert.equal(f.calls.length, 0); assert.equal(f.timers.size, 0);
+    } else {
+      await f.authorize(); assert.equal((await f.app.refresh()).status, 'success');
+      assert.equal((await f.app.readPublic()).body.status, publicFlag === 'false' ? 'unavailable' : 'ready');
+    }
+  }
+});
+
+test('CAL-08: private OAuth, publication and diagnostics remain available without public payloads', async () => {
+  const f = fixture({ env: { ...ENV, TODOIST_CALENDAR_PUBLIC_ENABLED: 'false' } });
+  await f.authorize(); assert.equal((await f.app.refresh()).count, 1);
+  const saved = structuredClone({ snapshot: f.db.snapshot, credential: f.db.credential });
+  const requests = f.calls.length, queries = f.db.calls.length;
+  assert.equal((await f.app.readPublic()).httpStatus, 503); assert.equal(f.db.calls.length, queries);
+  let body, status = 200; const headers = {};
+  const res = { set: (k, v) => { headers[k] = v; }, status: value => { status = value; return res; }, json: value => { body = value; return res; } };
+  await f.app.diagnosticsHandler({}, res);
+  assert.equal(body.integration_enabled, true); assert.equal(body.public_enabled, false);
+  assert.equal(body.configured, true); assert.equal(body.authorized, true); assert.equal(body.published_event_count, 1);
+  assert.equal(status, 200); assert.equal(headers['Cache-Control'], 'no-store');
+  assert(!JSON.stringify(body).match(/synthetic|PRIVATE|token|configuration_id|Synthetic Concert/));
+  f.db.fail = () => true; await f.app.diagnosticsHandler({}, res);
+  assert.deepEqual(body, { integration_enabled: true, public_enabled: false, configured: true,
+    refresh_status: 'unavailable', last_error_code: 'DATABASE' }); assert.equal(status, 503);
+  assert.equal(f.calls.length, requests); assert.deepEqual({ snapshot: f.db.snapshot, credential: f.db.credential }, saved);
+});
+
+test('CAL-08: visibility-only restarts preserve authorization, snapshots and persisted scheduling', async () => {
+  const f = fixture({ env: { ...ENV, TODOIST_CALENDAR_PUBLIC_ENABLED: 'false' } });
+  await f.authorize(); await f.app.refresh();
+  const saved = structuredClone({ snapshot: f.db.snapshot, credential: f.db.credential });
+  for (const publicFlag of ['true', 'false', '1', undefined]) {
+    const restarted = fixture({ db: f.db, env: { ...ENV, TODOIST_CALENDAR_PUBLIC_ENABLED: publicFlag } });
+    assert.equal(restarted.app.config.configurationId, f.app.config.configurationId);
+    assert.equal((await restarted.app.auth.getAccessToken()).token, 'synthetic-access-1');
+    assert.equal(restarted.calls.length, 0);
+    const result = await restarted.app.readPublic();
+    assert.equal(result.body.status, ['true', '1'].includes(publicFlag) ? 'ready' : 'unavailable');
+    assert.equal((await restarted.app.refresh()).status, 'waiting'); assert.equal(restarted.calls.length, 0);
+    restarted.app.start(); restarted.app.start(); assert.equal(restarted.timers.size, 1);
+    const [timer, scheduled] = [...restarted.timers][0]; restarted.timers.delete(timer); await scheduled.fn();
+    assert.equal(restarted.timers.size, 1); assert.equal([...restarted.timers.values()][0].delay, 300000);
+    await restarted.app.stop(); assert.equal(restarted.timers.size, 0); assert.equal(restarted.calls.length, 0);
+    assert.deepEqual({ snapshot: f.db.snapshot, credential: f.db.credential }, saved);
+  }
+});
+
+test('CAL-08: public flag changes cannot bypass persisted 900-second provider backoff', async () => {
+  const f = fixture(); await f.authorize(); await f.app.refresh(); f.advance(300000);
+  f.pages = () => Response.json({ error_extra: { retry_after: 900 } }, { status: 429 });
+  assert.equal((await f.app.refresh()).delay, 900000);
+  const saved = structuredClone({ snapshot: f.db.snapshot, credential: f.db.credential });
+  const workers = ['false', 'true'].map(publicFlag => fixture({ db: f.db,
+    env: { ...ENV, TODOIST_CALENDAR_PUBLIC_ENABLED: publicFlag } }));
+  for (const worker of workers) worker.advance(300000);
+  const results = await Promise.all(workers.map(worker => worker.app.refresh()));
+  assert(results.every(result => ['waiting', 'busy'].includes(result.status)));
+  for (const worker of workers) {
+    worker.advance(899999); assert.equal((await worker.app.refresh()).status, 'waiting');
+    assert.equal(worker.calls.length, 0); await worker.app.readPublic();
+  }
+  assert.deepEqual({ snapshot: f.db.snapshot, credential: f.db.credential }, saved); assert.equal(f.db.locks.size, 0);
 });
 
 test('OAuth state/PKCE/redirect, one-use callback and authenticated encryption', async () => {
@@ -382,7 +469,7 @@ test('integration wiring stays outside legacy Sheets and preserves Admin middlew
   }
 });
 
-test('actual Express Calendar handlers and setup credential guard (isolated local HTTP)', async () => {
+test('actual Express handlers: CAL-08 visibility gate, conditional requests and Admin protection (isolated HTTP)', async () => {
   const express = require('express');
   const source = fs.readFileSync(path.resolve(__dirname, '../server.js'), 'utf8');
   const extract = name => {
@@ -393,10 +480,12 @@ test('actual Express Calendar handlers and setup credential guard (isolated loca
   const context = vm.createContext({ crypto, Buffer, getConfiguredAdminSecrets: () => ['synthetic-admin-header'] });
   vm.runInContext(extract('adminTokenMatches') + '\n' + extract('requireCalendarAdminCredential'), context);
   const f = fixture(); await f.authorize(); await f.app.refresh();
+  const privateApp = fixture({ db: f.db, env: { ...ENV, TODOIST_CALENDAR_PUBLIC_ENABLED: 'false' } });
+  let active = f.app;
   const app = express();
-  app.get('/api/calendar', f.app.publicHandler);
-  app.get('/api/admin/calendar/status', context.requireCalendarAdminCredential, f.app.diagnosticsHandler);
-  app.post('/api/admin/calendar/oauth/start', context.requireCalendarAdminCredential, f.app.oauthStartHandler);
+  app.get('/api/calendar', (req, res) => active.publicHandler(req, res));
+  app.get('/api/admin/calendar/status', context.requireCalendarAdminCredential, (req, res) => active.diagnosticsHandler(req, res));
+  app.post('/api/admin/calendar/oauth/start', context.requireCalendarAdminCredential, (req, res) => active.oauthStartHandler(req, res));
   app.get('/api/calendar/oauth/callback', f.app.oauthCallbackHandler);
   const server = await new Promise(resolve => { const listener = app.listen(0, '127.0.0.1', () => resolve(listener)); });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -405,18 +494,41 @@ test('actual Express Calendar handlers and setup credential guard (isolated loca
     let response = await fetch(base + '/api/calendar?refresh=1');
     assert.equal(response.status, 200); assert.equal((await response.json()).status, 'ready');
     assert.equal(f.calls.length, requests); assert.match(response.headers.get('cache-control'), /max-age=30/);
+    const readyTag = response.headers.get('etag'); assert(readyTag);
+    // Simulate a visibility-only configuration restart, sharing the same persisted state.
+    active = privateApp.app;
+    const queries = f.db.calls.length;
+    for (const headers of [{}, { 'If-None-Match': readyTag }, { 'If-None-Match': '*' },
+      { 'If-Modified-Since': 'Thu, 01 Oct 2026 12:00:00 GMT' },
+      { 'If-None-Match': readyTag, 'Cache-Control': 'max-age=3600', Authorization: 'Bearer synthetic-admin-header' }]) {
+      response = await fetch(base + '/api/calendar?refresh=1&public_enabled=true', { headers });
+      assert.equal(response.status, 503); assert.equal(response.headers.get('cache-control'), 'no-store');
+      const hidden = await response.json();
+      assert.equal(hidden.status, 'unavailable'); assert.deepEqual(hidden.events, []); assert.equal(hidden.freshness, null);
+      assert(!JSON.stringify(hidden).match(/Synthetic Concert|synthetic|PRIVATE|configured|public_enabled/));
+    }
+    assert.equal(f.db.calls.length, queries); assert.equal(privateApp.calls.length, 0);
     for (const query of ['', '?admin_token=synthetic-admin-header']) {
       response = await fetch(base + '/api/admin/calendar/status' + query);
       assert.equal(response.status, 401); assert.equal(response.headers.get('cache-control'), 'no-store');
     }
     response = await fetch(base + '/api/admin/calendar/status', { headers: { Authorization: 'Bearer synthetic-admin-header' } });
-    assert.equal(response.status, 200); assert.equal((await response.json()).published_event_count, 1);
+    assert.equal(response.status, 200); const diagnostics = await response.json();
+    assert.equal(diagnostics.published_event_count, 1); assert.equal(diagnostics.public_enabled, false);
+    assert.equal(diagnostics.integration_enabled, true); assert.equal(diagnostics.authorized, true);
     response = await fetch(base + '/api/admin/calendar/oauth/start', { method: 'POST' }); assert.equal(response.status, 401);
+    response = await fetch(base + '/api/admin/calendar/oauth/start', {
+      method: 'POST', headers: { Authorization: 'Bearer synthetic-admin-header' } });
+    assert.equal(response.status, 200); assert.match((await response.json()).authorization_url, /^https:\/\/app\.todoist\.com\/oauth\/authorize\?/);
+    assert.equal(privateApp.calls.length, 0);
     response = await fetch(base + '/api/calendar/oauth/callback?state=bad&code=private');
     assert.equal(response.status, 400); assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
     assert(!(await response.text()).includes('private')); assert.equal(f.calls.length, requests);
     const res = { locals: { v3AdminSessionAuthorized: true } };
     let passed = false; context.requireCalendarAdminCredential({}, res, () => { passed = true; }); assert(passed);
+    active = f.app;
+    response = await fetch(base + '/api/calendar'); assert.equal(response.status, 200);
+    assert.equal((await response.json()).status, 'ready');
     f.advance(300000); f.pages = () => ({ results: [], next_cursor: null }); await f.app.refresh();
     response = await fetch(base + '/api/calendar');
     assert.equal(response.status, 200); assert.equal((await response.json()).status, 'empty');
@@ -817,6 +929,6 @@ test('CAL-05B: actual pg Client still enforces the separate 3000ms query timeout
     try { await item.run(); console.log(`PASS ${item.name}`); }
     catch (error) { failed++; console.error(`FAIL ${item.name}: ${error.stack}`); }
   }
-  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04/CAL-05A/CAL-05B checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
+  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04/CAL-05A/CAL-05B/CAL-08 checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
   process.exitCode = failed ? 1 : 0;
 })();
