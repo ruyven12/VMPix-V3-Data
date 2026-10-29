@@ -1668,14 +1668,7 @@ function getMusicPeopleArchiveMatchedPhotoTime(photo) {
 }
 
 function formatMusicPeopleArchiveSeenDate(value) {
-  const time = getMusicPeopleArchiveDateTimeOriginalTime(value);
-  if (!time) return null;
-  const date = new Date(time);
-  return [
-    String(date.getUTCMonth() + 1).padStart(2, '0'),
-    String(date.getUTCDate()).padStart(2, '0'),
-    String(date.getUTCFullYear())
-  ].join('/');
+  return formatMusicBandCoverageDate(normalizeSmugCoverageDateValue(value));
 }
 
 function getMusicPeopleArchivePhotoUrl(photo) {
@@ -2422,9 +2415,27 @@ async function buildMusicBandArchiveCoverageResponse(payload, bandRef, forceRefr
   };
 }
 
+// SmugMug timestamps are instants; archive readouts use Eastern time, including DST.
+// Date-only and unzoned camera values retain their supplied calendar day.
+const musicArchiveTimestampDateFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+});
+function getMusicArchiveTimestampDateParts(value) {
+  const text = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) return null;
+  const time = Date.parse(text);
+  if (!Number.isFinite(time)) return null;
+  const parts = Object.fromEntries(musicArchiveTimestampDateFormatter.formatToParts(new Date(time))
+    .filter(part => ['year', 'month', 'day'].includes(part.type))
+    .map(part => [part.type, Number(part.value)]));
+  return { ...parts, time };
+}
+
 function normalizeSmugCoverageDateValue(value) {
   const clean = String(value || '').trim();
   if (!clean || /^0{4}[:/-]0{1,2}[:/-]0{1,2}/.test(clean)) return null;
+  const timestampDate = getMusicArchiveTimestampDateParts(clean);
+  if (timestampDate) return timestampDate;
 
   let match = clean.match(/^(\d{4})[:/-](\d{1,2})[:/-](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
   if (match) {
@@ -2444,7 +2455,7 @@ function normalizeSmugCoverageDateValue(value) {
     }
   }
 
-  match = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  match = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
   if (match) {
     const month = Number(match[1]);
     const day = Number(match[2]);
