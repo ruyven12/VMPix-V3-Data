@@ -226,3 +226,150 @@ database. It covers API handlers, publication, OAuth, locking and scheduling fai
 local verification with a production `DATABASE_URL`. Additive table definitions require
 a separately authorized migration/deployment. Calendar modules themselves never create
 tables. The public endpoint works safely as 503 while the integration remains disabled.
+
+## CAL-04 production-readiness review (2026-10-29)
+
+**Recommendation: NO-GO for production activation.** CAL-03 runtime and publication
+policy remain unchanged. This pass adds readiness tests and this checklist only.
+The inspected checkout baseline was `a6ee74c9fd9961a48d7a0fe2ed0101d66da95956`.
+No live OAuth, production schema application, deployment, secret provisioning or
+enablement was performed. The production enablement value itself could not be read.
+
+### Verified findings and blockers
+
+- The original 22 Calendar groups pass; five additional readiness groups pass.
+  Two new release checks fail: **27/29** total. The failing checks remain enabled.
+  1. `requestJson()` reads a top-level `retry_after`, but not Todoist's documented
+     `error_extra.retry_after`. A synthetic body-only 900-second backoff results in
+     a 300-second retry. Before activation, accept valid nested backoff metadata
+     without shortening a valid server delay, and keep invalid values bounded.
+  2. Public/diagnostic snapshot reads use `pool.query()`. Its `query_timeout` does
+     not cover waiting for an available pool connection. The installed `pg` Pool,
+     with a synthetic transport and its only connection held, leaves the Calendar
+     read pending beyond 3300ms despite the 3000ms query timeout. Before activation,
+     bound Calendar read connection acquisition and clean up late arrivals; return
+     sanitized 503/no-store on failure. Do not alter unrelated database consumers.
+- OAuth scope, one-use state, PKCE challenge/verifier consistency, denied callbacks,
+  encrypted token persistence, rotation serialization and fail-closed interrupted
+  rotation are verified with mocks. Legacy token responses and grace-window responses
+  without a recoverable replacement refresh token are rejected safely.
+- The current official API documents the exact project filter, `results`/`next_cursor`,
+  task fields and structured due dates used here. A new OAuth app defaults to rotating
+  refresh tokens; a legacy app must explicitly enable that mode. CAL-03 intentionally
+  does not support long-lived personal/legacy tokens. Actual provider enforcement of
+  PKCE for the configured confidential app still requires an authorized live test.
+- Publication excludes unapproved/ineligible tasks; only the eight public fields are
+  returned. Tests cover New York DST, all-day boundaries, partial scans, withdrawals,
+  valid empty snapshots, credential changes mid-scan and failed token persistence.
+- Isolated Express HTTP checks verify ready/empty/stale/unavailable, no-store errors,
+  no ingestion from public reads, and no stale 304 response after snapshot expiry.
+  Synthetic restart tests preserve the existing snapshot, credentials and retry delay.
+- Import Reporting: **22/22**. Wrestling photo-total: **14/16**, with the same two
+  missing-`res.locals` fixture failures reproduced against pre-Calendar `3f6620b`.
+  No unrelated test repairs were made. JavaScript syntax and scoped diff checks pass.
+
+### PostgreSQL assessment
+
+The two additive tables use singleton primary keys, UUID credential versions,
+TIMESTAMPTZ freshness, a JSONB array check, and status/scope/state constraints.
+The primary-key indexes are sufficient for their single-row equality lookups; no
+additional event, JSONB or ciphertext index is needed. Snapshot replacement uses
+BEGIN/UPDATE/COMMIT and ROLLBACK on failure. The credential row is locked FOR SHARE
+during publication to prevent publishing under replaced authorization. A valid
+empty array is supported. No Music/Wrestling tables or relationships are changed.
+
+Refresh and OAuth coordination use separate session advisory locks on dedicated
+connections, plus persisted scheduling and token-rotation markers. Use a **direct
+PostgreSQL connection**, not transaction-pooled PgBouncer, for these session locks.
+The worker can hold two connections concurrently; retain capacity for public APIs.
+On a lost connection PostgreSQL releases session locks and rolls back uncommitted
+transactions; a restarted worker consults the persisted schedule before another scan.
+An ambiguous committed token exchange deliberately requires reauthorization.
+
+Real schema execution, grants, locking, transaction rollback and connection-loss
+recovery remain **unverified**: no disposable PostgreSQL/Docker runtime or explicitly
+identified test database was available. Mock SQL tests and the installed-driver probe
+are not a substitute. Before migration, check whether either table already exists
+and compare its definition; CREATE TABLE IF NOT EXISTS does not validate an existing
+table. The existing `db.js` sets `rejectUnauthorized: false`; certificate/network
+assurance must be reviewed for the intended production connection separately. This
+pre-existing shared setting was inspected but not changed.
+
+### Hosting and live access
+
+Render connector operations were unavailable; the browser reached Render sign-in.
+No Render CLI, local Render Blueprint, or configured non-production Todoist credentials
+were available in the scoped checks. Service identity, plan, region, instance count,
+deployed commit, environment configuration and database state could not be verified.
+No account sign-in or authorization was initiated.
+
+Render Free web services sleep after 15 minutes without inbound traffic; an in-process
+timer cannot guarantee five-minute refreshes while asleep. Verify a continuously
+running service before activation; if the target is Free, an approved paid-compute
+change is needed for this design. No cron or additional service is proposed here.
+Multiple running instances use the existing database locks/persisted schedule; this
+behavior is mock-tested, not yet exercised on Render. Restarts preserve PostgreSQL
+snapshots and encrypted tokens; expired snapshots remain withheld until refresh succeeds.
+
+Even on continuous hosting, the current schedule starts the next scan at the freshness
+boundary, so a brief 503/stale window can occur during a successful refresh. Rate limits
+or downtime can extend unavailability, and removal of approval is bounded by polling,
+not instantaneous. Keep the existing health endpoint: Calendar's intentionally disabled
+or stale 503 response must not become the whole service's health check.
+
+### Controlled activation checklist — not executed
+
+Every production write, configuration change, authorization or deploy below requires
+separate user approval. Complete the two failing checks and isolated PostgreSQL tests
+before proceeding. Do not create live test tasks.
+
+1. **Migration approval:** verify the target service/database and pending migrations.
+   Apply only the two additive CAL-03 definitions under a reviewed transaction with
+   bounded lock/statement timeouts; inspect resulting columns, constraints and indexes.
+   Existing startup applies the full schema and runtime migrations even when Calendar
+   is disabled, so a backend deployment must not be treated as a migration-free step.
+2. **Render configuration approval:** verify a continuously running service, correct
+   Node runtime (18+), direct PostgreSQL URL, adequate connection capacity, intended
+   workspace/region and existing Admin/CORS settings. Keep `TODOIST_CALENDAR_ENABLED=0`
+   throughout preparation. No new service or scheduler is required by this plan.
+3. **Encryption-key approval:** provision `TODOIST_TOKEN_ENCRYPTION_KEY` as canonical
+   base64 for 32 cryptographically random bytes in Render secrets. Preserve it securely
+   across restarts/rollbacks; do not rotate it casually or print it. Configuration/key
+   changes invalidate existing authorization and require a reviewed reauthorization.
+4. **OAuth application approval:** configure a confidential Todoist OAuth application
+   with refresh tokens enabled, `data:read` only, and an exact HTTPS redirect ending in
+   `/api/calendar/oauth/callback`. Provision `TODOIST_CLIENT_ID`, `TODOIST_CLIENT_SECRET`
+   and `TODOIST_REDIRECT_URI`. Preserve the existing `DATABASE_URL` and Admin credentials.
+5. **Account authorization and activation approval:** the current single enable flag
+   gates OAuth setup, the worker and public reads together. Setting it to 1 and completing
+   `POST /api/admin/calendar/oauth/start` plus consent can lead directly to publication
+   on the next worker scan. Approve that combined activation explicitly; there is no
+   separate production dry-run/publication gate. Do not add one without a separate pass.
+6. **Initial real scan:** allow the existing bounded worker to retrieve only project
+   `6gRQ3CfW6Ww7V2fF`; verify approval/exclusion behavior against existing approved tasks.
+   Confirm no personal tasks, raw descriptions or extra fields reach storage/output.
+7. **Publication verification:** read back only normalized snapshot fields and freshness;
+   confirm credential linkage and success, including legitimate empty publication. Never
+   print ciphertext, raw OAuth responses or private task fields during inspection.
+8. **Refresh monitoring:** use authenticated `/api/admin/calendar/status` and sanitized
+   status logs across at least two refresh cycles. Check expiry/cache behavior, retries,
+   restart recovery and absence of overlapping workers. Inspect query-string logging
+   so OAuth callback codes/state are not retained in proxy/access logs.
+9. **Public API verification:** check the approved production URL for ready or verified
+   empty, exact eight-field records, New York dates and bounded cache headers. Exercise
+   stale/unavailable and failure injection in staging, not by disrupting production.
+   No frontend Calendar changes are part of this activation.
+10. **Rollback approval:** set `TODOIST_CALENDAR_ENABLED=0` and deploy that configuration;
+    verify workers stop and `/api/calendar` returns 503/unavailable/no-store. Allow the
+    existing public-cache window (at most 30 seconds) to expire. Retain both additive
+    tables, snapshot and encrypted credentials; do not drop tables or alter archive data.
+    If code rollback is also needed, verify configuration and schema compatibility first:
+    a code rollback does not undo migrations or necessarily apply newly saved environment
+    values. Token revocation/key rotation are separate approved actions if required.
+
+Current primary references: [Todoist API v1](https://developer.todoist.com/api/v1/),
+[Render Free services](https://render.com/docs/free),
+[Render deployments](https://render.com/docs/deploys),
+[Render health checks](https://render.com/docs/health-checks),
+[Render private networking](https://render.com/docs/private-network),
+[Render rollbacks](https://render.com/docs/rollbacks).

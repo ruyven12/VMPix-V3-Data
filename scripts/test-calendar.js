@@ -416,7 +416,114 @@ test('actual Express Calendar handlers and setup credential guard (isolated loca
     assert(!(await response.text()).includes('private')); assert.equal(f.calls.length, requests);
     const res = { locals: { v3AdminSessionAuthorized: true } };
     let passed = false; context.requireCalendarAdminCredential({}, res, () => { passed = true; }); assert(passed);
+    f.advance(300000); f.pages = () => ({ results: [], next_cursor: null }); await f.app.refresh();
+    response = await fetch(base + '/api/calendar');
+    assert.equal(response.status, 200); assert.equal((await response.json()).status, 'empty');
+    const etag = response.headers.get('etag');
+    f.advance(300000);
+    response = await fetch(base + '/api/calendar', { headers: { 'If-None-Match': etag } });
+    assert.equal(response.status, 503); assert.equal(response.headers.get('cache-control'), 'no-store');
+    let body = await response.json(); assert.equal(body.status, 'stale'); assert.deepEqual(body.events, []);
+    f.db.fail = () => true;
+    response = await fetch(base + '/api/calendar'); body = await response.json();
+    assert.equal(response.status, 503); assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(body.status, 'unavailable'); assert.deepEqual(body.events, []);
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+// CAL-04: production-readiness checks. Failures are release blockers, not skipped checks.
+test('PKCE digest matches the verifier; mismatched/denied callbacks cannot exchange tokens', async () => {
+  const f = fixture(); const start = await f.app.auth.beginAuthorization();
+  const url = new URL(start.authorization_url), state = url.searchParams.get('state');
+  await rejected(f.app.auth.completeAuthorization({ state: 'X'.repeat(43), code: 'synthetic-code' }), 'AUTH_STATE');
+  assert.equal(f.calls.length, 0);
+  await f.app.auth.completeAuthorization({ state, code: 'synthetic-code' });
+  assert.equal(crypto.createHash('sha256').update(f.calls[0].options.body.get('code_verifier')).digest('base64url'), url.searchParams.get('code_challenge'));
+  const denied = new URL((await f.app.auth.beginAuthorization()).authorization_url).searchParams.get('state');
+  const count = f.calls.length;
+  await rejected(f.app.auth.completeAuthorization({ state: denied, error: 'access_denied' }), 'AUTH_DENIED');
+  await rejected(f.app.auth.completeAuthorization({ state: denied, code: 'synthetic-code' }), 'AUTH_STATE');
+  assert.equal(f.calls.length, count);
+});
+
+test('legacy OAuth and lost rotated refresh-token responses fail closed', async () => {
+  const f = fixture();
+  f.tokenResponse = () => Response.json({ access_token: 'synthetic-legacy', token_type: 'Bearer', expires_in: 315360000 });
+  await rejected(f.authorize(), 'AUTH_SCOPE'); assert.equal(f.db.credential.encrypted_tokens, null);
+  f.tokenResponse = null; await f.authorize(); const ciphertext = f.db.credential.encrypted_tokens;
+  f.advance(3600000);
+  f.tokenResponse = () => Response.json({ access_token: 'synthetic-grace-retry', token_type: 'Bearer', expires_in: 3600, scope: 'data:read' });
+  await rejected(f.app.auth.getAccessToken(), 'AUTH_REAUTHORIZE');
+  assert.equal(f.db.credential.encrypted_tokens, ciphertext); assert.equal(f.db.credential.blocked, true);
+});
+
+test('process restart retains the snapshot, tokens and persisted refresh/backoff schedule', async () => {
+  const first = fixture(); await first.authorize(); await first.app.refresh(); await first.app.stop();
+  const saved = structuredClone(first.db.snapshot), restarted = fixture({ db: first.db });
+  assert.equal((await restarted.app.readPublic()).body.status, 'ready');
+  assert.equal((await restarted.app.refresh()).status, 'waiting'); assert.equal(restarted.calls.length, 0);
+  assert.deepEqual(first.db.snapshot.events, saved.events);
+  restarted.advance(300000);
+  restarted.pages = () => new Response('synthetic rate limit', { status: 429, headers: { 'Retry-After': '900' } });
+  assert.equal((await restarted.app.refresh()).delay, 900000);
+  const afterBackoffRestart = fixture({ db: first.db });
+  afterBackoffRestart.setNow(new Date(restarted.now() + 300000).toISOString());
+  assert.equal((await afterBackoffRestart.app.refresh()).status, 'waiting'); assert.equal(afterBackoffRestart.calls.length, 0);
+  assert.equal((await afterBackoffRestart.app.readPublic()).body.status, 'stale');
+  afterBackoffRestart.advance(600000); afterBackoffRestart.pages = () => ({ results: [], next_cursor: null });
+  assert.equal((await afterBackoffRestart.app.refresh()).count, 0);
+  assert.equal((await afterBackoffRestart.app.readPublic()).body.status, 'empty');
+});
+
+test('credential replacement during a scan prevents publication under an old authorization', async () => {
+  const f = fixture(); await f.authorize(); await f.app.refresh(); const saved = structuredClone(f.db.snapshot);
+  f.advance(300000);
+  f.pages = () => { f.db.credential.credential_version = crypto.randomUUID(); return { results: [task({ content: 'Changed event' })], next_cursor: null }; };
+  assert.equal((await f.app.refresh()).code, 'AUTH_REAUTHORIZE');
+  assert.deepEqual(f.db.snapshot.events, saved.events); assert.deepEqual(f.db.snapshot.verified_at, saved.verified_at);
+  assert.equal((await f.app.readPublic()).body.status, 'unavailable'); assert.equal(f.db.locks.size, 0);
+});
+
+test('failed token persistence blocks reuse without replacing the previous publication', async () => {
+  const f = fixture(); await f.authorize(); await f.app.refresh(); const saved = structuredClone(f.db.snapshot);
+  f.advance(3600000); f.db.fail = sql => sql.startsWith('UPDATE todoist_oauth_credentials SET encrypted_tokens');
+  assert.equal((await f.app.refresh()).code, 'AUTH_REAUTHORIZE');
+  assert.deepEqual(f.db.snapshot.events, saved.events); assert.deepEqual(f.db.snapshot.verified_at, saved.verified_at);
+  assert(f.db.credential.blocked); const requests = f.calls.length;
+  f.advance(300000); await f.app.refresh(); assert.equal(f.calls.length, requests); assert.equal(f.db.locks.size, 0);
+});
+
+test('CAL-04 blocker: body-only Todoist backoff must honor error_extra.retry_after', async () => {
+  const f = fixture(); await f.authorize();
+  f.pages = () => Response.json({ error_tag: 'RATE_LIMIT_EXCEEDED', http_code: 429,
+    error_extra: { retry_after: 900 } }, { status: 429 });
+  const result = await f.app.refresh();
+  assert.equal(result.delay, 900000, 'Nested Todoist backoff must not be shortened to the five-minute default');
+});
+
+test('CAL-04 blocker: public database pool acquisition must have a bounded deadline', async () => {
+  // Real installed pg Pool, synthetic transport; no PostgreSQL or network connection.
+  const { Pool } = require('pg');
+  class FakeClient extends EventEmitter {
+    connect(callback) { process.nextTick(() => callback(null)); }
+    query(config, values, callback) {
+      const done = typeof values === 'function' ? values : callback;
+      process.nextTick(() => done(null, { rows: [] }));
+    }
+    end(callback) { this.emit('end'); if (callback) process.nextTick(callback); }
+  }
+  const pool = new Pool({ max: 1, Client: FakeClient });
+  const held = await pool.connect();
+  const f = fixture({ db: pool });
+  let deadline;
+  const request = f.app.readPublic();
+  try {
+    const result = await Promise.race([request, new Promise(resolve => { deadline = setTimeout(() => resolve(null), 3300); })]);
+    assert(result, 'Calendar SELECT remains queued beyond its 3000ms query timeout when the pool is exhausted');
+    assert.equal(result.httpStatus, 503); assert.equal(result.body.status, 'unavailable');
+  } finally {
+    clearTimeout(deadline); held.release(); await request; await pool.end();
+  }
 });
 
 (async () => {
@@ -425,6 +532,6 @@ test('actual Express Calendar handlers and setup credential guard (isolated loca
     try { await item.run(); console.log(`PASS ${item.name}`); }
     catch (error) { failed++; console.error(`FAIL ${item.name}: ${error.stack}`); }
   }
-  console.log(`${tests.length - failed}/${tests.length} CAL-03 checks passed (mocked; no live Todoist or PostgreSQL).`);
+  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04 checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
   process.exitCode = failed ? 1 : 0;
 })();
