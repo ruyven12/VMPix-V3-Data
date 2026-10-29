@@ -64,8 +64,32 @@ function unseal(value, config, purpose) {
   } catch { throw fault('AUTH_REAUTHORIZE'); }
 }
 
+function retryDelay(header, data, now) {
+  // Validate the persisted deadline, not the platform timer limit: long backoffs
+  // survive early timer wake-ups. Never clamp a usable provider delay downward.
+  const usable = ms => Number.isSafeInteger(ms) && ms >= 0 && Number.isSafeInteger(now + ms) &&
+    Math.abs(now + ms) <= 8640000000000000 ? ms : null;
+  const seconds = value => {
+    if (typeof value !== 'number' && !(typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim()))) return null;
+    const amount = Number(value);
+    return Number.isFinite(amount) && amount >= 0 ? usable(Math.ceil(amount * 1000)) : null;
+  };
+  let headerDelay = seconds(header);
+  // HTTP dates begin with a weekday. Do not let Date.parse turn a malformed
+  // numeric delay (such as "-1") into an unrelated calendar date.
+  if (headerDelay === null && typeof header === 'string' && /^[A-Za-z]{3,9}(?:,| )/.test(header.trim())) {
+    // The legacy HTTP asctime form omits its zone but still denotes GMT.
+    const date = header.trim();
+    const asctime = /^[A-Za-z]{3} [A-Za-z]{3} {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(date);
+    headerDelay = usable(Math.max(0, Date.parse(asctime ? `${date} GMT` : date) - now));
+  }
+  const hints = [headerDelay, seconds(data?.error_extra?.retry_after), seconds(data?.retry_after)]
+    .filter(value => value !== null);
+  return hints.length ? Math.max(...hints) : 300000;
+}
+
 // All remote requests stay on fixed Todoist URLs; never follow credential-bearing redirects.
-async function requestJson(fetchImpl, url, { signal, timeoutMs = 10000, maxBytes = 2 * 1024 * 1024, ...options } = {}) {
+async function requestJson(fetchImpl, url, { signal, timeoutMs = 10000, maxBytes = 2 * 1024 * 1024, clock = Date.now, ...options } = {}) {
   const controller = new AbortController();
   const cancel = () => controller.abort();
   signal?.addEventListener('abort', cancel, { once: true });
@@ -83,10 +107,7 @@ async function requestJson(fetchImpl, url, { signal, timeoutMs = 10000, maxBytes
     let data = null;
     try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { if (response.ok) throw fault('RESPONSE_INVALID'); }
-    const retry = response.headers.get('retry-after');
-    const seconds = retry && /^\d+(\.\d+)?$/.test(retry) ? Number(retry)
-      : retry ? Math.max(0, (Date.parse(retry) - Date.now()) / 1000) : Number(data?.retry_after);
-    const retryAfterMs = Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : 300000;
+    const retryAfterMs = retryDelay(response.headers.get('retry-after'), data, clock());
     return { status: response.status, ok: response.ok, data, retryAfterMs };
   } catch (error) {
     if (signal?.aborted) throw fault('CANCELLED');
@@ -198,7 +219,7 @@ function createTodoistAuth({ db, config, fetchImpl = global.fetch, clock = Date.
       await query(client, 'UPDATE todoist_oauth_credentials SET oauth_state_hash = NULL, oauth_state_expires_at = NULL, pending_authorization = NULL WHERE id = 1');
       if (error) throw fault('AUTH_DENIED');
       if (typeof code !== 'string' || !code || code.length > 2048) throw fault('AUTH_STATE');
-      const response = await requestJson(fetchImpl, TOKEN_URL, { method: 'POST', maxBytes: 65536,
+      const response = await requestJson(fetchImpl, TOKEN_URL, { clock, method: 'POST', maxBytes: 65536,
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
         body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret,
           code, redirect_uri: config.redirectUri, code_verifier: pending.verifier }) });
@@ -230,7 +251,7 @@ function createTodoistAuth({ db, config, fetchImpl = global.fetch, clock = Date.
       // do not replay a possibly consumed refresh token after restart.
       await query(client, 'UPDATE todoist_oauth_credentials SET refresh_in_progress = TRUE WHERE id = 1');
       try {
-        const response = await requestJson(fetchImpl, TOKEN_URL, { signal, method: 'POST', maxBytes: 65536,
+        const response = await requestJson(fetchImpl, TOKEN_URL, { signal, clock, method: 'POST', maxBytes: 65536,
           headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
           body: new URLSearchParams({ grant_type: 'refresh_token', client_id: config.clientId,
             client_secret: config.clientSecret, refresh_token: tokens.refresh_token }) });

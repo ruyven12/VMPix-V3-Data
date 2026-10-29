@@ -493,12 +493,151 @@ test('failed token persistence blocks reuse without replacing the previous publi
   f.advance(300000); await f.app.refresh(); assert.equal(f.calls.length, requests); assert.equal(f.db.locks.size, 0);
 });
 
-test('CAL-04 blocker: body-only Todoist backoff must honor error_extra.retry_after', async () => {
-  const f = fixture(); await f.authorize();
-  f.pages = () => Response.json({ error_tag: 'RATE_LIMIT_EXCEEDED', http_code: 429,
-    error_extra: { retry_after: 900 } }, { status: 429 });
+test('CAL-05A: body-only 900-second backoff persists from the error without renewing publication', async () => {
+  const f = fixture(); await f.authorize(); await f.app.refresh();
+  const saved = structuredClone(f.db.snapshot);
+  f.advance(300000);
+  f.pages = () => {
+    f.advance(2000); // Count the delay from the response, not the start of the scan.
+    return Response.json({ error_tag: 'RATE_LIMIT_EXCEEDED', http_code: 429,
+      error_extra: { retry_after: 900 }, private_detail: 'PRIVATE-RATE-LIMIT-CANARY' }, { status: 429 });
+  };
   const result = await f.app.refresh();
+  assert.equal(result.code, 'RATE_LIMIT');
   assert.equal(result.delay, 900000, 'Nested Todoist backoff must not be shortened to the five-minute default');
+  assert.equal(Date.parse(f.db.snapshot.next_attempt_at), f.now() + 900000);
+  for (const key of ['events', 'verified_at', 'published_at', 'valid_until']) assert.deepEqual(f.db.snapshot[key], saved[key]);
+  const publicResult = await f.app.readPublic();
+  assert.equal(publicResult.body.status, 'stale'); assert.deepEqual(publicResult.body.events, []);
+  assert(!JSON.stringify([publicResult, f.logs]).match(/PRIVATE|synthetic-access|synthetic-refresh|error_extra/));
+  assert.equal(f.db.locks.size, 0);
+});
+
+test('CAL-05A: retry hints use seconds, preserve HTTP dates and choose the longest usable delay', async () => {
+  const cases = [
+    ['900', {}, 900000],
+    [null, { error_extra: { retry_after: 900 } }, 900000],
+    ['300', { error_extra: { retry_after: 900 } }, 900000],
+    ['1200', { error_extra: { retry_after: 900 } }, 1200000],
+    ['Thu, 01 Oct 2026 12:20:00 GMT', { error_extra: { retry_after: 900 } }, 1200000],
+    ['Thursday, 01-Oct-26 12:20:00 GMT', {}, 1200000],
+    ['Thu Oct  1 12:20:00 2026', {}, 1200000],
+    ['Thu, 01 Oct 2026 11:00:00 GMT', { error_extra: { retry_after: 900 } }, 900000],
+    ['broken', { error_extra: { retry_after: '900.0001' } }, 900001],
+    ['900.0001', { error_extra: { retry_after: 'invalid' } }, 900001],
+    [null, { retry_after: 1200, error_extra: { retry_after: 900 } }, 1200000],
+    [null, { error_extra: { retry_after: 315360000 } }, 315360000000], // No arbitrary short cap.
+    [null, {}, 300000],
+    ['-1', { error_extra: { retry_after: -1 } }, 300000],
+    ['1e309', { error_extra: { retry_after: 'Infinity' } }, 300000],
+    ['8640000000000', { error_extra: { retry_after: 8640000000000 } }, 300000], // Deadline exceeds Date range.
+    [null, { error_extra: { retry_after: 0 } }, 0],
+    ...[null, true, false, '', ' ', 'NaN', 'Infinity', '1e309', [], [900], {}, -0.0001, -900, 1e308]
+      .map(value => [null, { error_extra: { retry_after: value } }, 300000]),
+  ];
+  for (const [header, body, expected] of cases) {
+    const response = await requestJson(async (url, options) => {
+      assert.equal('clock' in options, false);
+      return Response.json(body, { status: 429, headers: header === null ? {} : { 'Retry-After': header } });
+    }, 'https://fixture.invalid', { clock: () => BASE_NOW });
+    assert.equal(response.retryAfterMs, expected, JSON.stringify({ header, body }));
+  }
+  for (const invalid of ['NaN', 'Infinity', '-Infinity', '1e309']) {
+    const response = await requestJson(async () => new Response(`{"error_extra":{"retry_after":${invalid}}}`, { status: 429 }),
+      'https://fixture.invalid', { clock: () => BASE_NOW });
+    assert.equal(response.retryAfterMs, 300000);
+  }
+});
+
+test('CAL-05A: refresh persists header/body precedence and preserves fallback and successful cadence', async () => {
+  for (const [header, body, delay] of [
+    ['1200', { error_extra: { retry_after: 900 } }, 1200000],
+    ['Thu, 01 Oct 2026 12:20:00 GMT', { error_extra: { retry_after: 900 } }, 1200000],
+    ['300', { error_extra: { retry_after: 900 } }, 900000],
+    [null, { error_extra: { retry_after: 900.0001 } }, 900001],
+    [null, { error_extra: { retry_after: 'bad' } }, 300000],
+    [null, {}, 300000],
+    [null, { error_extra: { retry_after: 0 } }, 300000],
+  ]) {
+    const f = fixture(); await f.authorize();
+    f.pages = () => Response.json(body, { status: 429, headers: header === null ? {} : { 'Retry-After': header } });
+    assert.equal((await f.app.refresh()).delay, delay);
+    assert.equal(new Date(f.db.snapshot.next_attempt_at).getTime(), f.now() + delay);
+    const requests = f.calls.length;
+    f.advance(delay - 1); assert.equal((await f.app.refresh()).status, 'waiting'); assert.equal(f.calls.length, requests);
+    f.advance(1); f.pages = () => ({ results: [task()], next_cursor: null });
+    const success = await f.app.refresh(); assert.equal(success.status, 'success'); assert.equal(success.delay, 300000);
+    assert.equal(new Date(f.db.snapshot.next_attempt_at).getTime(), f.now() + 300000);
+  }
+});
+
+test('CAL-05A: restart, concurrent workers and credential replacement cannot bypass pending backoff', async () => {
+  const first = fixture(); await first.authorize();
+  first.pages = () => Response.json({ error_extra: { retry_after: 900 } }, { status: 429 });
+  assert.equal((await first.app.refresh()).delay, 900000); await first.app.stop();
+  const second = fixture({ db: first.db }), third = fixture({ db: first.db });
+  second.advance(300000); third.advance(300000);
+  const before = await Promise.all([second.app.refresh(), third.app.refresh()]);
+  assert(before.every(result => ['waiting', 'busy'].includes(result.status)));
+  assert.equal(second.calls.length + third.calls.length, 0);
+  const oldVersion = first.db.credential.credential_version;
+  await second.authorize(); assert.notEqual(first.db.credential.credential_version, oldVersion);
+  const requests = second.calls.length;
+  assert.equal((await second.app.refresh()).status, 'waiting');
+  assert.equal((await third.app.refresh()).status, 'waiting');
+  assert.equal(second.calls.length + third.calls.length, requests);
+  assert.equal(Date.parse(first.db.snapshot.next_attempt_at), BASE_NOW + 900000);
+  second.advance(599999); third.advance(599999);
+  assert.equal((await third.app.refresh()).delay, 1); assert.equal(third.calls.length, 0);
+  second.advance(1); third.advance(1);
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  second.pages = () => { entered(); return new Promise(resolve => { release = resolve; }); };
+  const winner = second.app.refresh(); await started;
+  assert.equal((await third.app.refresh()).status, 'busy'); assert.equal(third.calls.length, 0);
+  release({ results: [task()], next_cursor: null }); assert.equal((await winner).status, 'success');
+  assert.equal((await third.app.refresh()).status, 'waiting');
+  assert.equal(taskCalls(second).length, 1); assert.equal(first.db.locks.size, 0);
+});
+
+test('CAL-05A: token-refresh rate limits share the persisted delay without changing authorization recovery', async () => {
+  const f = fixture(); await f.authorize(); await f.app.refresh();
+  const saved = structuredClone(f.db.snapshot);
+  f.advance(3600000);
+  f.tokenResponse = () => Response.json({ error_extra: { retry_after: 900 } }, { status: 429 });
+  const result = await f.app.refresh(); assert.equal(result.code, 'RATE_LIMIT'); assert.equal(result.delay, 900000);
+  assert.equal(f.db.credential.blocked, false); assert.equal(f.db.credential.refresh_in_progress, false);
+  assert.equal(Date.parse(f.db.snapshot.next_attempt_at), f.now() + 900000);
+  const requests = f.calls.length;
+  f.advance(300000); assert.equal((await f.app.refresh()).status, 'waiting'); assert.equal(f.calls.length, requests);
+  assert.deepEqual(f.db.snapshot.events, saved.events); assert.deepEqual(f.db.snapshot.verified_at, saved.verified_at);
+  f.advance(600000); f.tokenResponse = () => new Response('', { status: 400 });
+  assert.equal((await f.app.refresh()).code, 'AUTH_REAUTHORIZE'); assert(f.db.credential.blocked);
+  const blocked = f.calls.length; f.advance(300000); await f.app.refresh(); assert.equal(f.calls.length, blocked);
+  // An explicit reauthorization still clears an authentication stop immediately.
+  f.tokenResponse = null; await f.authorize(); assert.equal((await f.app.refresh()).status, 'success');
+});
+
+test('CAL-05A: platform timer limit cannot shorten a persisted 30-day provider delay', async () => {
+  const f = fixture(); await f.authorize();
+  f.pages = () => Response.json({ error_extra: { retry_after: 2592000 } }, { status: 429 });
+  const tick = async () => {
+    assert.equal(f.timers.size, 1);
+    const [key, timer] = [...f.timers][0]; f.timers.delete(key); await timer.fn();
+  };
+  f.app.start();
+  try {
+    await tick(); assert.equal(Date.parse(f.db.snapshot.next_attempt_at), BASE_NOW + 2592000000);
+    assert.equal([...f.timers.values()][0].delay, 2147483647);
+    const requests = f.calls.length;
+    f.advance(2147483647); await tick(); assert.equal(f.calls.length, requests);
+    const remaining = 2592000000 - 2147483647;
+    assert.equal([...f.timers.values()][0].delay, remaining);
+    f.advance(remaining); f.pages = () => ({ results: [], next_cursor: null }); await tick();
+    assert.equal(taskCalls(f).length, 2); assert.equal([...f.timers.values()][0].delay, 300000);
+    assert.equal((await f.app.readPublic()).body.status, 'empty');
+  } finally { await f.app.stop(); }
+  assert.equal(f.timers.size, 0);
 });
 
 test('CAL-04 blocker: public database pool acquisition must have a bounded deadline', async () => {
@@ -532,6 +671,6 @@ test('CAL-04 blocker: public database pool acquisition must have a bounded deadl
     try { await item.run(); console.log(`PASS ${item.name}`); }
     catch (error) { failed++; console.error(`FAIL ${item.name}: ${error.stack}`); }
   }
-  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04 checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
+  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04/CAL-05A checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
   process.exitCode = failed ? 1 : 0;
 })();

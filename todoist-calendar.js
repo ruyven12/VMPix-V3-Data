@@ -150,12 +150,12 @@ function createCalendar({ db, env = process.env, fetchImpl = global.fetch, clock
       url.searchParams.set('project_id', PROJECT_ID);
       url.searchParams.set('limit', '50');
       if (cursor) url.searchParams.set('cursor', cursor);
-      let response = await requestJson(fetchImpl, url.href, { signal,
+      let response = await requestJson(fetchImpl, url.href, { signal, clock,
         headers: { Authorization: `Bearer ${credential.token}`, Accept: 'application/json' } });
       if (response.status === 401 && !refreshedAfter401) {
         refreshedAfter401 = true;
         credential = await auth.getAccessToken({ rejectedToken: credential.token, signal });
-        response = await requestJson(fetchImpl, url.href, { signal,
+        response = await requestJson(fetchImpl, url.href, { signal, clock,
           headers: { Authorization: `Bearer ${credential.token}`, Accept: 'application/json' } });
       }
       if ([401, 403].includes(response.status)) { await auth.block(); throw fault('AUTH_REAUTHORIZE'); }
@@ -189,9 +189,14 @@ function createCalendar({ db, env = process.env, fetchImpl = global.fetch, clock
           await query(client, 'INSERT INTO calendar_publication_snapshot (id) VALUES (1) ON CONFLICT (id) DO NOTHING');
           const existing = (await query(client, READ_SNAPSHOT, [config.configurationId])).rows?.[0];
           const now = clock();
+          // pg returns a Date; Date.parse(Date) would discard its milliseconds.
+          const nextAttempt = new Date(existing?.next_attempt_at).getTime();
           // All processes consult the same persisted schedule; one winner per interval.
-          if (Date.parse(existing?.next_attempt_at) > now && existing?.current_credential_version === existing?.attempt_credential_version) {
-            return { status: 'waiting', delay: Date.parse(existing.next_attempt_at) - now };
+          // Reauthorization may clear an authentication failure, but must not
+          // bypass a provider rate-limit deadline shared by every worker.
+          if (nextAttempt > now && (existing?.last_error_code === 'RATE_LIMIT' ||
+            existing?.current_credential_version === existing?.attempt_credential_version)) {
+            return { status: 'waiting', delay: nextAttempt - now };
           }
           await query(client, `UPDATE calendar_publication_snapshot SET refresh_status = 'running',
             attempt_started_at = $1, attempt_credential_version = $2, next_attempt_at = $3 WHERE id = 1`,
