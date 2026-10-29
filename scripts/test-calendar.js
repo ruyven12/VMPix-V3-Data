@@ -7,6 +7,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
+const { mock } = require('node:test');
 const { createCalendar, normalizeTask, normalizeTasks, localInstant, publicDescription } = require('../todoist-calendar');
 const { PROJECT_ID, readConfig, requestJson, withDbLock } = require('../todoist-auth');
 
@@ -640,29 +641,174 @@ test('CAL-05A: platform timer limit cannot shorten a persisted 30-day provider d
   assert.equal(f.timers.size, 0);
 });
 
-test('CAL-04 blocker: public database pool acquisition must have a bounded deadline', async () => {
+test('CAL-05B: original exhausted-pool regression returns within the acquisition deadline and recovers', async () => {
   // Real installed pg Pool, synthetic transport; no PostgreSQL or network connection.
   const { Pool } = require('pg');
+  const seed = fixture(); await seed.authorize(); await seed.app.refresh();
+  const row = { ...seed.db.snapshot, current_credential_version: seed.db.credential.credential_version, credentials_ready: true };
+  let queries = 0, ended = 0;
   class FakeClient extends EventEmitter {
+    constructor() { super(); this._queryable = true; this._ending = false; }
     connect(callback) { process.nextTick(() => callback(null)); }
     query(config, values, callback) {
+      queries++; assert.equal(config.query_timeout, 3000);
       const done = typeof values === 'function' ? values : callback;
-      process.nextTick(() => done(null, { rows: [] }));
+      if (done) process.nextTick(() => done(null, { rows: [row] }));
+      else return Promise.resolve({ rows: [row] });
     }
-    end(callback) { this.emit('end'); if (callback) process.nextTick(callback); }
+    end(callback) { ended++; this.emit('end'); if (callback) process.nextTick(callback); }
   }
   const pool = new Pool({ max: 1, Client: FakeClient });
-  const held = await pool.connect();
+  let held = await pool.connect();
   const f = fixture({ db: pool });
   let deadline;
+  const started = performance.now();
   const request = f.app.readPublic();
   try {
     const result = await Promise.race([request, new Promise(resolve => { deadline = setTimeout(() => resolve(null), 3300); })]);
     assert(result, 'Calendar SELECT remains queued beyond its 3000ms query timeout when the pool is exhausted');
     assert.equal(result.httpStatus, 503); assert.equal(result.body.status, 'unavailable');
+    assert.deepEqual(result.body.events, []); assert.equal(result.cache, 'no-store');
+    const elapsed = performance.now() - started;
+    assert(elapsed >= 2900 && elapsed < 3300, `Acquisition took ${elapsed}ms`);
+    console.log(`INFO exhausted-pool acquisition returned after ${Math.round(elapsed)}ms (synthetic transport)`);
+    assert.equal(queries, 0); assert.equal(ended, 0); assert.equal(pool.totalCount, 1);
+    held.release(); held = null;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pool.waitingCount, 0); assert.equal(pool.idleCount, 1); assert.equal(queries, 0);
+    assert.equal(ended, 0, 'Late healthy checkout must not be destroyed');
+    assert.equal((await f.app.readPublic()).body.status, 'ready');
+    assert.equal(queries, 1); assert.equal(pool.idleCount, 1); assert.equal(pool.totalCount, 1);
   } finally {
-    clearTimeout(deadline); held.release(); await request; await pool.end();
+    clearTimeout(deadline); held?.release(); await request; await pool.end();
   }
+});
+
+const settleAcquisition = () => new Promise(resolve => setImmediate(resolve));
+
+function acquisitionFixture() {
+  const pending = [];
+  const db = { connect: () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+    query: () => assert.fail('Public Calendar must not use unbounded pool.query') };
+  const f = fixture({ db });
+  return Object.assign(f, { pending, tick: async ms => { f.advance(ms); mock.timers.tick(ms); await settleAcquisition(); } });
+}
+
+function acquisitionClient(queryImpl = async () => ({ rows: [] })) {
+  const client = new EventEmitter();
+  client.queries = []; client.releases = [];
+  client.query = args => { client.queries.push(args); return queryImpl(args); };
+  client.release = destroy => client.releases.push(destroy);
+  return client;
+}
+
+test('CAL-05B: never-resolving acquisition returns 503 at 3000ms; late client runs no SQL or second response', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const f = acquisitionFixture(), client = acquisitionClient();
+    let sends = 0, status, body;
+    const headers = {};
+    const res = { set: (key, value) => { headers[key] = value; }, status: value => { status = value; return res; },
+      json: value => { sends++; body = value; return res; } };
+    const request = f.app.publicHandler({}, res); await settleAcquisition(); assert.equal(f.pending.length, 1);
+    await f.tick(2999); assert.equal(sends, 0);
+    await f.tick(1); assert.equal(sends, 1); await request;
+    assert.equal(status, 503); assert.equal(body.status, 'unavailable'); assert.deepEqual(body.events, []);
+    assert.equal(headers['Cache-Control'], 'no-store'); assert.equal(f.calls.length, 0);
+    f.pending[0].resolve(client); await settleAcquisition();
+    assert.deepEqual(client.releases, [undefined]); assert.equal(client.queries.length, 0); assert.equal(client.listenerCount('error'), 0);
+    await f.tick(6000); assert.equal(sends, 1); assert.equal(client.releases.length, 1);
+    assert(!JSON.stringify([body, headers, f.logs]).match(/PRIVATE|postgres:|synthetic|DATABASE|SQL/));
+  } finally { mock.timers.reset(); }
+});
+
+test('CAL-05B: late rejection and immediate acquisition failures stay handled and private', async () => {
+  const unhandled = [], onUnhandled = error => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const f = acquisitionFixture(); let response;
+    f.app.readPublic().then(value => { response = value; }); await settleAcquisition();
+    await f.tick(3000); assert.equal(response?.httpStatus, 503);
+    f.pending[0].reject(Error('PRIVATE postgres://secret connection failure')); await settleAcquisition();
+    for (const connect of [() => { throw Error('PRIVATE SQL credential'); }, () => Promise.reject(Error('PRIVATE SQL credential'))]) {
+      f.db.connect = connect;
+      const result = await f.app.readPublic(); assert.equal(result.body.status, 'unavailable'); assert.equal(result.cache, 'no-store');
+      assert(!JSON.stringify(result).match(/PRIVATE|SQL|credential/));
+    }
+    await f.tick(6000); assert.equal(f.pending.length, 1); assert.deepEqual(unhandled, []); assert.deepEqual(f.logs, []);
+  } finally { mock.timers.reset(); process.removeListener('unhandledRejection', onUnhandled); }
+});
+
+test('CAL-05B: concurrent timeouts release each late checkout once and preserve recovery', async () => {
+  const seed = fixture(); await seed.authorize(); await seed.app.refresh();
+  const saved = structuredClone(seed.db.snapshot);
+  const row = { ...saved, current_credential_version: seed.db.credential.credential_version, credentials_ready: true };
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const f = acquisitionFixture(), responses = [];
+    for (let i = 0; i < 12; i++) f.app.readPublic().then(value => responses.push(value));
+    await settleAcquisition(); assert.equal(f.pending.length, 12);
+    await f.tick(3000); assert.equal(responses.length, 12);
+    assert(responses.every(result => result.httpStatus === 503 && result.cache === 'no-store' && result.body.status === 'unavailable'));
+    const clients = f.pending.map(() => acquisitionClient());
+    for (let i = 11; i >= 0; i--) f.pending[i].resolve(clients[i]);
+    await settleAcquisition();
+    for (const client of clients) { assert.deepEqual(client.releases, [undefined]); assert.equal(client.queries.length, 0); }
+    const recovered = acquisitionClient(async () => ({ rows: [row] }));
+    f.db.connect = async () => recovered;
+    const result = await f.app.readPublic(); assert.equal(result.body.status, 'ready');
+    assert.deepEqual(recovered.releases, [false]); assert.equal(recovered.listenerCount('error'), 0);
+    assert.equal(recovered.queries[0].query_timeout, 3000); assert.match(recovered.queries[0].text, /^SELECT /);
+    assert.deepEqual(seed.db.snapshot, saved); assert.equal(f.calls.length, 0);
+  } finally { mock.timers.reset(); }
+});
+
+test('CAL-05B: acquisition and query deadlines are independent; connection errors clean up once', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const f = acquisitionFixture(); let complete, result;
+    const client = acquisitionClient(() => new Promise(resolve => { complete = resolve; }));
+    f.app.readPublic().then(value => { result = value; }); await settleAcquisition();
+    await f.tick(2999); f.pending[0].resolve(client); await settleAcquisition();
+    assert.equal(client.queries[0].query_timeout, 3000);
+    await f.tick(1); assert.equal(result, undefined); assert.deepEqual(client.releases, []);
+    complete({ rows: [] }); await settleAcquisition();
+    assert.equal(result.body.status, 'unavailable'); assert.deepEqual(client.releases, [false]);
+    assert.equal(client.listenerCount('error'), 0);
+    await f.tick(6000); assert.deepEqual(client.releases, [false]);
+
+    let rejectQuery;
+    const broken = acquisitionClient(() => new Promise((_, reject) => { rejectQuery = reject; }));
+    f.db.connect = async () => broken;
+    const failed = f.app.readPublic(); await settleAcquisition();
+    broken.emit('error', Error('PRIVATE connection failure'));
+    assert.equal((await failed).body.status, 'unavailable'); assert.deepEqual(broken.releases, [true]);
+    rejectQuery(Error('PRIVATE late query rejection')); await settleAcquisition();
+    assert.deepEqual(broken.releases, [true]); assert.equal(broken.listenerCount('error'), 0);
+
+    // Guard even when a delayed event loop delivers the connection before its timer callback.
+    const late = acquisitionClient(); f.db.connect = () => { f.advance(3000); return Promise.resolve(late); };
+    assert.equal((await f.app.readPublic()).body.status, 'unavailable');
+    assert.deepEqual(late.releases, [undefined]); assert.equal(late.queries.length, 0);
+  } finally { mock.timers.reset(); }
+});
+
+test('CAL-05B: actual pg Client still enforces the separate 3000ms query timeout', async () => {
+  // Exercise installed driver timeout code without ever connecting a socket.
+  const { Client } = require('pg');
+  const client = new Client(), releases = [];
+  client.release = destroy => releases.push(destroy);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const f = acquisitionFixture(); let result;
+    f.app.readPublic().then(value => { result = value; }); await settleAcquisition();
+    await f.tick(2000); f.pending[0].resolve(client); await settleAcquisition();
+    await f.tick(2999); assert.equal(result, undefined); assert.deepEqual(releases, []);
+    await f.tick(1); assert.equal(result?.body.status, 'unavailable'); assert.equal(result.httpStatus, 503);
+    assert.deepEqual(releases, [true]); assert.equal(client.listenerCount('error'), 0);
+    await f.tick(6000); assert.deepEqual(releases, [true]);
+  } finally { mock.timers.reset(); await client.end(); }
 });
 
 (async () => {
@@ -671,6 +817,6 @@ test('CAL-04 blocker: public database pool acquisition must have a bounded deadl
     try { await item.run(); console.log(`PASS ${item.name}`); }
     catch (error) { failed++; console.error(`FAIL ${item.name}: ${error.stack}`); }
   }
-  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04/CAL-05A checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
+  console.log(`${tests.length - failed}/${tests.length} CAL-03/CAL-04/CAL-05A/CAL-05B checks passed (mocked services; isolated HTTP/pg-driver checks; no live Todoist or PostgreSQL).`);
   process.exitCode = failed ? 1 : 0;
 })();

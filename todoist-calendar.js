@@ -276,10 +276,46 @@ function createCalendar({ db, env = process.env, fetchImpl = global.fetch, clock
       message: 'Upcoming events are temporarily unavailable.' } };
   }
 
+  async function readPublicSnapshot() {
+    // pg's connectionTimeoutMillis is pool-wide. Bound only this Calendar read,
+    // leaving the shared pool and the existing 3000ms query timeout unchanged.
+    let acquisitionTimer, expired = false, client;
+    const deadline = clock() + 3000;
+    const connection = Promise.resolve().then(() => db.connect()).then(value => {
+      if (expired || clock() >= deadline) {
+        value.release(); // Healthy late checkout: return it without executing SQL.
+        throw fault('DATABASE');
+      }
+      return value;
+    });
+    try {
+      client = await Promise.race([connection, new Promise((_, reject) => {
+        acquisitionTimer = setTimeout(() => { expired = true; reject(fault('DATABASE')); }, 3000);
+      })]);
+    } finally { clearTimeout(acquisitionTimer); }
+
+    let failed = false, onError;
+    try {
+      // Retain pool.query's checked-out-client error handling. Both promise
+      // branches remain observed even if acquisition or the client fails first.
+      return await new Promise((resolve, reject) => {
+        onError = () => { failed = true; reject(fault('DATABASE')); };
+        client.once?.('error', onError);
+        query(client, READ_SNAPSHOT, [config.configurationId]).then(resolve, reject);
+      });
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      client.removeListener?.('error', onError);
+      client.release(failed);
+    }
+  }
+
   async function readPublic() {
     if (!config.configured) return unavailable();
     try {
-      const row = (await query(db, READ_SNAPSHOT, [config.configurationId])).rows?.[0];
+      const row = (await readPublicSnapshot()).rows?.[0];
       if (!row?.credentials_ready || !row.verified_at || row.policy_version !== POLICY_VERSION ||
         row.credential_version !== row.current_credential_version) return unavailable();
       const verified = Date.parse(row.verified_at), until = Date.parse(row.valid_until), now = clock();
