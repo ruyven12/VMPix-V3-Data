@@ -61,14 +61,14 @@ function observedDatabase(pool, state) {
   };
 }
 
-function fixture(db) {
-  let now = BASE_NOW, tokenSequence = 0;
+function fixture(db, { env: suppliedEnv, now: initialNow = BASE_NOW } = {}) {
+  let now = initialNow, tokenSequence = 0;
   const f = { logs: [], requests: [], pages: () => ({ results: [task()], next_cursor: null }),
     now: () => now, advance: ms => { now += ms; } };
   // Explicit injected configuration, never inherited production configuration.
   // This inert URL only satisfies configured-state validation; db is the guarded
   // test pool. Encryption keys/tokens are synthetic and are never logged.
-  const env = { TODOIST_CALENDAR_ENABLED: '1', DATABASE_URL: 'postgres://fixture.invalid/not-connected',
+  const env = suppliedEnv || { TODOIST_CALENDAR_ENABLED: '1', DATABASE_URL: 'postgres://fixture.invalid/not-connected',
     TODOIST_CLIENT_ID: 'cal06b-synthetic-client', TODOIST_CLIENT_SECRET: 'cal06b-synthetic-secret',
     TODOIST_TOKEN_ENCRYPTION_KEY: crypto.randomBytes(32).toString('base64'),
     TODOIST_REDIRECT_URI: 'https://fixture.invalid/api/calendar/oauth/callback', NODE_ENV: 'test' };
@@ -86,13 +86,14 @@ function fixture(db) {
     assert.equal(url.pathname, '/api/v1/tasks');
     assert.equal(url.searchParams.get('project_id'), PROJECT_ID);
     assert.equal(url.searchParams.get('limit'), '50');
-    const body = await f.pages(url);
+    const body = await f.pages(url, options);
     return body instanceof Response ? body : Response.json(body);
   };
   f.app = createCalendar({ db, env, fetchImpl, clock: f.now,
     logger: { info: (...args) => f.logs.push(args) },
     setTimer: () => { throw Error('BACKGROUND_SCHEDULER_NOT_ALLOWED'); }, clearTimer: () => {} });
   // start() is deliberately never called; only explicitly requested test refreshes.
+  f.env = env; // CAL-06C shares only this synthetic configuration with test workers.
   return f;
 }
 
@@ -440,6 +441,7 @@ async function main() {
   }
 }
 
+module.exports = { fixture, task };
 if (require.main === module) main().catch(() => {
   console.error('CAL06B_STOPPED: inspect the named check; no production fallback is permitted.');
   process.exitCode = 1;
