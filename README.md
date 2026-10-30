@@ -442,3 +442,179 @@ Current primary references: [Todoist API v1](https://developer.todoist.com/api/v
 [Render health checks](https://render.com/docs/health-checks),
 [Render private networking](https://render.com/docs/private-network),
 [Render rollbacks](https://render.com/docs/rollbacks).
+
+
+## Contact delivery foundation (CON-04, inactive)
+
+`POST /api/contact` is an isolated, disabled-by-default route in `contact.js`.
+It uses native Node fetch, existing Express, and no new dependencies, tables,
+database queries, files of message data, or background jobs. The frontend remains
+the approved CON-03 unavailable form; CON-05 must explicitly connect it later.
+No Resend/Cloudflare account, live challenge, email, or production change was made
+in CON-04. Provider setup and activation each need separate approval.
+
+### Required configuration (server only)
+
+| Variable | Requirement |
+| --- | --- |
+| `CONTACT_ENABLED` | Defaults off. Only exact `1` enables processing, and all other settings must validate. Keep `0` until activation approval. |
+| `CONTACT_ALLOWED_ORIGINS` | Explicit comma-separated subset of the approved code allowlist, currently only `https://vmpix-v3.onrender.com`. No wildcard, localhost, arbitrary preview site, inherited shared CORS list, or origin fallback. |
+| `CONTACT_FROM_EMAIL` | One bare, fixed sender address on the approved Resend-verified sending domain. No display-name syntax or visitor-controlled sender. Not selected/provisioned in CON-04. |
+| `CONTACT_SENDER_VERIFIED` | Exact `1` only after an operator has actually verified the sender/domain in Resend. This flag is an operator attestation, not automatic DNS verification. Defaults `0`. |
+| `CONTACT_TO_EMAIL` | One fixed Voodoo Media inbox approved by the owner; no client override or automatic recipient fallback. The final recipient needs confirmation. |
+| `RESEND_API_KEY` | Secret server-side sending key, restricted to the sending domain where available. Never put it in frontend code or committed files. |
+| `TURNSTILE_SECRET_KEY` | Secret server-side key for the separately approved widget. The public site key belongs to the later frontend setup, not this API response. |
+| `CONTACT_IDEMPOTENCY_SECRET` | Stable base64 encoding of exactly 32 random bytes, identical across restarts/overlapping instances. Provision separately through deployment secrets. Never generate it on startup. |
+
+Configuration is read once at module factory creation. Missing/invalid settings
+fail closed. An allowed origin with inactive/incomplete delivery receives 503
+`contact_unavailable`; disallowed/missing origins receive 403. Shared TLS,
+database, Admin, Music, Wrestling and Calendar settings are unchanged.
+
+### Request contract for the future frontend
+
+- `Content-Type: application/json` (optional `charset=utf-8`). No compression,
+  attachments, HTML field, query parameters or credentials/cookies are needed.
+- `Origin` must match the configured approved origin exactly. This is a browser
+  boundary, not authentication: non-browser clients can forge an Origin header.
+- `Idempotency-Key: <13-digit Unix milliseconds>.<lowercase UUID v4>`.
+  Create it once for a new submission using current time and `crypto.randomUUID()`.
+- JSON contains exactly five strings: `name`, `email`, `subject`, `message`,
+  `turnstileToken`. Limits are respectively 100, 254, 150, 5000, 2048 UTF-16
+  code units (matching the CON-03 HTML limits for the four fields).
+- Required text is trimmed; message line endings become LF. Invalid Unicode,
+  prohibited controls, single-line header injection, malformed email addresses,
+  extra fields and oversized fields are rejected, never silently clipped.
+  HTML-looking message text remains literal plain text. The provider payload has
+  only fixed `from`/`to`, the visitor's validated `reply_to`, prefixed subject, and
+  `text`. There are no auto-replies, templates, HTML or dynamic recipients.
+- Complete a Turnstile widget with action `contact` on the approved hostname.
+  Refresh expired/rejected tokens; the server verifies success, exact origin
+  hostname, action and challenge age. Widget secrets stay on the server.
+
+### Responses and retry behavior
+
+All responses are JSON with `Cache-Control: no-store`. Failures expose stable
+codes and optional invalid field *names*, never user values, provider errors,
+provider IDs, recipient addresses, tokens or secrets. CORS exposes `Retry-After`
+only; no credentialed or wildcard access. OPTIONS permits POST with only
+Content-Type and Idempotency-Key request headers. Other methods return 405.
+
+| HTTP / code | Meaning and client action |
+| --- | --- |
+| 202 `provider_accepted` | `ok:true`, `delivery:"accepted"`. Resend accepted the request; inbox delivery is not confirmed. Never label this "delivered". |
+| 400 `invalid_request`, `invalid_fields`, `invalid_idempotency_key` | Correct the input. Invalid-field responses list field names. |
+| 400 `challenge_invalid` | Refresh the challenge and retry with the same submission key and unchanged message. |
+| 403 `origin_not_allowed`, `preflight_not_allowed` | Request is outside the approved browser contract. |
+| 404 `not_found` | Unsupported Contact path or query string. |
+| 408 `request_timeout`; 413 `payload_too_large`; 415 `unsupported_content_type` | Upload/format rejected before email work. |
+| 429 `rate_limited` | Wait at least Retry-After; keep the submission key. |
+| 503 `contact_unavailable` | Inactive or unconfigured; offer existing direct channels. |
+| 503 `contact_busy`, `verification_unavailable` | Processing capacity or verification unavailable; respect Retry-After. |
+| 503 `delivery_unavailable` | Provider explicitly rejected this attempt; no acceptance is claimed. |
+| 409 `request_in_progress`; 503 `delivery_uncertain` | `delivery:"unknown"`. Another attempt may have been accepted. Preserve draft/key and retry only the same message/key after Retry-After. |
+| 409 `idempotency_conflict`, `retry_window_closed` | Stop automatic retries (`retryable:false`); outcome may remain unknown. Seek confirmation through a direct channel before deliberately creating another submission. |
+
+`delivery:"not_attempted"` describes this HTTP attempt only, not the entire
+history of a key. A client that has already seen an uncertain result (including
+its own network timeout) must keep that uncertainty until acceptance is resolved.
+Later validation errors, rate limits or provider rejections do not prove an earlier attempt was unsent.
+
+Retry keys are accepted for at most 60 minutes from their timestamp, with up to
+60 seconds of future clock tolerance. The server derives a stable opaque Resend
+key from the client key and the secret, *not* from the message or challenge token.
+The email payload is deterministic. Changing the message requires a new deliberate
+submission, never an automatic retry. Reuse the original key across network errors
+and refresh Turnstile as needed. Do not automatically retry after the key expires.
+
+Resend retains idempotency keys for 24 hours; our shorter window prevents an old
+key from silently sending again after provider retention expires. The same key
+with changed content is rejected locally while cached and by Resend across process
+restarts. In-flight duplicates, cooldowns and accepted results are also cached
+locally. See [Resend idempotency](https://resend.com/docs/dashboard/emails/idempotency-keys).
+Turnstile tokens are single-use and expire after five minutes; a stable per-key,
+per-token verification UUID supports Siteverify retries. New challenge tokens keep
+the same email identity. See [Cloudflare server verification](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/).
+
+No exactly-once inbox-delivery guarantee is made. There is no durable outbox or
+delivery webhook in this pass. Keep server clocks synchronized and sender,
+recipient, payload format, Resend account and idempotency secret stable throughout
+the retry window. For a planned identity/secret change, disable new intake and
+wait at least 61 minutes before replacement; unresolved outcomes still require
+manual review. Never rotate a secret as an automatic retry workaround.
+
+### Resource limits, privacy and production blockers
+
+- Defaults: 5 attempts per socket peer and 30 globally per 15-minute window;
+  4 concurrent requests including uploads; 1024 peer buckets and 1000 active
+  retry records. Full maps reject new work instead of evicting live protection.
+  Every permitted-origin POST consumes the attempt budget, including invalid
+  input and cached retries. No queued/background sends or automatic provider retries.
+- Input is limited while streaming to 48 KiB and 5 seconds. Turnstile has 4
+  seconds, Resend 8 seconds, and the whole operation 18 seconds. Provider response
+  bodies are capped at 16 KiB, including reads under the timeout. Abort signals
+  stop work on deadlines/disconnects; a send that might have started remains
+  uncertain. Redirects are refused; only fixed HTTPS provider URLs are used.
+- Limits are in-process and reset on restart; multiple/overlapping processes
+  have separate rate/concurrency budgets. Provider deduplication survives only
+  with the same account/secret and within the bounded window. Approve an edge or
+  shared rate-limit policy before activation or scaling if these limits are
+  insufficient. A distributed limiter would be separately scoped work.
+- The limiter uses socket peers and ignores X-Forwarded-For/CF-Connecting-IP.
+  Render can group many visitors behind one proxy peer, so this is conservatively
+  restrictive. Verify the actual proxy/edge boundary and expected traffic during
+  activation preflight. No broad `trust proxy` or existing API behavior is changed.
+- Requests contain personal data sent to Resend, then the configured inbox.
+  Cloudflare receives challenge data; this API does not forward visitor IPs to
+  Siteverify. No message content, email addresses, tokens, provider errors or
+  secrets are logged by this module. Retry records contain keyed fingerprints
+  and result state, not drafts; peer identifiers are salted in memory. Expired
+  entries are removed lazily on later requests; counts are always bounded.
+- Approve provider/inbox retention, access controls and the frontend privacy
+  notice. Ensure infrastructure tracing does not capture POST bodies or secret
+  headers. This module intentionally has no message-bearing diagnostic endpoint.
+
+### Provider setup and activation checklist (not executed)
+
+1. Obtain separate approval for Resend and Turnstile account/setup and production
+   activation. Confirm the actual Voodoo Media recipient and sending identity.
+2. Verify an owned sending domain in Resend with its required DNS records; use a
+   restricted sending key. Confirm sender verification in the dashboard before
+   setting the attestation flag. Review quotas and bounces/complaints. See
+   [Resend domain verification](https://resend.com/docs/dashboard/domains/introduction).
+3. Configure a production Turnstile widget restricted to `vmpix-v3.onrender.com`,
+   action `contact`; provision its secret only on the backend and public site key
+   in the later frontend. Use separate development/test settings. See
+   [Turnstile hostname controls](https://developers.cloudflare.com/turnstile/additional-configuration/hostname-management/).
+4. Provision all required values securely, keeping CONTACT_ENABLED=0. Verify
+   exact origins, clocks, proxy/limiter behavior, privacy notice, recipient, fixed
+   sender, provider quotas and the retry contract. Resolve baseline regression
+   failures separately. Do not use normal backend startup for a read-only preflight:
+   it still runs existing database initialization/migrations.
+5. CON-05: connect the existing Contact UI, add Turnstile and explicit retry/unknown
+   feedback, preserve the draft and one submission key, and test with mocks. No
+   form request should happen just from opening/closing the terminal.
+6. Under separate approval only: stage/deploy reviewed files, perform an explicitly
+   authorized single live delivery test, inspect acceptance/inbox receipt and
+   Reply-To, then approve activation. Do not infer delivery from HTTP 202 alone.
+7. Disable intake by setting CONTACT_ENABLED=0 and applying the separately
+   approved restart/deploy. No data deletion or rollback migration is needed.
+   Disabling cannot recall an email already accepted; review uncertain requests
+   before inviting resubmission. Keep retry identity stable during recovery.
+
+### Local verification
+
+`node --test scripts/test-contact.js` uses loopback HTTP and injected synthetic
+provider responses. Native fetch is blocked in that suite; it does not import
+server.js, db.js, or .env. No live provider calls or emails are part of testing.
+Syntax: `node --check contact.js`, `node --check server.js`, and
+`node --check scripts/test-contact.js`.
+
+CON-04 verification on Node 22.21.0: Contact 68/68; Calendar 43/43; Calendar database
+guards 38/38; Import Reporting 22/22; Wrestling missing-data 11/11. Wrestling photo
+totals: 14/16; both failing mocks access missing `res.locals.v3AdminSessionAuthorized`.
+The same two failures were reproduced against committed backend revision
+`c9b47f4c2513a6559e03c2bf7668cc6b99487d0e`; no Wrestling code/test was changed.
+Provider credentials, DNS verification, real inbox delivery, production proxy
+behavior and frontend wiring remain unverified by design. Local foundation: GO
+for review; production activation: NO-GO until the checklist is approved/completed.

@@ -11,6 +11,7 @@ const { buildExactDuplicatesResponse } = require('./exact-duplicates');
 const { buildPossibleDuplicatesResponse } = require('./possible-duplicates');
 const importReporting = require('./import-reporting');
 const { createCalendar } = require('./todoist-calendar');
+const { createContactRouter } = require('./contact');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -585,6 +586,9 @@ function logStartupEnvironmentWarnings() {
   const warnings = getStartupEnvironmentWarnings();
   warnings.forEach((warning) => console.warn(`Startup warning: ${warning}`));
 }
+
+// Contact owns its CORS/body limits; mount before the shared public CORS handler.
+app.use('/api/contact', createContactRouter());
 
 const v3AdminAuthRouter = createV3AdminAuthRouter({ db: dbPool });
 app.use('/api/v3/admin/auth', v3AdminAuthRouter);
