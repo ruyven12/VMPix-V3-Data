@@ -14,7 +14,8 @@ const EMAIL_PATTERN = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0
 const SINGLE_CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
 const TURNSTILE_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
-const RESEND_URL = 'https://api.resend.com/emails';
+const FORMSPREE_BASE = 'https://formspree.io/f/';
+const FORM_ID_PATTERN = /^[a-zA-Z0-9]{8,32}$/;
 
 function validEmail(value) {
   return typeof value === 'string' && value.length <= 254 && EMAIL_PATTERN.test(value) &&
@@ -24,13 +25,16 @@ function configured(env) {
   const origins = String(env.CONTACT_ALLOWED_ORIGINS || '').split(',').map(s => s.trim());
   const allowed = origins.length > 0 && origins.every(s => APPROVED_ORIGINS.includes(s));
   const secret = env.CONTACT_IDEMPOTENCY_SECRET;
-  const ready = env.CONTACT_ENABLED === '1' && env.CONTACT_SENDER_VERIFIED === '1' && allowed &&
-    validEmail(env.CONTACT_FROM_EMAIL) && validEmail(env.CONTACT_TO_EMAIL) &&
-    [env.RESEND_API_KEY, env.TURNSTILE_SECRET_KEY].every(s => typeof s === 'string' && s.length >= 16 && s.length <= 512 && !/\s/.test(s)) &&
+  const formId = env.CONTACT_FORMSPREE_FORM_ID;
+  // This attestation requires separate review of recipient, CAPTCHA, domain/proxy
+  // compatibility and single-process operation. It is not provider authentication.
+  const ready = env.CONTACT_ENABLED === '1' && env.CONTACT_FORMSPREE_PROXY_APPROVED === '1' && allowed &&
+    typeof formId === 'string' && FORM_ID_PATTERN.test(formId) &&
+    [env.TURNSTILE_SECRET_KEY].every(s => typeof s === 'string' && s.length >= 16 && s.length <= 512 && !/\s/.test(s)) &&
     typeof secret === 'string' && /^[A-Za-z0-9+/]{43}=$/.test(secret) &&
     Buffer.from(secret, 'base64').length === 32 && Buffer.from(secret, 'base64').toString('base64') === secret;
   return { origins: allowed ? new Set(origins) : new Set(), ready,
-    from: env.CONTACT_FROM_EMAIL, to: env.CONTACT_TO_EMAIL, resend: env.RESEND_API_KEY,
+    endpoint: typeof formId === 'string' && FORM_ID_PATTERN.test(formId) ? `${FORMSPREE_BASE}${formId}` : null,
     turnstile: env.TURNSTILE_SECRET_KEY, secret };
 }
 function validateBody(body) {
@@ -55,7 +59,7 @@ function failure(status, code, delivery = 'not_attempted', retryable = false, re
 }
 function accepted() {
   return { status: 202, body: { ok: true, code: 'provider_accepted', delivery: 'accepted', retryable: false,
-    message: 'Your message was accepted for delivery. Inbox delivery is not yet confirmed.' } };
+    message: 'Your submission was accepted by Formspree. Inbox delivery is not yet confirmed.' } };
 }
 function respond(req, res, result) {
   if (res.headersSent || res.destroyed || res.writableEnded || req.aborted) return;
@@ -147,6 +151,8 @@ function createContactRouter({ env = process.env, fetchImpl = globalThis.fetch, 
   const router = express.Router({ caseSensitive: true, strict: true });
   const peers = new Map();
   const records = new Map();
+  const challenges = new Map();
+  const startedAt = now();
   const peerSalt = crypto.randomBytes(32);
   let globalWindow = { at: 0, count: 0 };
   let active = 0;
@@ -174,76 +180,89 @@ function createContactRouter({ env = process.env, fetchImpl = globalThis.fetch, 
     const key = req.headers['idempotency-key'];
     if (typeof key !== 'string' || !KEY_PATTERN.test(key)) return failure(400, 'invalid_idempotency_key');
     const keyTime = Number(key.slice(0, 13));
-    // A bounded, timestamped key survives process restarts while staying far inside Resend's
-    // 24-hour deduplication window. Old keys never start another send, even after cache eviction.
+    // Formspree has no assumed provider-side deduplication. Old keys never start
+    // another send after cache expiry; pre-restart keys fail closed below.
     if (at - keyTime > policy.retryMs || keyTime - at > policy.futureMs) return failure(409, 'retry_window_closed', 'unknown');
     const { fields, token } = validation;
-    const payload = { from: config.from, to: [config.to], reply_to: fields.email,
-      subject: `[V3 Contact] ${fields.subject}`,
-      text: `Name: ${fields.name}\nEmail: ${fields.email}\nSubject: ${fields.subject}\n\n${fields.message}` };
+    const payload = { name: fields.name, email: fields.email,
+      subject: `[V3 Contact] ${fields.subject}`, message: fields.message };
     const serialized = JSON.stringify(payload);
-    const providerKey = `v3-contact/${digest(`key:${key}`)}`;
+    const recordKey = digest(`key:${key}`);
     const fingerprint = digest(`payload:${serialized}`);
     for (const [id, entry] of records) if (!entry.busy && entry.expires <= at) records.delete(id);
-    let record = records.get(providerKey);
+    let record = records.get(recordKey);
     if (record && record.fingerprint !== fingerprint) return failure(409, 'idempotency_conflict', 'unknown');
     if (record?.accepted) return accepted();
-    if (record?.busy) return failure(409, 'request_in_progress', 'unknown', true, 10);
+    if (record?.busy) return failure(409, 'request_in_progress', 'unknown');
+    if (record?.attempted) return record.result;
     if (record?.nextAt > at) return { ...record.result, retryAfter: Math.ceil((record.nextAt - at) / 1000) };
     if (!record) {
+      // Without durable receipts, refuse a missing key that could predate startup,
+      // including the full allowed future-clock skew. Fresh clients need ~60s
+      // after startup; overlapping processes still require separate coordination.
+      if (!Number.isSafeInteger(startedAt) || keyTime - policy.futureMs <= startedAt) {
+        return failure(409, 'submission_history_unavailable', 'unknown');
+      }
       if (records.size >= policy.records) return failure(503, 'contact_busy', 'not_attempted', true, 60);
-      record = { fingerprint, expires: keyTime + policy.retryMs + 1, busy: false, unknown: false };
-      records.set(providerKey, record);
+      record = { fingerprint, expires: keyTime + policy.retryMs + 1, busy: false, attempted: false };
+      records.set(recordKey, record);
     }
     record.busy = true;
     let sending = false;
     try {
-      // Stable per key+token UUID permits safe Siteverify retries without storing raw tokens.
-      const hex = digest(`challenge:${key}:${token}`);
-      const verificationId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+      // Consume each token at most once here, even after a verification timeout.
+      // Keep only a digest for the full submission window, never the raw token.
+      for (const [id, expires] of challenges) if (expires <= at) challenges.delete(id);
+      const challengeKey = digest(`challenge:${token}`);
+      if (challenges.has(challengeKey)) return failure(400, 'challenge_refresh_required', 'not_attempted', true);
+      if (challenges.size >= policy.records) return failure(503, 'contact_busy', 'not_attempted', true, 60);
+      challenges.set(challengeKey, at + policy.retryMs + policy.futureMs);
       const challenge = await providerJson(fetchImpl, TURNSTILE_URL, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret: config.turnstile, response: token, idempotency_key: verificationId })
+        body: JSON.stringify({ secret: config.turnstile, response: token })
       }, signal, policy.challengeMs, policy.responseBytes);
       const verified = challenge.body;
       const errors = verified?.['error-codes'] ?? [];
       if (challenge.status !== 200 || !verified || typeof verified.success !== 'boolean' ||
           !Array.isArray(errors) || errors.some(code => typeof code !== 'string') ||
           errors.some(code => ['internal-error', 'invalid-input-secret', 'missing-input-secret', 'bad-request'].includes(code))) {
-        return failure(503, 'verification_unavailable', record.unknown ? 'unknown' : 'not_attempted', true, 10);
+        return failure(503, 'verification_unavailable', 'not_attempted', true, 10);
       }
       const age = now() - Date.parse(verified.challenge_ts);
       if (!verified.success || errors.length || verified.hostname !== new URL(req.headers.origin).hostname || verified.action !== 'contact' ||
           !Number.isFinite(age) || age < -60000 || age > 300000) {
-        return failure(400, 'challenge_invalid', record.unknown ? 'unknown' : 'not_attempted', true);
+        return failure(400, 'challenge_invalid', 'not_attempted', true);
       }
       if (signal.aborted) throw fault('request_timeout');
       sending = true;
-      const sent = await providerJson(fetchImpl, RESEND_URL, { method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.resend}`, 'Idempotency-Key': providerKey },
+      // Mark the attempt BEFORE dispatch. No repeat POST is safe after this point.
+      record.attempted = true;
+      record.result = failure(503, 'delivery_uncertain', 'unknown');
+      const sent = await providerJson(fetchImpl, config.endpoint, { method: 'POST',
+        // No consumed CAPTCHA token, secret, idempotency header, client headers or
+        // fabricated Origin/Referer are forwarded to Formspree.
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: serialized
       }, signal, policy.sendMs, policy.responseBytes);
-      if (sent.status >= 200 && sent.status < 300 && typeof sent.body?.id === 'string' && sent.body.id.length > 0 && sent.body.id.length <= 128) {
+      const result = sent.body;
+      // The official Formspree client identifies success by a string `next`.
+      // Require a successful HTTP status too; never follow or expose `next`.
+      const hasError = result && (Object.hasOwn(result, 'error') || Object.hasOwn(result, 'errors') ||
+        Object.hasOwn(result, 'stripe') || Object.hasOwn(result, 'resubmitKey') || result.ok === false);
+      if (sent.status >= 200 && sent.status < 300 && result && !hasError &&
+          typeof result.next === 'string' && result.next.length > 0 && result.next.length <= 2048) {
         record.accepted = true;
         return accepted();
       }
-      if (sent.status === 409 && sent.body?.name === 'invalid_idempotent_request') {
-        record.unknown = true;
-        record.result = failure(409, 'idempotency_conflict', 'unknown');
-        record.nextAt = record.expires;
-        return record.result;
-      }
-      const rejected = [400, 401, 403, 404, 405, 422, 429].includes(sent.status);
-      record.unknown ||= !rejected;
-      record.result = record.unknown ? failure(503, 'delivery_uncertain', 'unknown', true, 10) :
-        failure(503, 'delivery_unavailable', 'rejected', true, sent.status === 429 ? 60 : 10);
-      record.nextAt = now() + Math.max(policy.cooldownMs, record.result.retryAfter * 1000);
+      if ([400, 422].includes(sent.status)) record.result = failure(422, 'provider_validation_failed', 'rejected');
+      else if (sent.status === 429) record.result = failure(429, 'provider_rate_limited', 'rejected', false, 60);
+      else if ([401, 403, 404, 405].includes(sent.status)) record.result = failure(502, 'delivery_unavailable', 'rejected');
+      // 5xx, network errors, redirects and unexpected 2xx bodies stay uncertain.
       return record.result;
     } catch {
-      record.unknown ||= sending;
-      record.result = failure(503, record.unknown ? 'delivery_uncertain' : 'verification_unavailable',
-        record.unknown ? 'unknown' : 'not_attempted', true, 10);
-      record.nextAt = now() + policy.cooldownMs;
+      record.result = sending ? failure(503, 'delivery_uncertain', 'unknown') :
+        failure(503, 'verification_unavailable', 'not_attempted', true, 10);
+      if (!sending) record.nextAt = now() + policy.cooldownMs;
       return record.result;
     } finally { record.busy = false; }
   }

@@ -15,10 +15,10 @@ globalThis.fetch = () => { throw new Error('Unexpected live fetch is forbidden i
 after(() => { globalThis.fetch = ORIGINAL_FETCH; });
 const ORIGIN = 'https://vmpix-v3.onrender.com';
 const TIME = Date.parse('2026-10-30T12:00:00Z');
-const ENV = Object.freeze({ CONTACT_ENABLED: '1', CONTACT_SENDER_VERIFIED: '1', CONTACT_ALLOWED_ORIGINS: ORIGIN,
-  CONTACT_FROM_EMAIL: 'relay@sender.example', CONTACT_TO_EMAIL: 'inbox@recipient.example',
-  RESEND_API_KEY: 'synthetic-resend-private-key', TURNSTILE_SECRET_KEY: 'synthetic-turnstile-private-key',
+const ENV = Object.freeze({ CONTACT_ENABLED: '1', CONTACT_FORMSPREE_PROXY_APPROVED: '1', CONTACT_ALLOWED_ORIGINS: ORIGIN,
+  CONTACT_FORMSPREE_FORM_ID: 'testabcd', TURNSTILE_SECRET_KEY: 'synthetic-turnstile-private-key',
   CONTACT_IDEMPOTENCY_SECRET: Buffer.alloc(32, 41).toString('base64') });
+const SUCCESS = Object.freeze({ next: 'https://formspree.io/thanks', ok: true });
 const FIELDS = Object.freeze({ name: 'Synthetic Visitor', email: 'visitor@example.com', subject: 'Synthetic subject',
   message: 'PRIVATE-SYNTHETIC-MESSAGE', turnstileToken: 'synthetic-challenge' });
 const keyAt = (time = TIME) => `${time}.${crypto.randomUUID()}`;
@@ -28,17 +28,17 @@ const challenge = (changes = {}) => ({ success: true, challenge_ts: new Date(TIM
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fixture(t, options = {}) {
-  let clock = TIME;
+  let clock = options.bootTime ?? TIME - 120000;
   const calls = [];
   const mockFetch = async (url, init) => {
     const call = { url, ...init, payload: JSON.parse(init.body) };
     calls.push(call);
     assert.equal(init.redirect, 'error');
     assert.ok(init.signal instanceof AbortSignal);
-    assert.ok(['https://api.resend.com/emails', 'https://challenges.cloudflare.com/turnstile/v0/siteverify'].includes(url));
+    assert.ok(['https://formspree.io/f/testabcd', 'https://challenges.cloudflare.com/turnstile/v0/siteverify'].includes(url));
     if (options.provider) return options.provider(call, calls, clock);
     return url.includes('siteverify') ? jsonResponse(200, challenge({ challenge_ts: new Date(clock).toISOString() })) :
-      jsonResponse(200, { id: 'synthetic-provider-id' });
+      jsonResponse(200, SUCCESS);
   };
   const app = express();
   app.use('/api/contact', createContactRouter({ env: { ...ENV, ...options.env }, fetchImpl: mockFetch,
@@ -48,8 +48,9 @@ async function fixture(t, options = {}) {
   const server = app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  clock = TIME;
   const port = server.address().port;
-  function request({ body = FIELDS, headers = {}, method = 'POST', route = '/api/contact', raw, partial = false } = {}) {
+  function request({ body = { ...FIELDS, turnstileToken: `synthetic-${crypto.randomUUID()}` }, headers = {}, method = 'POST', route = '/api/contact', raw, partial = false } = {}) {
     return new Promise((resolve, reject) => {
       const data = raw === undefined ? JSON.stringify(body) : raw;
       const defaults = { Origin: ORIGIN, 'Content-Type': 'application/json', 'Idempotency-Key': keyAt(clock) };
@@ -80,11 +81,12 @@ test('route is mounted before shared CORS and startup is not imported by this te
 });
 
 for (const [label, env] of Object.entries({ disabled: { CONTACT_ENABLED: '0' }, missingFlag: { CONTACT_ENABLED: undefined },
-  truthyFlag: { CONTACT_ENABLED: 'true' }, senderUnverified: { CONTACT_SENDER_VERIFIED: '0' },
-  keyMissing: { RESEND_API_KEY: '' }, challengeSecretMissing: { TURNSTILE_SECRET_KEY: '' },
-  unstableSecret: { CONTACT_IDEMPOTENCY_SECRET: 'short' }, recipientMissing: { CONTACT_TO_EMAIL: '' },
-  senderHeaderInjection: { CONTACT_FROM_EMAIL: 'sender@example.com\r\nBcc:attacker@example.com' },
-  multipleRecipients: { CONTACT_TO_EMAIL: 'a@example.com,b@example.com' } })) {
+  truthyFlag: { CONTACT_ENABLED: 'true' }, proxyNotApproved: { CONTACT_FORMSPREE_PROXY_APPROVED: '0' },
+  challengeSecretMissing: { TURNSTILE_SECRET_KEY: '' }, unstableSecret: { CONTACT_IDEMPOTENCY_SECRET: 'short' },
+  missingForm: { CONTACT_FORMSPREE_FORM_ID: '' }, fullEndpoint: { CONTACT_FORMSPREE_FORM_ID: 'https://evil.example/form' },
+  pathInjection: { CONTACT_FORMSPREE_FORM_ID: 'testabcd/../../api' }, queryInjection: { CONTACT_FORMSPREE_FORM_ID: 'testabcd?to=evil' },
+  fragment: { CONTACT_FORMSPREE_FORM_ID: 'testabcd#evil' }, encodedPath: { CONTACT_FORMSPREE_FORM_ID: 'test%2fabcd' },
+  headerInjection: { CONTACT_FORMSPREE_FORM_ID: 'testabcd\r\nX-Test:value' }, whitespace: { CONTACT_FORMSPREE_FORM_ID: ' testabcd' } })) {
   test(`configuration fails closed: ${label}`, async t => {
     const f = await fixture(t, { env });
     const r = await f.request();
@@ -165,7 +167,9 @@ for (const field of Object.keys(FIELD_LIMITS)) {
 
 test('rejects unknown payload keys, header injection, malformed email and challenge token', async t => {
   const f = await fixture(t);
-  for (const body of [[], null, {}, { ...FIELDS, to: 'attacker@example.com' }, { ...FIELDS, html: '<script>x</script>' }]) {
+  for (const body of [[], null, {}, { ...FIELDS, to: 'attacker@example.com' }, { ...FIELDS, html: '<script>x</script>' },
+    { ...FIELDS, endpoint: 'https://evil.example' }, { ...FIELDS, _cc: 'other@example.com' },
+    { ...FIELDS, 'cf-turnstile-response': 'do-not-forward' }, { ...FIELDS, 'g-recaptcha-response': 'do-not-forward' }]) {
     assert.equal((await f.request({ body })).status, 400);
   }
   for (const field of ['name', 'email', 'subject']) {
@@ -180,18 +184,20 @@ test('rejects unknown payload keys, header injection, malformed email and challe
   assert.equal(f.calls.length, 0);
 });
 
-test('valid fields use fixed sender/recipient, visitor Reply-To, deterministic plain text and private responses', async t => {
+test('standard form endpoint maps only plain-text fields with visitor email for Reply-To', async t => {
   const f = await fixture(t);
-  const r = await f.request({ body: { ...FIELDS, name: '  Zoë Visitor  ', message: '  <b>Text only</b>\r\nNext\tline  ' } });
+  const r = await f.request({ body: { ...FIELDS, name: '  Zoë Visitor  ', message: '  <b>Text only</b>\r\nNext\tline  ' },
+    headers: { Referer: 'https://evil.example/private', 'X-Forwarded-For': '1.2.3.4', Authorization: 'Bearer do-not-forward' } });
   assert.equal(r.status, 202); assert.equal(r.body.delivery, 'accepted'); assert.match(r.body.message, /not yet confirmed/);
   assert.equal(f.calls.length, 2);
-  assert.deepEqual(f.calls[1].payload, { from: ENV.CONTACT_FROM_EMAIL, to: [ENV.CONTACT_TO_EMAIL], reply_to: FIELDS.email,
-    subject: `[V3 Contact] ${FIELDS.subject}`, text: 'Name: Zoë Visitor\nEmail: visitor@example.com\nSubject: Synthetic subject\n\n<b>Text only</b>\nNext\tline' });
-  assert.equal(f.calls[1].headers.Authorization, `Bearer ${ENV.RESEND_API_KEY}`);
+  assert.equal(f.calls[1].url, 'https://formspree.io/f/testabcd');
+  assert.deepEqual(f.calls[1].payload, { name: 'Zoë Visitor', email: FIELDS.email,
+    subject: `[V3 Contact] ${FIELDS.subject}`, message: '<b>Text only</b>\nNext\tline' });
+  assert.deepEqual(f.calls[1].headers, { 'Content-Type': 'application/json', Accept: 'application/json' });
+  assert.deepEqual(Object.keys(f.calls[0].payload).sort(), ['response', 'secret']);
   assert.equal(f.calls[0].payload.secret, ENV.TURNSTILE_SECRET_KEY);
-  assert.equal(f.calls[0].payload.remoteip, undefined);
-  assert.match(f.calls[0].payload.idempotency_key, /^[0-9a-f-]{36}$/);
-  for (const value of [...Object.values(ENV), ...Object.values(FIELDS), 'synthetic-provider-id']) assert.ok(!r.text.includes(value));
+  assert.equal(f.calls[0].payload.response, FIELDS.turnstileToken);
+  for (const value of [...Object.values(ENV), ...Object.values(FIELDS), SUCCESS.next]) assert.ok(!r.text.includes(value));
 });
 
 test('exact maximum name/subject/message limits and valid long email are accepted without clipping', async t => {
@@ -199,7 +205,7 @@ test('exact maximum name/subject/message limits and valid long email are accepte
   const email = 'a'.repeat(64) + '@' + 'b'.repeat(63) + '.' + 'c'.repeat(63) + '.' + 'd'.repeat(61);
   assert.equal(email.length, 254);
   const r = await f.request({ body: { ...FIELDS, name: 'n'.repeat(100), email, subject: 's'.repeat(150), message: '😀'.repeat(2500) } });
-  assert.equal(r.status, 202); assert.ok(f.calls[1].payload.text.endsWith('😀'.repeat(2500)));
+  assert.equal(r.status, 202); assert.ok(f.calls[1].payload.message.endsWith('😀'.repeat(2500)));
 });
 
 for (const [label, changes] of Object.entries({ failure: { success: false, 'error-codes': ['timeout-or-duplicate'] },
@@ -227,28 +233,45 @@ for (const [label, provider] of Object.entries({ unavailable: async () => jsonRe
   });
 }
 
-for (const status of [400, 401, 403, 404, 405, 422, 429, 409, 500, 503]) {
-  test(`Resend ${status} is safely distinguished from provider acceptance`, async t => {
+for (const status of [400, 401, 403, 404, 405, 422, 429, 408, 409, 500, 503]) {
+  test(`Formspree ${status} is distinguished and never automatically replayed`, async t => {
     const f = await fixture(t, { provider: async call => call.url.includes('siteverify') ? jsonResponse(200, challenge()) :
-      jsonResponse(status, { name: status === 409 ? 'concurrent_idempotent_requests' : 'provider_error', message: FIELDS.message }) });
-    const r = await f.request(); assert.equal(r.status, 503); assert.equal(r.body.ok, false);
-    assert.equal(r.body.delivery, [409, 500, 503].includes(status) ? 'unknown' : 'rejected');
-    assert.ok(Number(r.headers['retry-after']) >= 10); assert.ok(!r.text.includes(FIELDS.message));
+      jsonResponse(status, { errors: [{ message: FIELDS.message, field: 'email', code: 'PRIVATE-PROVIDER-CODE' }] }) });
+    const headers = { 'Idempotency-Key': keyAt() };
+    const r = await f.request({ headers });
+    const expected = [400, 422].includes(status) ? [422, 'provider_validation_failed', 'rejected'] :
+      status === 429 ? [429, 'provider_rate_limited', 'rejected'] :
+      [401, 403, 404, 405].includes(status) ? [502, 'delivery_unavailable', 'rejected'] : [503, 'delivery_uncertain', 'unknown'];
+    assert.deepEqual([r.status, r.body.code, r.body.delivery], expected);
+    assert.equal(r.body.retryable, false); assert.ok(!r.text.includes(FIELDS.message));
+    assert.ok(!r.text.includes('PRIVATE-PROVIDER-CODE'));
+    f.advance(61000); assert.deepEqual((await f.request({ headers })).body, r.body); assert.equal(f.calls.length, 2);
   });
 }
 
-for (const [label, emailResponse] of Object.entries({ timeout: () => new Promise(() => {}),
+for (const [label, response] of Object.entries({ timeout: () => new Promise(() => {}),
   network: () => { throw new Error('private network data'); }, malformed: () => new Response('invalid json'),
-  missingId: () => jsonResponse(200, {}), oversized: () => new Response('x'.repeat(LIMITS.responseBytes + 1)),
+  missingNext: () => jsonResponse(200, { ok: true }), falseSuccess: () => jsonResponse(200, { next: '/thanks', ok: false }),
+  errorsWithNext: () => jsonResponse(200, { next: '/thanks', errors: [{ message: 'PRIVATE' }] }),
+  paymentAction: () => jsonResponse(200, { next: '/thanks', stripe: {}, resubmitKey: 'PRIVATE' }),
+  oversized: () => new Response('x'.repeat(LIMITS.responseBytes + 1)),
   redirect: () => { throw new Error('redirect rejected'); },
   slowBody: () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')); } })) })) {
-  test(`Resend ${label} is uncertain, bounded and never false success`, async t => {
-    const f = await fixture(t, { limits: { sendMs: 35 }, provider: async call => call.url.includes('siteverify') ? jsonResponse(200, challenge()) : emailResponse() });
-    const start = Date.now(); const r = await f.request();
+  test(`Formspree ${label} is uncertain, bounded and never replayed`, async t => {
+    const f = await fixture(t, { limits: { sendMs: 35 }, provider: async call => call.url.includes('siteverify') ? jsonResponse(200, challenge()) : response() });
+    const headers = { 'Idempotency-Key': keyAt() }; const start = Date.now(); const r = await f.request({ headers });
     assert.equal(r.status, 503); assert.equal(r.body.code, 'delivery_uncertain'); assert.equal(r.body.delivery, 'unknown');
+    assert.equal(r.body.retryable, false); assert.equal(r.headers['retry-after'], undefined);
     assert.ok(Date.now() - start < 1500); assert.equal(f.calls[1].signal.aborted, ['timeout', 'oversized', 'slowBody'].includes(label));
+    f.advance(11000); assert.deepEqual((await f.request({ headers })).body, r.body); assert.equal(f.calls.length, 2);
   });
 }
+
+test('official next-only success is accepted without following or exposing provider URLs', async t => {
+  const f = await fixture(t, { provider: async call => call.url.includes('siteverify') ? jsonResponse(200, challenge()) :
+    jsonResponse(200, { next: 'https://private.example/receipt?secret=PRIVATE' }) });
+  const r = await f.request(); assert.equal(r.status, 202); assert.ok(!r.text.includes('private.example')); assert.equal(f.calls.length, 2);
+});
 
 test('identical accepted retry is cached; changed message conflicts without another provider call', async t => {
   const f = await fixture(t); const key = keyAt(); const headers = { 'Idempotency-Key': key };
@@ -258,64 +281,75 @@ test('identical accepted retry is cached; changed message conflicts without anot
   assert.equal(r.status, 409); assert.equal(r.body.code, 'idempotency_conflict'); assert.equal(f.calls.length, 2);
 });
 
-test('uncertain retry respects cooldown, uses same provider key/body and Siteverify retry UUID', async t => {
-  let sends = 0;
-  const f = await fixture(t, { provider: async (call, _calls, at) => {
-    if (call.url.includes('siteverify')) return jsonResponse(200, challenge({ challenge_ts: new Date(at).toISOString() }));
-    if (++sends === 1) throw new Error('connection lost after acceptance');
-    return jsonResponse(200, { id: 'same-delivery' });
-  } });
-  const headers = { 'Idempotency-Key': keyAt() };
-  assert.equal((await f.request({ headers })).body.delivery, 'unknown');
-  assert.equal((await f.request({ headers })).body.delivery, 'unknown'); assert.equal(f.calls.length, 2);
-  f.advance(11000);
-  assert.equal((await f.request({ headers })).status, 202);
-  assert.equal(f.calls[1].headers['Idempotency-Key'], f.calls[3].headers['Idempotency-Key']);
-  assert.equal(f.calls[1].body, f.calls[3].body);
-  assert.equal(f.calls[0].payload.idempotency_key, f.calls[2].payload.idempotency_key);
-});
-
-test('new challenge token changes only Siteverify retry UUID, never email identity', async t => {
-  const f = await fixture(t, { provider: async (call, _calls, at) => call.url.includes('siteverify') ?
-    jsonResponse(200, challenge({ challenge_ts: new Date(at).toISOString() })) : jsonResponse(429, {}) });
-  const headers = { 'Idempotency-Key': keyAt() };
-  await f.request({ headers }); f.advance(61000);
-  await f.request({ headers, body: { ...FIELDS, turnstileToken: 'new-challenge' } });
-  assert.notEqual(f.calls[0].payload.idempotency_key, f.calls[2].payload.idempotency_key);
-  assert.equal(f.calls[1].headers['Idempotency-Key'], f.calls[3].headers['Idempotency-Key']);
-});
-
-test('uncertainty remains truthful if a later retry is rejected by verification or provider', async t => {
-  let phase = 0;
+test('verification timeout requires a fresh token and never re-verifies a consumed token', async t => {
+  let verifications = 0;
   const f = await fixture(t, { provider: async call => {
-    if (call.url.includes('siteverify')) return jsonResponse(200, phase === 1 ? challenge({ success: false }) : challenge());
-    return jsonResponse(phase === 0 ? 500 : 403, {});
+    if (call.url.includes('siteverify')) {
+      if (++verifications === 1) throw new Error('verification outcome unknown');
+      return jsonResponse(200, challenge());
+    }
+    return jsonResponse(200, SUCCESS);
   } });
   const headers = { 'Idempotency-Key': keyAt() };
-  assert.equal((await f.request({ headers })).body.delivery, 'unknown');
-  f.advance(11000); phase = 1; assert.equal((await f.request({ headers })).body.delivery, 'unknown');
-  phase = 2; assert.equal((await f.request({ headers })).body.delivery, 'unknown');
+  assert.equal((await f.request({ headers, body: FIELDS })).body.code, 'verification_unavailable');
+  f.advance(11000);
+  assert.equal((await f.request({ headers, body: FIELDS })).body.code, 'challenge_refresh_required');
+  assert.equal(f.calls.length, 1);
+  assert.equal((await f.request({ headers, body: { ...FIELDS, turnstileToken: 'fresh-token' } })).status, 202);
+  assert.equal(f.calls.length, 3);
 });
 
-test('same key across process recreation keeps provider identity and payload; changed config conflicts safely', async t => {
-  const known = new Map();
-  const provider = async call => {
-    if (call.url.includes('siteverify')) return jsonResponse(200, challenge());
-    const key = call.headers['Idempotency-Key'];
-    if (known.has(key) && known.get(key) !== call.body) return jsonResponse(409, { name: 'invalid_idempotent_request' });
-    known.set(key, call.body); return jsonResponse(200, { id: 'stable-id' });
-  };
-  const first = await fixture(t, { provider }); const second = await fixture(t, { provider });
-  const changed = await fixture(t, { provider, env: { CONTACT_FROM_EMAIL: 'new@sender.example' } });
+test('consumed challenge cannot be reused with a different key', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.request({ body: FIELDS })).status, 202);
+  const r = await f.request({ body: FIELDS });
+  assert.equal(r.body.code, 'challenge_refresh_required'); assert.equal(f.calls.length, 2);
+});
+
+test('concurrent keys cannot verify the same single-use challenge twice', async t => {
+  let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, { provider: async call => {
+    if (call.url.includes('siteverify')) { await waiting; return jsonResponse(200, challenge()); }
+    return jsonResponse(200, SUCCESS);
+  } });
+  const first = f.request({ body: FIELDS });
+  while (!f.calls.length) await sleep(5);
+  try {
+    assert.equal((await f.request({ body: FIELDS })).body.code, 'challenge_refresh_required');
+    assert.equal(f.calls.length, 1);
+  } finally { release(); }
+  assert.equal((await first).status, 202); assert.equal(f.calls.length, 2);
+});
+
+test('uncertainty survives elapsed cooldown and refreshed challenge without another dispatch', async t => {
+  const f = await fixture(t, { provider: async call => call.url.includes('siteverify') ? jsonResponse(200, challenge()) : jsonResponse(500, {}) });
   const headers = { 'Idempotency-Key': keyAt() };
-  assert.equal((await first.request({ headers })).status, 202);
-  assert.equal((await second.request({ headers })).status, 202); assert.equal(known.size, 1);
-  const r = await changed.request({ headers }); assert.equal(r.status, 409); assert.equal(r.body.delivery, 'unknown');
-  assert.equal(r.body.retryable, false); assert.equal((await changed.request({ headers })).status, 409);
-  assert.equal(changed.calls.length, 2);
+  assert.equal((await f.request({ headers })).body.delivery, 'unknown');
+  f.advance(61000);
+  const r = await f.request({ headers, body: { ...FIELDS, turnstileToken: 'fresh-token' } });
+  assert.equal(r.body.delivery, 'unknown'); assert.equal(r.body.retryable, false); assert.equal(f.calls.length, 2);
 });
 
-test('invalid/future/expired keys never send, including after cache loss beyond provider retention', async t => {
+test('restart refuses pre-start keys, including future-skew keys, after receipt memory is lost', async t => {
+  const first = await fixture(t);
+  const keys = [keyAt(), keyAt(TIME + LIMITS.futureMs)];
+  for (const key of keys) assert.equal((await first.request({ headers: { 'Idempotency-Key': key } })).status, 202);
+  const restarted = await fixture(t, { bootTime: TIME + 1 }); restarted.advance(120000);
+  for (const key of keys) {
+    const r = await restarted.request({ headers: { 'Idempotency-Key': key } });
+    assert.equal(r.body.code, 'submission_history_unavailable'); assert.equal(r.body.retryable, false);
+  }
+  assert.equal(restarted.calls.length, 0); assert.equal((await restarted.request()).status, 202);
+});
+
+test('fresh process rejects keys within startup uncertainty and recovers for newly created keys', async t => {
+  const f = await fixture(t, { bootTime: TIME });
+  assert.equal((await f.request()).body.code, 'submission_history_unavailable');
+  f.advance(LIMITS.futureMs + 1); assert.equal((await f.request()).status, 202);
+});
+
+test('invalid/future/expired keys never send, including after cache expiry', async t => {
   const f = await fixture(t);
   for (const key of [undefined, 'a', crypto.randomUUID(), `${TIME}.not-a-uuid`]) {
     assert.equal((await f.request({ headers: { 'Idempotency-Key': key } })).status, 400);
@@ -344,7 +378,7 @@ test('global request cap and bounded record capacity fail closed without evictin
   assert.equal((await f.request({ headers })).status, 202);
   assert.equal((await f.request()).body.code, 'contact_busy');
   assert.equal((await f.request({ headers })).status, 202); assert.equal(f.calls.length, 2);
-  f.advance(LIMITS.retryMs + 1); assert.equal((await f.request()).status, 202);
+  f.advance(LIMITS.retryMs + LIMITS.futureMs + 1); assert.equal((await f.request()).status, 202);
   assert.equal((await f.request({ headers })).body.code, 'retry_window_closed');
 });
 
@@ -353,7 +387,7 @@ test('in-flight duplicate and bounded concurrency reject excess work and recover
   const waiting = new Promise(resolve => { release = resolve; });
   const f = await fixture(t, { limits: { concurrent: 2 }, provider: async call => {
     if (call.url.includes('siteverify')) { await waiting; return jsonResponse(200, challenge()); }
-    return jsonResponse(200, { id: 'one-email' });
+    return jsonResponse(200, SUCCESS);
   } });
   const headers = { 'Idempotency-Key': keyAt() }; const first = f.request({ headers });
   while (f.calls.length < 1) await sleep(5);
@@ -380,12 +414,12 @@ test('client disconnect during verification aborts work before sending and frees
   const r = await f.request(); assert.equal(r.body.code, 'verification_unavailable'); assert.equal(f.calls.length, 2);
 });
 
-test('disconnect after send starts keeps uncertainty and reuses the provider key on retry', async t => {
+test('disconnect after send starts keeps uncertainty and blocks replay', async t => {
   let sends = 0;
   const f = await fixture(t, { provider: async (call, _calls, at) => {
     if (call.url.includes('siteverify')) return jsonResponse(200, challenge({ challenge_ts: new Date(at).toISOString() }));
     if (++sends === 1) return new Promise(() => {});
-    return jsonResponse(200, { id: 'replayed-acceptance' });
+    return jsonResponse(200, SUCCESS);
   } });
   const key = keyAt();
   const req = http.request({ host: '127.0.0.1', port: f.port, method: 'POST', path: '/api/contact',
@@ -396,8 +430,8 @@ test('disconnect after send starts keeps uncertainty and reuses the provider key
   assert.ok(f.calls[1].signal.aborted);
   const headers = { 'Idempotency-Key': key };
   assert.equal((await f.request({ headers })).body.delivery, 'unknown');
-  f.advance(11000); assert.equal((await f.request({ headers })).status, 202);
-  assert.equal(f.calls[1].headers['Idempotency-Key'], f.calls[3].headers['Idempotency-Key']);
+  f.advance(11000); const result = await f.request({ headers });
+  assert.equal(result.body.delivery, 'unknown'); assert.equal(result.body.retryable, false); assert.equal(f.calls.length, 2);
 });
 
 test('streamed oversized upload stops before parsing or sending and next request still works', async t => {
@@ -422,9 +456,9 @@ test('sensitive upstream errors and content are neither logged nor returned', as
   try {
     const f = await fixture(t, { provider: async call => {
       if (call.url.includes('siteverify')) return jsonResponse(200, challenge());
-      throw new Error(`${FIELDS.message} ${ENV.RESEND_API_KEY} ${ENV.CONTACT_TO_EMAIL}`);
+      throw new Error(`${FIELDS.message} ${ENV.TURNSTILE_SECRET_KEY} inbox@private.example`);
     } });
     const r = await f.request(); assert.equal(r.body.delivery, 'unknown');
-    assert.equal(logs.length, 0); assert.ok(!r.text.includes(FIELDS.message)); assert.ok(!r.text.includes(ENV.RESEND_API_KEY));
+    assert.equal(logs.length, 0); assert.ok(!r.text.includes(FIELDS.message)); assert.ok(!r.text.includes(ENV.TURNSTILE_SECRET_KEY));
   } finally { for (const method of Object.keys(originals)) console[method] = originals[method]; }
 });
