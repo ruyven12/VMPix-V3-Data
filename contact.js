@@ -6,14 +6,13 @@ const crypto = require('node:crypto');
 const APPROVED_ORIGINS = Object.freeze(['https://vmpix-v3.onrender.com']);
 const FIELD_LIMITS = Object.freeze({ name: 100, email: 254, subject: 150, message: 5000 });
 const LIMITS = Object.freeze({ bodyBytes: 48 * 1024, responseBytes: 16 * 1024,
-  bodyMs: 5000, challengeMs: 4000, sendMs: 8000, requestMs: 18000,
+  bodyMs: 5000, sendMs: 8000, requestMs: 18000,
   concurrent: 4, peerAttempts: 5, globalAttempts: 30, rateMs: 15 * 60 * 1000,
-  peers: 1024, records: 1000, retryMs: 60 * 60 * 1000, futureMs: 60000, cooldownMs: 10000 });
+  peers: 1024, records: 1000, retryMs: 60 * 60 * 1000, futureMs: 60000 });
 const KEY_PATTERN = /^(\d{13})\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 const EMAIL_PATTERN = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 const SINGLE_CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
-const TURNSTILE_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 const FORMSPREE_BASE = 'https://formspree.io/f/';
 const FORM_ID_PATTERN = /^[a-zA-Z0-9]{8,32}$/;
 
@@ -26,16 +25,16 @@ function configured(env) {
   const allowed = origins.length > 0 && origins.every(s => APPROVED_ORIGINS.includes(s));
   const secret = env.CONTACT_IDEMPOTENCY_SECRET;
   const formId = env.CONTACT_FORMSPREE_FORM_ID;
-  // This attestation requires separate review of recipient, CAPTCHA, domain/proxy
-  // compatibility and single-process operation. It is not provider authentication.
+  // Operator attestation: native Turnstile rejects invalid challenges, Formspree
+  // domain restriction is off, recipient and single-process safeguards are approved.
+  // This flag cannot inspect provider settings and is not provider authentication.
   const ready = env.CONTACT_ENABLED === '1' && env.CONTACT_FORMSPREE_PROXY_APPROVED === '1' && allowed &&
     typeof formId === 'string' && FORM_ID_PATTERN.test(formId) &&
-    [env.TURNSTILE_SECRET_KEY].every(s => typeof s === 'string' && s.length >= 16 && s.length <= 512 && !/\s/.test(s)) &&
     typeof secret === 'string' && /^[A-Za-z0-9+/]{43}=$/.test(secret) &&
     Buffer.from(secret, 'base64').length === 32 && Buffer.from(secret, 'base64').toString('base64') === secret;
   return { origins: allowed ? new Set(origins) : new Set(), ready,
     endpoint: typeof formId === 'string' && FORM_ID_PATTERN.test(formId) ? `${FORMSPREE_BASE}${formId}` : null,
-    turnstile: env.TURNSTILE_SECRET_KEY, secret };
+    secret };
 }
 function validateBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body) ||
@@ -102,7 +101,7 @@ function readBody(req, signal, limits) {
   });
 }
 
-// The deadline includes response-body reading. Never follow redirects carrying a secret.
+// The deadline includes response-body reading. Never redirect private submission data.
 async function providerJson(fetchImpl, url, options, parentSignal, timeoutMs, maxBytes) {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -195,7 +194,6 @@ function createContactRouter({ env = process.env, fetchImpl = globalThis.fetch, 
     if (record?.accepted) return accepted();
     if (record?.busy) return failure(409, 'request_in_progress', 'unknown');
     if (record?.attempted) return record.result;
-    if (record?.nextAt > at) return { ...record.result, retryAfter: Math.ceil((record.nextAt - at) / 1000) };
     if (!record) {
       // Without durable receipts, refuse a missing key that could predate startup,
       // including the full allowed future-clock skew. Fresh clients need ~60s
@@ -207,42 +205,25 @@ function createContactRouter({ env = process.env, fetchImpl = globalThis.fetch, 
       record = { fingerprint, expires: keyTime + policy.retryMs + 1, busy: false, attempted: false };
       records.set(recordKey, record);
     }
+    if (signal.aborted) throw fault('request_timeout');
+    // Duplicate guard only: retain a keyed digest, never verify/consume the token here.
+    // Formspree is the sole Turnstile verifier. Refuse repeat dispatch under another
+    // key even if the original outcome is unknown; do not suggest an automatic retry.
+    for (const [id, expires] of challenges) if (expires <= at) challenges.delete(id);
+    const challengeKey = digest(`challenge:${token}`);
+    if (challenges.has(challengeKey)) return failure(409, 'challenge_already_submitted', 'unknown');
+    if (challenges.size >= policy.records) return failure(503, 'contact_busy', 'not_attempted', true, 60);
+    challenges.set(challengeKey, at + policy.retryMs + policy.futureMs);
     record.busy = true;
-    let sending = false;
     try {
-      // Consume each token at most once here, even after a verification timeout.
-      // Keep only a digest for the full submission window, never the raw token.
-      for (const [id, expires] of challenges) if (expires <= at) challenges.delete(id);
-      const challengeKey = digest(`challenge:${token}`);
-      if (challenges.has(challengeKey)) return failure(400, 'challenge_refresh_required', 'not_attempted', true);
-      if (challenges.size >= policy.records) return failure(503, 'contact_busy', 'not_attempted', true, 60);
-      challenges.set(challengeKey, at + policy.retryMs + policy.futureMs);
-      const challenge = await providerJson(fetchImpl, TURNSTILE_URL, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret: config.turnstile, response: token })
-      }, signal, policy.challengeMs, policy.responseBytes);
-      const verified = challenge.body;
-      const errors = verified?.['error-codes'] ?? [];
-      if (challenge.status !== 200 || !verified || typeof verified.success !== 'boolean' ||
-          !Array.isArray(errors) || errors.some(code => typeof code !== 'string') ||
-          errors.some(code => ['internal-error', 'invalid-input-secret', 'missing-input-secret', 'bad-request'].includes(code))) {
-        return failure(503, 'verification_unavailable', 'not_attempted', true, 10);
-      }
-      const age = now() - Date.parse(verified.challenge_ts);
-      if (!verified.success || errors.length || verified.hostname !== new URL(req.headers.origin).hostname || verified.action !== 'contact' ||
-          !Number.isFinite(age) || age < -60000 || age > 300000) {
-        return failure(400, 'challenge_invalid', 'not_attempted', true);
-      }
-      if (signal.aborted) throw fault('request_timeout');
-      sending = true;
       // Mark the attempt BEFORE dispatch. No repeat POST is safe after this point.
       record.attempted = true;
       record.result = failure(503, 'delivery_uncertain', 'unknown');
       const sent = await providerJson(fetchImpl, config.endpoint, { method: 'POST',
-        // No consumed CAPTCHA token, secret, idempotency header, client headers or
-        // fabricated Origin/Referer are forwarded to Formspree.
+        // Forward the unverified token once. No secret, idempotency header, client
+        // headers or fabricated Origin/Referer are forwarded to Formspree.
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: serialized
+        body: JSON.stringify({ ...payload, 'cf-turnstile-response': token })
       }, signal, policy.sendMs, policy.responseBytes);
       const result = sent.body;
       // The official Formspree client identifies success by a string `next`.
@@ -260,9 +241,7 @@ function createContactRouter({ env = process.env, fetchImpl = globalThis.fetch, 
       // 5xx, network errors, redirects and unexpected 2xx bodies stay uncertain.
       return record.result;
     } catch {
-      record.result = sending ? failure(503, 'delivery_uncertain', 'unknown') :
-        failure(503, 'verification_unavailable', 'not_attempted', true, 10);
-      if (!sending) record.nextAt = now() + policy.cooldownMs;
+      record.result = failure(503, 'delivery_uncertain', 'unknown');
       return record.result;
     } finally { record.busy = false; }
   }

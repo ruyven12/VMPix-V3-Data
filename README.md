@@ -444,10 +444,11 @@ Current primary references: [Todoist API v1](https://developer.todoist.com/api/v
 [Render rollbacks](https://render.com/docs/rollbacks).
 
 
-## Contact delivery foundation (CON-04A: Formspree, inactive)
+## Contact delivery foundation (CON-04B: native Turnstile, inactive)
 
-`POST /api/contact` keeps the CON-04 validation, CORS, request limits, Turnstile
-verification and safe responses. Delivery now uses the standard Formspree
+`POST /api/contact` keeps the approved validation, CORS, request limits, duplicate
+guards and safe responses. Formspree now owns Turnstile verification: V3 forwards
+the unverified token with the validated message in one POST. Delivery uses the standard Formspree
 submission endpoint `https://formspree.io/f/<form-id>`, not the paid submissions
 management API. There are no new dependencies, database operations/migrations,
 message files, background sends or frontend changes. No live Formspree submission,
@@ -460,9 +461,14 @@ email, account creation, provider setting change or production action was perfor
 | `CONTACT_ENABLED` | Defaults off; only exact `1` enables processing when all prerequisites validate. Keep `0` in this pass. |
 | `CONTACT_ALLOWED_ORIGINS` | Explicit comma-separated subset of the code allowlist, currently only `https://vmpix-v3.onrender.com`. No wildcard or shared CORS fallback. |
 | `CONTACT_FORMSPREE_FORM_ID` | Dashboard form ID only, 8-32 ASCII letters/digits. No URL, slash, query, fragment, whitespace or encoding. Host and `/f/` path are fixed in code. |
-| `CONTACT_FORMSPREE_PROXY_APPROVED` | Defaults `0`. Exact `1` is an operator attestation only after recipient, CAPTCHA, domain/proxy compatibility, and single-process/replay limits have been separately reviewed and approved. It does not verify provider settings automatically. Do not set it to bypass the blockers below. |
-| `TURNSTILE_SECRET_KEY` | Backend-only secret for the approved V3 widget. Public site key and widget integration belong to a later frontend pass. |
+| `CONTACT_FORMSPREE_PROXY_APPROVED` | Defaults `0`. Exact `1` attests that the recipient is verified, native Turnstile rejects invalid challenges, Formspree Restrict to Domain is disabled for this proxy, and single-process/replay safeguards are approved. It cannot inspect provider settings automatically. Keep `0` until these protections are established. |
 | `CONTACT_IDEMPOTENCY_SECRET` | Retained configuration name: stable base64 encoding of exactly 32 random bytes. Used for private local key/content/token fingerprints, not a Formspree idempotency guarantee. |
+
+The **public Turnstile site key** belongs in the later frontend widget configuration.
+Its **matching secret belongs only in Formspree's CAPTCHA settings**, with CAPTCHA
+enabled and Cloudflare Turnstile selected. Neither key is provisioned in this pass.
+`TURNSTILE_SECRET_KEY` is no longer read or required by V3 Contact; an old value
+has no effect. Removing any production value requires separate approval.
 
 `RESEND_API_KEY`, `CONTACT_FROM_EMAIL`, `CONTACT_TO_EMAIL` and
 `CONTACT_SENDER_VERIFIED` are retired from Contact. The recipient and notification
@@ -480,49 +486,53 @@ shared TLS/database settings are unchanged.
 - Required input is trimmed, message line endings become LF, and invalid Unicode,
   control/header injection, malformed email, extra fields and excessive lengths
   are rejected rather than clipped. No HTML, attachments, destination override,
-  `_cc`, CAPTCHA passthrough or user-defined headers are accepted.
+  `_cc`, extra provider CAPTCHA fields or user-defined headers are accepted.
+  `turnstileToken` must be 1-2048 printable non-whitespace ASCII characters;
+  missing/malformed values fail locally without contacting Formspree. This is
+  structural validation only, not proof that a challenge is authentic or fresh.
 - `Content-Type: application/json` (optional UTF-8 charset), exact approved
   `Origin`, and `Idempotency-Key: <13-digit Unix milliseconds>.<lowercase UUID v4>`
   remain required. No query strings, cookies or Admin credentials are needed.
-- Formspree receives only sanitized `name`, `email`, `subject` (prefixed with
-  `[V3 Contact]`) and `message`, as plain string data. Its `email` field supplies
+- Formspree receives sanitized `name`, `email`, `subject` (prefixed with
+  `[V3 Contact]`) and `message`, plus the unchanged unverified token mapped to
+  `cf-turnstile-response`. Its `email` field supplies
   Reply-To and `subject` supplies the notification subject. See
   [Formspree special fields](https://help.formspree.io/articles/building-your-form/special-fields).
   No HTML email is constructed here; Formspree owns notification rendering, so
   review its template/plain-text behavior and escaping before activation.
 - Outbound requests use JSON and `Accept: application/json`. They have no API key,
-  Authorization, Idempotency-Key, visitor IP, CAPTCHA token, Origin or Referer.
+  Authorization, Idempotency-Key, visitor IP, Turnstile secret, Origin or Referer.
   Redirects are refused. Incoming headers are never copied to Formspree.
 
-### CAPTCHA and domain/proxy blockers
+### Native CAPTCHA ownership and domain configuration
 
-The backend remains the verifier of the V3 Turnstile token. It checks success,
-exact approved hostname, action `contact`, and age (five minutes, with 60 seconds
-of future clock tolerance). A token digest is reserved before Siteverify and
-retained for 61 minutes in a bounded map: retries/concurrent submissions cannot
-reverify a remembered token. A verification timeout requires a fresh token.
-Raw tokens are not retained in receipt records or forwarded to Formspree.
-See [Cloudflare token verification](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/).
+V3 makes **no Siteverify call** and never consumes the challenge before forwarding.
+Formspree is the sole verifier. Its documented native integration accepts
+`cf-turnstile-response` and uses the configured secret to check the challenge.
+See [Formspree Turnstile](https://help.formspree.io/articles/form-and-project-settings/protecting-your-forms-with-cloudflare-turnstile).
+Configure the Cloudflare widget for the approved frontend hostname
+`vmpix-v3.onrender.com`; retain Cloudflare hostname restrictions. Expiry, authenticity
+and single-use validation belong to Formspree/Cloudflare. V3 no longer independently
+checks challenge timestamp, returned hostname or `action=contact`; no undocumented
+Formspree action enforcement is assumed.
 
-Formspree's native Turnstile integration expects `cf-turnstile-response` and
-verifies it itself. It cannot reuse the already-consumed backend token. A form
-requiring Formspree CAPTCHA will not work with this four-field adapter without
-an approved compatible design. See [Formspree Turnstile](https://help.formspree.io/articles/form-and-project-settings/protecting-your-forms-with-cloudflare-turnstile).
-Do not solve this by automatically disabling either verifier. Simply disabling
-Formspree CAPTCHA can expose its independently accessible endpoint to submissions
-that bypass our backend; keeping the form ID private is not authentication.
-No documented authenticated proxy exception was established in this audit.
-Provider confirmation or a separately approved design (for example, independent
-challenges for separate verifiers) is required. That design is not implemented here.
+Formspree **must reject missing, invalid, expired and reused challenges** without
+accepting a submission. Prove that separately against the configured form before
+setting the approval flag; mocks cannot certify external settings. Do not disable
+native CAPTCHA or fall back to unprotected delivery on failure. Direct access to
+the public Formspree endpoint bypasses V3's origin/field/rate checks, so native
+CAPTCHA and provider abuse limits remain essential. A form ID is not authentication.
 
 Formspree's Restrict to Domain feature checks Referer; missing/mismatched values
 can send submissions to its spam folder. A server fetch has no natural browser
-Referer. This adapter neither fabricates one nor relaxes restrictions. Obtain an
-approved, provider-supported proxy configuration before activation; do not infer
-inbox routing from acceptance. See [domain restrictions](https://help.formspree.io/articles/form-and-project-settings/restrict-to-domain).
-The intended visitor domain is `vmpix-v3.onrender.com`, not the backend hostname.
-Actual form settings, CAPTCHA mode, domain restriction and proxy compatibility
-remain unverified. `CONTACT_FORMSPREE_PROXY_APPROVED=0` preserves that block.
+Referer. **Keep Formspree Restrict to Domain disabled for this backend proxy.**
+Do not fabricate a Referer or forward a visitor-supplied one. This setting is
+separate from Cloudflare's widget hostname restrictions, which remain enabled.
+See [domain restrictions](https://help.formspree.io/articles/form-and-project-settings/restrict-to-domain).
+V3's exact origin checks and rate limits remain unchanged; origin checks are a
+browser boundary, not authentication for arbitrary HTTP clients. Actual form
+settings and invalid-challenge rejection remain unverified in this local pass;
+both activation flags stay `0`. Acceptance does not prove inbox routing.
 
 ### Responses and no-replay contract
 
@@ -535,16 +545,15 @@ POST, and Content-Type/Idempotency-Key; it exposes Retry-After without credentia
 | --- | --- |
 | 202 `provider_accepted` | Formspree accepted the submission, not guaranteed Gmail/inbox delivery. Never display "delivered". |
 | 400 `invalid_request`, `invalid_fields`, `invalid_idempotency_key` | Local input validation failed. |
-| 400 `challenge_invalid`, `challenge_refresh_required` | No submission attempt; obtain a new Turnstile token before a deliberate retry. |
 | 403 origin/preflight errors; 404 `not_found`; 405 method error | Outside the approved API contract. |
 | 408 `request_timeout`; 413 `payload_too_large`; 415 `unsupported_content_type` | Rejected before provider submission. |
-| 429 `rate_limited`; 503 `contact_busy`, `verification_unavailable` | Local capacity/verification failure; observe Retry-After, preserving any earlier uncertainty. |
+| 429 `rate_limited`; 503 `contact_busy` | Local capacity failure; observe Retry-After, preserving any earlier uncertainty. |
 | 503 `contact_unavailable` | Disabled or configuration incomplete. |
-| 422 `provider_validation_failed` | Formspree returned 400/422; generic rejection, no raw provider fields/errors exposed. |
+| 422 `provider_validation_failed` | Formspree returned 400/422, including native CAPTCHA rejection; no raw provider fields/errors exposed. Exact live CAPTCHA status/code is not assumed. |
 | 429 `provider_rate_limited` | Formspree returned 429. Retry-After is advisory; this key will not dispatch again. |
 | 502 `delivery_unavailable` | Provider rejected/configuration failed (401/403/404/405). |
 | 503 `delivery_uncertain` | Timeout, network loss, 5xx, redirect, or unexpected response: submission may have been accepted. No automatic replay. |
-| 409 `request_in_progress`, `idempotency_conflict`, `retry_window_closed`, `submission_history_unavailable` | Stop automatic retries; preserve draft/key and reconcile through a direct channel. |
+| 409 `request_in_progress`, `idempotency_conflict`, `retry_window_closed`, `submission_history_unavailable`, `challenge_already_submitted` | Stop automatic retries; preserve draft/key and reconcile through a direct channel. The last code prevents forwarding the same token under another key. |
 
 Acceptance requires 2xx and a nonempty string `next`, with no error/payment or
 contradictory failure fields. Formspree's official client uses `next` to identify
@@ -560,6 +569,13 @@ post-dispatch result has `retryable:false`, including provider rate limits. An
 in-flight duplicate also has `retryable:false`. Retry-After is not permission to
 replay. Only failures known to occur before dispatch can be retried with the same
 key and a fresh challenge; even then, prefer a user-activated retry.
+
+The payload fingerprint excludes the challenge: a refreshed token on the same
+key cannot bypass a cached result. A separate keyed token digest is reserved
+before dispatch for 61 minutes in a bounded map, preventing a second dispatch
+under another key. This local duplicate guard does not verify or consume the
+token. No raw token or message is retained in the receipt/digest maps; raw values
+exist only while handling the request and forwarding it to Formspree.
 
 Keys expire after 60 minutes and allow at most 60 seconds of future skew. On a
 cache miss, `key timestamp - 60 seconds` must be later than this process's start.
@@ -580,13 +596,46 @@ it must not automatically retry the POST or clear the draft. Later errors never
 prove an earlier request was unsent. Manual Formspree/inbox reconciliation is
 required for unresolved submissions; the management API is not used.
 
+### Render proxy and single-instance operation
+
+The stated deployment (one Render instance, one Node process) is compatible during
+steady operation. This pass did not re-inspect live Render settings. Multiple
+workers/instances are not supported by these in-memory limits. Even one configured
+instance can overlap old/new processes during Render deploys and restarts; see
+[Render deployment behavior](https://render.com/docs/deploys). Startup key guards
+reduce replay after memory loss but do not coordinate overlapping processes.
+
+Before activation, approve a disable-and-drain procedure for every later release:
+
+1. Under separate production approval, roll out `CONTACT_ENABLED=0`. Wait until all
+   previously enabled processes have stopped and in-flight requests have settled.
+   A single observed 503 is not proof that every old process has drained.
+2. Confirm the next release has only one Node writer and no enabled predecessor.
+   Then perform the separately approved enabling release. Any overlapping old
+   process must already be disabled. Allow the startup key guard interval.
+3. Apply this process to planned restarts and subsequent deployments. Review how
+   Auto-Deploy will be controlled before activating Contact; an automatic release
+   while enabled would bypass the procedure. No Auto-Deploy setting changed here.
+   If no-overlap cannot be established, keep Contact disabled pending separately
+   approved durable coordination. Unexpected restarts may lose rate-limit history;
+   old submission keys still fail closed. Do not automatically regenerate them.
+
+Rate limiting deliberately uses `req.socket.remoteAddress`, not caller-controlled
+Forwarded/X-Forwarded-For/CF-Connecting-IP. Render terminates proxy traffic, so a
+socket peer can represent many visitors; the 5-per-15-minute bucket may reject
+legitimate shared traffic. See [Render proxy/IP behavior](https://render.com/articles/how-render-handles-ddos-attacks).
+The global cap remains 30 attempts per 15 minutes. No shared `trust proxy` or
+global middleware was changed. Accept this conservative limit explicitly before
+activation, or scope a separate verified proxy-chain design; do not blindly trust
+forwarded headers for a more generous limit.
+
 ### Preserved limits and privacy
 
 - 5 attempts per socket peer and 30 globally per 15 minutes; 4 concurrent requests
   including uploads. 1024 peer buckets, 1000 receipt records and 1000 token digests.
   Full maps reject new work rather than evict active protection. Expiry cleanup
   is lazy. Rate limits/caches reset on process restart; forwarded IPs remain untrusted.
-- Upload: 48 KiB/5 seconds. Turnstile: 4 seconds. Formspree: 8 seconds. Whole
+- Upload: 48 KiB/5 seconds. Formspree (including its CAPTCHA processing): 8 seconds. Whole
   request: 18 seconds. Provider response cap: 16 KiB with body-read deadlines.
   Abort on disconnect/deadline; a possible submission remains uncertain.
 - Render proxy peers may group visitors under one restrictive limit. Verify the
@@ -601,17 +650,20 @@ required for unresolved submissions; the management API is not used.
 
 1. Approve the Formspree form and confirm its verified Voodoo Media/Gmail recipient,
    notifications, quota and retention. Configure only the approved form ID.
-2. Resolve CAPTCHA ownership and direct-endpoint bypass protection with Formspree;
-   do not reuse one token or weaken spam protection as a workaround.
-3. Resolve Referer/domain restrictions for backend proxy traffic without spoofed
-   headers, plus the single-writer/restart/deployment-overlap limitations above.
-4. Provision the Turnstile secret, stable fingerprint secret and origin allowlist.
+2. Configure the approved Cloudflare widget hostname/public site key and put its
+   matching secret in Formspree only. Enable Formspree CAPTCHA with Turnstile.
+   Keep Formspree Restrict to Domain disabled; retain Cloudflare hostname controls.
+3. Approve the single-writer disable-and-drain procedure and conservative proxy
+   rate limits above. If either required protection cannot be established, stop.
+4. Provision the form ID, stable fingerprint secret and V3 origin allowlist.
    Keep both CONTACT_ENABLED and CONTACT_FORMSPREE_PROXY_APPROVED at `0` until the
    review is approved. No provider setting is automatically changed by these flags.
-5. In a later frontend pass, implement the widget, safe response mapping, retained
-   draft, stable key and deliberate retries. Never replay uncertain submissions.
-6. Only under separate approval, perform a controlled live acceptance/inbox and
-   Reply-To check, inspect spam routing, and then authorize activation/deployment.
+5. In a later frontend pass, implement the public-site-key widget, send its
+   unverified token as `turnstileToken`, and implement safe response mapping,
+   retained draft, stable key and deliberate retries. Never replay uncertain submissions.
+6. Only under separate approval, verify native rejection of missing/invalid/expired/
+   reused tokens, then perform a controlled acceptance/inbox and Reply-To check.
+   Inspect spam routing and notification rendering before authorizing activation.
    Do not start the normal backend for read-only preflight: existing startup still
    applies its unrelated database initialization/migrations.
 7. Disable intake with CONTACT_ENABLED=0 under an approved restart/deployment.
@@ -619,14 +671,15 @@ required for unresolved submissions; the management API is not used.
 
 ### Local verification
 
-`node --test scripts/test-contact.js` uses synthetic Formspree/Turnstile responses
+`node --test scripts/test-contact.js` uses synthetic Formspree responses/tokens
 and loopback HTTP only; native fetch is blocked. It never loads server startup,
 db.js or .env. Syntax checks cover contact.js, server.js and scripts/test-contact.js.
-CON-04A on Node 22.21.0: Contact 79/79; Calendar 43/43; database guards 38/38;
+CON-04B on Node 22.21.0: Contact 79/79; Calendar 43/43; database guards 38/38;
 Import Reporting 22/22; Wrestling diagnostics 11/11. Wrestling photo totals remain
 14/16: the two existing mocks lack `res.locals.v3AdminSessionAuthorized` (same
-failure recorded in CON-04); server.js and those tests are unchanged in CON-04A.
+failure recorded in CON-04/04A); server.js and those tests are unchanged in CON-04B.
 
-GO for local adapter review. NO-GO for production activation until CAPTCHA,
-domain/proxy and deployment-overlap blockers are resolved and separately approved.
+GO for local adapter review. NO-GO for production activation until actual native
+CAPTCHA rejection, form configuration, frontend integration, proxy limit acceptance
+and deployment-overlap safeguards are verified and separately approved.
 No live Formspree submission or actual email was used for verification.
