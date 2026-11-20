@@ -12,6 +12,7 @@ const { buildPossibleDuplicatesResponse } = require('./possible-duplicates');
 const importReporting = require('./import-reporting');
 const { createCalendar } = require('./todoist-calendar');
 const { createContactRouter } = require('./contact');
+const { createMusicVenuePhotoCensus } = require('./music-venue-photo-census');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -24911,6 +24912,53 @@ app.get('/api/music/people/stats', async (req, res) => {
       },
       error: err && err.message ? err.message : String(err)
     });
+  }
+});
+
+// Explicit census refresh only; public reads never enumerate SmugMug or initialize tables.
+function musicVenuePhotoCensusService() {
+  return createMusicVenuePhotoCensus({ db: dbPool, fetchJson: fetchSmugJson,
+    getImages: getSmugAlbumImages, dateFolder: formatMusicShowDateFolder });
+}
+
+app.get('/api/music/venues/:venue_id/photo-census', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim()) throw new Error('database_unavailable');
+    const venue = await findMusicVenueForPhotoAggregation(req.params.venue_id);
+    if (!venue) return res.status(404).json({ ok: false, error: 'venue_not_found' });
+    return res.json({ ok: true, readOnly: true, databaseMutated: false,
+      venue: buildMusicVenuePhotoVenuePayload(venue), photo_census: await musicVenuePhotoCensusService().read(venue) });
+  } catch (_) {
+    return res.status(503).json({ ok: false, error: 'venue_photo_census_unavailable',
+      photo_census: { total: null, status: 'unavailable', complete: false } });
+  }
+});
+
+app.post('/api/admin/music/venues/:venue_id/photo-census', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const secrets = getConfiguredAdminSecrets();
+  if (res.locals.v3AdminSessionAuthorized !== true &&
+      (!secrets.length || !getRequestAdminTokens(req).some(token => adminTokenMatches(token, secrets)))) {
+    return res.status(401).json({ ok: false, error: 'admin_required' });
+  }
+  let lock, result;
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim() || !isSmugMugConfigured()) throw new Error('configuration_unavailable');
+    const venue = await findMusicVenueForPhotoAggregation(req.params.venue_id);
+    if (!venue) return res.status(404).json({ ok: false, error: 'venue_not_found' });
+    const acquired = await acquireImportLock({ section: 'music', category: 'shows', owner: getImportLockOwner(),
+      meta: { operation: 'venue_photo_census', venue_id: venue.venue_key || venue.venue_id } });
+    if (!acquired.acquired) return res.status(409).json({ ok: false, error: 'music_shows_locked' });
+    if (acquired.bypassed || !acquired.lock) throw new Error('active_lock_required');
+    lock = acquired.lock;
+    result = await musicVenuePhotoCensusService().refresh(venue, lock);
+    return res.json({ ok: true, photo_census: result });
+  } catch (_) {
+    return res.status(503).json({ ok: false, error: 'venue_photo_census_refresh_failed',
+      photo_census: { total: null, status: 'unavailable', complete: false } });
+  } finally {
+    if (lock) await releaseImportLock(lock.id, result?.complete ? 'completed' : 'failed', { operation: 'venue_photo_census' });
   }
 });
 
