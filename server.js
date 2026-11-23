@@ -13,6 +13,7 @@ const importReporting = require('./import-reporting');
 const { createCalendar } = require('./todoist-calendar');
 const { createContactRouter } = require('./contact');
 const { createMusicVenuePhotoCensus } = require('./music-venue-photo-census');
+const { createMusicVenuePhotoCensusBatch, withMusicVenueCensusGate, createCensusRequestScope, assertMusicVenueCensusReconciled } = require('./music-venue-photo-census-batch');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -591,6 +592,46 @@ function logStartupEnvironmentWarnings() {
 // Contact owns its CORS/body limits; mount before the shared public CORS handler.
 app.use('/api/contact', createContactRouter());
 
+// Legacy-only batch control must precede V3 session validation: previews/status
+// never touch sessions, initialize tables, acquire locks, or enumerate providers.
+app.use('/api/admin/music/venue-photo-census/batches', allowCors, (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  const secrets = getConfiguredAdminSecrets();
+  if (!secrets.length || !getRequestAdminTokens(req).some(token => adminTokenMatches(token, secrets)))
+    return res.status(401).json({ ok: false, error: 'admin_required' });
+  next();
+}, express.json({ limit: '16kb' }), async (req, res) => {
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  req.once('aborted', abort); res.once('close', abort);
+  try {
+    if (!String(process.env.DATABASE_URL || '').trim())
+      return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    const service = musicVenuePhotoCensusBatchService();
+    const status = /^\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})\/?$/.exec(req.path);
+    if (req.method === 'GET' && status) return res.json(await service.status(status[1]));
+    if (!['', '/'].includes(req.path)) return res.status(404).json({ ok: false, error: 'batch_route_not_found' });
+    if (req.method === 'GET') {
+      const input = { ...req.query };
+      if (input.forceRefresh === 'true' || input.forceRefresh === 'false') input.forceRefresh = input.forceRefresh === 'true';
+      return res.json(await service.preview(input));
+    }
+    if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'method_not_allowed' });
+    if (req.body?.mode === 'execute' && !isSmugMugConfigured())
+      return res.status(503).json({ ok: false, error: 'provider_unavailable' });
+    return res.json(await service.execute(req.body || {}, { signal: controller.signal }));
+  } catch (error) {
+    const safe = new Set(['invalid_operation_id', 'execution_confirmation_required', 'invalid_mode',
+      'invalid_confirm', 'invalid_forceRefresh', 'invalid_venueIds', 'invalid_limit', 'invalid_budgetSeconds',
+      'invalid_maxAgeHours', 'operation_id_conflict', 'batch_not_found', 'census_operation_active',
+      'music_shows_locked', 'cancelled', 'import_lock_release_failed']);
+    return res.status(error.status >= 400 && error.status <= 599 ? error.status : 503).json({
+      ok: false, error: safe.has(error.code) ? error.code : 'venue_photo_census_batch_unavailable' });
+  } finally {
+    req.removeListener('aborted', abort); res.removeListener('close', abort);
+  }
+}, (error, req, res, next) => res.status(400).json({ ok: false, error: 'invalid_batch_request' }));
+
 const v3AdminAuthRouter = createV3AdminAuthRouter({ db: dbPool });
 app.use('/api/v3/admin/auth', v3AdminAuthRouter);
 app.use((req, res, next) => {
@@ -748,6 +789,7 @@ async function fetchSmugJson(endpoint, options = {}) {
   let lastError;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
+    if (options.signal?.aborted) throw Object.assign(new Error('provider_request_cancelled'), { name: 'AbortError' });
     if (peopleTrace) {
       peopleTrace.increment('smugmug_request_attempts');
       if (isImagePageRequest) peopleTrace.increment('image_page_requests');
@@ -761,7 +803,8 @@ async function fetchSmugJson(endpoint, options = {}) {
         headers: {
           Accept: 'application/json',
           'User-Agent': SMUG_USER_AGENT
-        }
+        },
+        ...(options.signal ? { signal: options.signal, redirect: 'error' } : {})
       });
     } catch (err) {
       if (peopleTrace) {
@@ -782,6 +825,12 @@ async function fetchSmugJson(endpoint, options = {}) {
     const text = await res.text();
     const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
     lastError = new Error(`SmugMug returned HTTP ${res.status} (${safeEndpoint})${snippet ? `: ${snippet}` : ''}`);
+    lastError.status = res.status;
+    const retryAfter = res.headers?.get?.('retry-after');
+    if (retryAfter != null) {
+      lastError.retryAfterMs = /^\d+(?:\.\d+)?$/.test(retryAfter.trim()) ?
+        Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now());
+    }
     if (peopleTrace) peopleTrace.increment('smugmug_request_failures');
 
     if (!isSmugRateLimitStatus(res.status) || attempt >= retries) throw lastError;
@@ -24916,9 +24965,15 @@ app.get('/api/music/people/stats', async (req, res) => {
 });
 
 // Explicit census refresh only; public reads never enumerate SmugMug or initialize tables.
-function musicVenuePhotoCensusService() {
-  return createMusicVenuePhotoCensus({ db: dbPool, fetchJson: fetchSmugJson,
+function musicVenuePhotoCensusService(db = dbPool, fetchJson = fetchSmugJson) {
+  return createMusicVenuePhotoCensus({ db, fetchJson,
     getImages: getSmugAlbumImages, dateFolder: formatMusicShowDateFolder });
+}
+
+function musicVenuePhotoCensusBatchService() {
+  return createMusicVenuePhotoCensusBatch({ db: dbPool, createService: musicVenuePhotoCensusService,
+    dateFolder: formatMusicShowDateFolder, fetchJson: fetchSmugJson, acquireImportLock,
+    releaseImportLock, owner: getImportLockOwner() });
 }
 
 app.get('/api/music/venues/:venue_id/photo-census', async (req, res) => {
@@ -24947,18 +25002,32 @@ app.post('/api/admin/music/venues/:venue_id/photo-census', async (req, res) => {
     if (!String(process.env.DATABASE_URL || '').trim() || !isSmugMugConfigured()) throw new Error('configuration_unavailable');
     const venue = await findMusicVenueForPhotoAggregation(req.params.venue_id);
     if (!venue) return res.status(404).json({ ok: false, error: 'venue_not_found' });
-    const acquired = await acquireImportLock({ section: 'music', category: 'shows', owner: getImportLockOwner(),
-      meta: { operation: 'venue_photo_census', venue_id: venue.venue_key || venue.venue_id } });
-    if (!acquired.acquired) return res.status(409).json({ ok: false, error: 'music_shows_locked' });
-    if (acquired.bypassed || !acquired.lock) throw new Error('active_lock_required');
-    lock = acquired.lock;
-    result = await musicVenuePhotoCensusService().refresh(venue, lock);
+    result = await withMusicVenueCensusGate(dbPool, async (ownedDb, signal) => {
+      await assertMusicVenueCensusReconciled(ownedDb, venue.venue_key || venue.venue_id);
+      const acquired = await acquireImportLock({ section: 'music', category: 'shows', owner: getImportLockOwner(),
+        meta: { operation: 'venue_photo_census', venue_id: venue.venue_key || venue.venue_id } });
+      if (!acquired.acquired) throw Object.assign(new Error('music_shows_locked'), { status: 409 });
+      if (acquired.bypassed || !acquired.lock) throw new Error('active_lock_required');
+      lock = acquired.lock;
+      let value;
+      const scope = createCensusRequestScope({ fetchJson: fetchSmugJson, signal,
+        deadline: Math.min(Date.now() + 90000, Date.parse(lock.expires_at) - 5000) });
+      try { value = await musicVenuePhotoCensusService(ownedDb, scope.fetchJson).refresh(venue, lock); return value; }
+      finally {
+        await scope.close();
+        if (!ownedDb.isHealthy()) throw new Error('census_connection_lost');
+        const released = await releaseImportLock(lock.id, value?.complete ? 'completed' : 'failed', { operation: 'venue_photo_census' });
+        if (!released || String(released.id) !== String(lock.id) || released.status !== (value?.complete ? 'completed' : 'failed'))
+          throw new Error('import_lock_release_failed');
+        lock = null;
+      }
+    });
     return res.json({ ok: true, photo_census: result });
-  } catch (_) {
+  } catch (error) {
+    if (error.status === 409) return res.status(409).json({ ok: false,
+      error: ['census_operation_active', 'prior_operation_requires_reconciliation'].includes(error.code) ? error.code : 'music_shows_locked' });
     return res.status(503).json({ ok: false, error: 'venue_photo_census_refresh_failed',
       photo_census: { total: null, status: 'unavailable', complete: false } });
-  } finally {
-    if (lock) await releaseImportLock(lock.id, result?.complete ? 'completed' : 'failed', { operation: 'venue_photo_census' });
   }
 });
 

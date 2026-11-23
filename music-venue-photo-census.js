@@ -203,11 +203,12 @@ function createMusicVenuePhotoCensus({ db, fetchJson, getImages, dateFolder }) {
       return project(plan, rows);
     } catch { return { ...project(plan, []), issues: [{ reason: 'snapshot_storage_unavailable' }] }; }
   }
-  async function refresh(venue, lock) {
+  async function refresh(venue, lock, runtime = {}) {
     if (!lock?.id || !Number.isFinite(Date.parse(lock.expires_at))) throw new Error('active_lock_required');
     const plan = buildPlan(venue, await source(db), dateFolder);
     const result = await scan(plan, { fetchJson, getImages,
-      deadline: Math.min(Date.now() + 90000, Date.parse(lock.expires_at) - 5000) });
+      deadline: Math.min(Date.now() + 90000, Date.parse(lock.expires_at) - 5000,
+        Number.isFinite(runtime.deadline) ? runtime.deadline : Infinity) });
     const client = await db.connect();
     try {
       await client.query('BEGIN');
@@ -220,14 +221,22 @@ function createMusicVenuePhotoCensus({ db, fetchJson, getImages, dateFolder }) {
         result.total = null; result.complete = false; result.status = 'incomplete'; result.verifiedAt = null;
         result.issues.push({ reason: 'venue_relationships_changed_during_scan' });
       }
+      if (runtime.batchOperationId && (runtime.signal?.aborted || Date.now() >= runtime.deadline)) {
+        result.total = null; result.complete = false; result.status = 'incomplete'; result.verifiedAt = null;
+        result.issues.push({ reason: runtime.signal?.aborted ? 'batch_cancelled' : 'batch_deadline_reached' });
+      }
       for (const suffix of result.complete ? ['attempt', 'verified'] : ['attempt']) {
         await client.query(`INSERT INTO stats_snapshots (section, category, snapshot_key, data, generated_at, meta)
           VALUES ('music', 'venues', $1, $2::jsonb, $3, $4::jsonb)
           ON CONFLICT (section, category, snapshot_key) DO UPDATE SET data = EXCLUDED.data,
             generated_at = EXCLUDED.generated_at, meta = EXCLUDED.meta`,
         [`${snapshotKey(plan.venue_id)}:${suffix}`, JSON.stringify(result), result.scannedAt,
-          JSON.stringify({ operation: 'venue_photo_census', definition: DEFINITION })]);
+          JSON.stringify({ operation: 'venue_photo_census', definition: DEFINITION,
+            ...(runtime.batchOperationId ? { batchOperationId: runtime.batchOperationId } : {}) })]);
       }
+      if (typeof runtime.onPersist === 'function') await runtime.onPersist(client, result);
+      if (runtime.batchOperationId && result.complete &&
+          (runtime.signal?.aborted || Date.now() >= runtime.deadline)) throw new Error('batch_publish_deadline_reached');
       await client.query('COMMIT');
       return result;
     } catch (error) { await client.query('ROLLBACK'); throw error; }
