@@ -592,14 +592,18 @@ function logStartupEnvironmentWarnings() {
 // Contact owns its CORS/body limits; mount before the shared public CORS handler.
 app.use('/api/contact', createContactRouter());
 
-// Legacy-only batch control must precede V3 session validation: previews/status
-// never touch sessions, initialize tables, acquire locks, or enumerate providers.
-app.use('/api/admin/music/venue-photo-census/batches', allowCors, (req, res, next) => {
+const v3AdminAuthRouter = createV3AdminAuthRouter({ db: dbPool });
+
+// Census batch control owns its CORS/auth before shared middleware. Session checks
+// are read-only, including POST previews; no session activity write or dev bypass.
+app.use('/api/admin/music/venue-photo-census/batches', v3AdminAuthRouter.censusBatchCors, async (req, res, next) => {
   res.set('Cache-Control', 'no-store');
   const secrets = getConfiguredAdminSecrets();
-  if (!secrets.length || !getRequestAdminTokens(req).some(token => adminTokenMatches(token, secrets)))
+  if (secrets.length && getRequestAdminTokens(req).some(token => adminTokenMatches(token, secrets))) return next();
+  const authorized = await v3AdminAuthRouter.authorizeSession(req, res, { readOnly: true });
+  if (authorized === true) return next();
+  if (authorized === null)
     return res.status(401).json({ ok: false, error: 'admin_required' });
-  next();
 }, express.json({ limit: '16kb' }), async (req, res) => {
   const controller = new AbortController();
   const abort = () => { if (!res.writableEnded) controller.abort(); };
@@ -608,6 +612,8 @@ app.use('/api/admin/music/venue-photo-census/batches', allowCors, (req, res, nex
     if (!String(process.env.DATABASE_URL || '').trim())
       return res.status(503).json({ ok: false, error: 'database_unavailable' });
     const service = musicVenuePhotoCensusBatchService();
+    if (req.method === 'GET' && /^\/operations\/recent\/?$/.test(req.path))
+      return res.json(await service.discover());
     const status = /^\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})\/?$/.exec(req.path);
     if (req.method === 'GET' && status) return res.json(await service.status(status[1]));
     if (!['', '/'].includes(req.path)) return res.status(404).json({ ok: false, error: 'batch_route_not_found' });
@@ -632,7 +638,6 @@ app.use('/api/admin/music/venue-photo-census/batches', allowCors, (req, res, nex
   }
 }, (error, req, res, next) => res.status(400).json({ ok: false, error: 'invalid_batch_request' }));
 
-const v3AdminAuthRouter = createV3AdminAuthRouter({ db: dbPool });
 app.use('/api/v3/admin/auth', v3AdminAuthRouter);
 app.use((req, res, next) => {
   const protectedPath = String(req.path || '').toLowerCase().replace(/\/+$/, '') || '/';

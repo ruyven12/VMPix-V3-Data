@@ -6,6 +6,8 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const { createV3AdminAuthRouter } = require('../v3-admin-auth');
+const { createV3AdminSessionManager } = require('../v3-admin-session');
 const { DEFINITION, buildPlan, createMusicVenuePhotoCensus } = require('../music-venue-photo-census');
 const { normalizeBatchOptions, planMusicVenueCensusBatch, withMusicVenueCensusGate,
   createMusicVenuePhotoCensusBatch } = require('../music-venue-photo-census-batch');
@@ -111,6 +113,18 @@ class StagedDb {
       return { rows: clone(rows) };
     }
     if (/SELECT show_id.*FROM music_shows/s.test(text)) return { rows: clone(this.shows) };
+    if (/SELECT s.snapshot_key, s.data FROM stats_snapshots s/.test(text)) {
+      assert.equal(c.readOnly, true);
+      assert.match(text, /substring\(s.snapshot_key FROM \$1::integer\)/);
+      const lease = this.activeLease;
+      const active = row => row.data.status === 'running' && lease?.status === 'running' &&
+        lease.meta?.operationId === row.snapshot_key.slice(values[0] - 1) && Date.parse(lease.expires_at) > this.clock();
+      let rows = [...(c.tx || this.rows)].map(([snapshot_key, row]) => ({ snapshot_key, ...clone(row) }))
+        .filter(row => row.snapshot_key.startsWith(values[1]))
+        .filter(row => !!active(row) === !text.includes('IS NOT TRUE'))
+        .sort((a, b) => b.generated_at.localeCompare(a.generated_at) || a.snapshot_key.localeCompare(b.snapshot_key));
+      return { rows: rows.slice(0, values[2]) };
+    }
     if (/^SELECT .*FROM stats_snapshots/s.test(text)) {
       let rows = [...(c.tx || this.rows)].map(([snapshot_key, row]) => ({ snapshot_key, ...clone(row) }));
       if (/snapshot_key = ANY/.test(text)) rows = rows.filter(row => values[0].includes(row.snapshot_key));
@@ -363,9 +377,9 @@ test('absolute budget stops further venues after time is consumed by provider wo
 });
 
 
-function routeHarness({ secrets = [], tokens = [], service, configured = true, databaseConfigured = true } = {}) {
+function routeHarness({ secrets = [], tokens = [], service, configured = true, databaseConfigured = true, authRouter } = {}) {
   const source = fs.readFileSync(require.resolve('../server.js'), 'utf8');
-  const a = source.indexOf('// Legacy-only batch control'), b = source.indexOf('\nconst v3AdminAuthRouter =', a);
+  const a = source.indexOf('// Census batch control owns'), b = source.indexOf("\napp.use('/api/v3/admin/auth'", a);
   assert(a >= 0 && b > a);
   let handlers, factories = 0, parses = 0, sessionValidations = 0;
   const operations = [];
@@ -373,7 +387,8 @@ function routeHarness({ secrets = [], tokens = [], service, configured = true, d
     preview: async input => { operations.push(['preview', input]); return { ok: true, mode: 'dry-run', databaseMutated: false }; },
     execute: async input => { operations.push(['execute', input]); const options = normalizeBatchOptions(input);
       return { ok: true, mode: options.mode, databaseMutated: options.mode === 'execute' }; },
-    status: async id => { operations.push(['status', id]); return { ok: true, operationId: id }; }
+    status: async id => { operations.push(['status', id]); return { ok: true, operationId: id }; },
+    discover: async () => { operations.push(['discover']); return { ok: true, active: [], recent: [] }; }
   };
   const context = vm.createContext({
     AbortController, process: { env: { DATABASE_URL: databaseConfigured ? 'postgres://fixture.invalid/not-connected' : '' } },
@@ -385,19 +400,30 @@ function routeHarness({ secrets = [], tokens = [], service, configured = true, d
     adminTokenMatches: (token, expected) => expected.includes(token),
     musicVenuePhotoCensusBatchService: () => { factories++; return mockService; },
     isSmugMugConfigured: () => configured,
-    v3AdminAuthRouter: { authorizeSession: () => { sessionValidations++; throw Error('session validator must not run'); } }
+    v3AdminAuthRouter: authRouter || {
+      censusBatchCors: (req, res, next) => next(),
+      authorizeSession: async (req, res, options) => {
+        sessionValidations++; assert.equal(options.readOnly, true);
+        res.status(401).json({ ok: false, error: 'admin_required' }); return false;
+      }
+    }
   });
   vm.runInContext(source.slice(a, b), context);
   return {
     operations,
     counts: () => ({ factories, parses, sessionValidations }),
-    async request({ method = 'GET', path = '/', body, query = {}, session = true } = {}) {
-      const req = Object.assign(new EventEmitter(), { method, path, body, query });
+    async request({ method = 'GET', path = '/', body, query = {}, session = true, headers = {} } = {}) {
+      const req = Object.assign(new EventEmitter(), { method, path, body, query, headers });
       const res = Object.assign(new EventEmitter(), {
         locals: { v3AdminSessionAuthorized: session }, code: 200, writableEnded: false,
-        set() {}, status(code) { this.code = code; return this; },
+        headers: {}, set(key, value) { if (typeof key === 'object') Object.assign(this.headers, key); else this.headers[key] = value; return this; },
+        vary() {}, removeHeader(key) { delete this.headers[key]; },
+        end() { this.writableEnded = true; return this; }, status(code) { this.code = code; return this; },
         json(value) { this.body = value; this.writableEnded = true; return this; }
       });
+      let corsAllowed = false;
+      await handlers[0](req, res, () => { corsAllowed = true; });
+      if (!corsAllowed) return res;
       let allowed = false;
       await handlers[1](req, res, () => { allowed = true; });
       if (allowed) {
@@ -408,13 +434,13 @@ function routeHarness({ secrets = [], tokens = [], service, configured = true, d
     }
   };
 }
-test('batch route denies missing or invalid legacy secret before parsing, factory, or V3 session validation', async () => {
+test('batch route denies credentials not authorized by legacy or V3 before parsing or factory', async () => {
   for (const config of [{ secrets: [], tokens: ['synthetic-session'] },
     { secrets: ['synthetic-legacy'], tokens: ['invalid-session-token'] }]) {
     const route = routeHarness(config);
     const res = await route.request({ method: 'POST', body: { mode: 'execute', confirm: true }, session: true });
     assert.equal(res.code, 401); assert.equal(res.body.error, 'admin_required');
-    assert.deepEqual(route.counts(), { factories: 0, parses: 0, sessionValidations: 0 });
+    assert.deepEqual(route.counts(), { factories: 0, parses: 0, sessionValidations: 1 });
     assert.equal(route.operations.length, 0);
   }
 });
@@ -627,5 +653,130 @@ test('missing DATABASE_URL rejects every authorized batch mode before factory or
     assert.equal(route.counts().factories, 0); assert.equal(route.counts().sessionValidations, 0);
     assert.equal(route.operations.length, 0);
   }
+});
+
+const ADMIN_ORIGIN = 'https://vmpix-v3.onrender.com';
+const ADMIN_TOKEN = 'a'.repeat(64); // Synthetic; never read application environment/credentials.
+const ADMIN_HEADERS = { origin: ADMIN_ORIGIN, authorization: 'Bearer ' + ADMIN_TOKEN, 'x-v3-admin-request': '1' };
+function adminFixture({ invalid = false, unavailable = false, enabled = true } = {}) {
+  const queries = [];
+  const db = { query: async (sql, values) => {
+    queries.push({ sql, values });
+    if (unavailable) throw Error('PRIVATE_SYNTHETIC_DB_DETAIL');
+    assert.match(sql, /FROM admin_sessions/);
+    assert.match(sql, /token_digest = \$1::bytea/);
+    assert.match(sql, /revoked_at IS NULL/);
+    for (const field of ['expires_at', 'created_at', 'last_activity_at']) assert(sql.includes(field));
+    const validDigest = require('node:crypto').createHash('sha256').update(ADMIN_TOKEN).digest();
+    const rows = !invalid && values[0].equals(validDigest) ? [{
+      session_id: '00000000-0000-4000-8000-000000000001', expires_at: new Date(Date.now() + 3600000)
+    }] : [];
+    return { rows, rowCount: rows.length };
+  } };
+  const manager = createV3AdminSessionManager({ db });
+  const router = createV3AdminAuthRouter({ sessions: manager, env: {
+    V3_ADMIN_AUTH_ENABLED: String(enabled), V3_ADMIN_AUTH_ORIGIN: ADMIN_ORIGIN,
+    V3_ADMIN_PASSWORD_HASH: 'scrypt$v1$' + '0'.repeat(32) + '$' + '0'.repeat(64)
+  } });
+  return { router, manager, queries };
+}
+
+test('real Admin validator + batch preview/status/discovery cause no writes, locks, or provider calls', async () => {
+  const x = setup(), auth = adminFixture();
+  seedVerified(x.db, LOST, 457, x.now());
+  x.db.rows.set(journalKey('finished'), { data: { operationId: 'finished', status: 'completed', results: [] },
+    generated_at: new Date(x.now()).toISOString() });
+  const before = clone([...x.db.rows]);
+  const route = routeHarness({ authRouter: auth.router, service: x.svc });
+  for (const request of [{}, { method: 'POST', body: { mode: 'dry-run', forceRefresh: true } },
+    { path: '/finished' }, { path: '/operations/recent' }]) {
+    const res = await route.request({ ...request, headers: ADMIN_HEADERS });
+    assert.equal(res.code, 200); assert.equal(res.body.ok, true);
+    assert.equal(res.headers['Access-Control-Allow-Origin'], ADMIN_ORIGIN);
+  }
+  assert.equal(auth.queries.length, 4);
+  assert(auth.queries.every(({ sql }) => !/\b(UPDATE|INSERT|DELETE|FOR UPDATE|pg_.*lock)\b/i.test(sql)));
+  assert(x.db.log.every(({ text }) => !/\b(UPDATE|INSERT|DELETE|CREATE|ALTER|pg_.*lock)\b/i.test(text)));
+  assert.deepEqual([...x.db.rows], before); assert.equal(x.db.commits.length, 0);
+  assert.equal(x.calls.length, 0); assert.equal(x.lease.acquired, 0); assert.equal(x.db.gate, null);
+});
+
+test('expired/revoked/unrecognized Admin session and non-admin token cannot reach batch operations', async () => {
+  for (const request of [{ invalid: true, headers: ADMIN_HEADERS },
+    { headers: { ...ADMIN_HEADERS, authorization: 'Bearer ' + 'b'.repeat(64) } },
+    { headers: { ...ADMIN_HEADERS, authorization: 'Bearer invalid' } },
+    { headers: { origin: ADMIN_ORIGIN, 'x-v3-admin-request': '1' } }]) {
+    const auth = adminFixture(request), route = routeHarness({ authRouter: auth.router });
+    const res = await route.request({ headers: request.headers, method: 'POST', body: exec('unauthorized') });
+    assert.equal(res.code, 401); assert.equal(route.operations.length, 0);
+    assert.equal(route.counts().parses, 0); assert.equal(route.counts().factories, 0);
+  }
+  const auth = adminFixture({ unavailable: true }), route = routeHarness({ authRouter: auth.router });
+  const res = await route.request({ headers: ADMIN_HEADERS });
+  assert.equal(res.code, 503); assert(!JSON.stringify(res.body).includes('PRIVATE_SYNTHETIC_DB_DETAIL'));
+});
+
+test('read-only session validation retains expiry/revocation policy; unrelated default still touches activity', async () => {
+  const auth = adminFixture();
+  assert.equal((await auth.manager.validateSession(ADMIN_TOKEN, { readOnly: true })).ok, true);
+  assert.equal((await auth.manager.validateSession(ADMIN_TOKEN)).ok, true);
+  const [read, write] = auth.queries.map(item => item.sql);
+  assert(!/UPDATE|FOR UPDATE/.test(read)); assert.match(write, /SET last_activity_at = checked.checked_at/);
+  for (const condition of ['revoked_at IS NULL', 'expires_at > checked_at', 'created_at <= checked_at',
+    'created_at > checked_at - ($2::bigint', 'last_activity_at <= checked_at', 'last_activity_at > checked_at - ($3::bigint']) {
+    assert(read.includes(condition));
+    assert(write.replaceAll('checked.', '').includes(condition));
+  }
+  assert.deepEqual(auth.queries[0].values, auth.queries[1].values);
+});
+
+test('census CORS permits explicit Admin preflights only; legacy remains usable without a session', async () => {
+  const auth = adminFixture({ enabled: false });
+  const route = routeHarness({ authRouter: auth.router, secrets: ['fixture-legacy'], tokens: ['fixture-legacy'] });
+  for (const method of ['GET', 'POST']) {
+    const res = await route.request({ method: 'OPTIONS', headers: { origin: ADMIN_ORIGIN,
+      'access-control-request-method': method,
+      'access-control-request-headers': 'Authorization, Content-Type, X-V3-Admin-Request, X-Admin-Token' } });
+    assert.equal(res.code, 204); assert.equal(res.headers['Access-Control-Allow-Origin'], ADMIN_ORIGIN);
+    assert.equal(res.headers['Access-Control-Allow-Methods'], 'GET, POST, OPTIONS');
+  }
+  for (const headers of [{ origin: 'https://untrusted.invalid', 'access-control-request-method': 'GET' },
+    { origin: ADMIN_ORIGIN, 'access-control-request-method': 'DELETE' },
+    { origin: ADMIN_ORIGIN, 'access-control-request-method': 'POST', 'access-control-request-headers': 'X-Not-Allowed' },
+    { 'access-control-request-method': 'GET' }]) {
+    assert.equal((await route.request({ method: 'OPTIONS', headers })).code, 403);
+  }
+  assert.equal(route.operations.length, 0); assert.equal(auth.queries.length, 0);
+  assert.equal((await route.request()).code, 200);
+  assert.equal((await route.request({ headers: { origin: ADMIN_ORIGIN } })).code, 200);
+  assert.equal((await route.request({ headers: { origin: 'https://untrusted.invalid' } })).code, 403);
+  assert.equal(auth.queries.length, 0);
+  assert.equal((await routeHarness({ authRouter: auth.router }).request()).code, 401);
+});
+
+test('discovery separates active/recent batches, bounds history, and projects only safe journal fields', async () => {
+  const x = setup(), stamp = new Date(x.now()).toISOString(), secret = 'PRIVATE_SYNTHETIC_RELATIONSHIP';
+  for (let i = 0; i < 24; i++) x.db.rows.set(journalKey('past-' + String(i).padStart(2, '0')), {
+    generated_at: stamp, data: { operationId: 'past-' + i, status: i === 0 ? 'stopped' : 'completed',
+      token: secret, source: { shows: secret }, stopReason: secret,
+      results: [{ venue_id: LOST.venue_key, status: i === 0 ? 'failed' : 'success', total: 457,
+        reasons: [secret], raw: secret }], inflight: null }
+  });
+  x.db.rows.set(journalKey('active-one'), { generated_at: '2020-01-01T00:00:00.000Z',
+    data: { operationId: 'active-one', status: 'running', results: [], inflight: { beforeSnapshot: 'a'.repeat(64) } } });
+  x.db.rows.set(journalKey('interrupted'), { generated_at: stamp,
+    data: { operationId: 'interrupted', status: 'running', results: [] } });
+  x.db.activeLease = { status: 'running', expires_at: new Date(x.now() + 60000).toISOString(), meta: { operationId: 'active-one' } };
+  seedVerified(x.db, LOST, 457, x.now());
+  const before = clone([...x.db.rows]), report = await x.svc.discover();
+  assert.equal(report.active.length, 1); assert.equal(report.active[0].operationId, 'active-one');
+  assert.equal(report.active[0].status, 'running'); assert.equal(report.recent.length, 20);
+  assert.equal(report.hasMore.recent, true); assert.equal(report.databaseMutated, false);
+  assert(report.recent.some(item => item.status === 'interrupted'));
+  assert(report.recent.some(item => item.summary.failed === 1));
+  const serialized = JSON.stringify(report);
+  for (const unsafe of [secret, 'beforeSnapshot', 'requestFingerprint', 'token', 'source']) assert(!serialized.includes('"' + unsafe + '"'));
+  assert(!serialized.includes(secret)); assert.deepEqual([...x.db.rows], before);
+  assert.equal(x.calls.length, 0); assert.equal(x.lease.acquired, 0); assert.equal(x.db.commits.length, 0);
 });
 

@@ -309,6 +309,34 @@ function createMusicVenuePhotoCensusBatch({ db, createService, dateFolder, fetch
     if (!job) throw fail('batch_not_found', 404);
     return displayJournal(job, active);
   }
+  async function discover() {
+    return readTransaction(db, async client => {
+      // Separate bounded queries keep an active batch visible even after many past runs.
+      const activeSql = `EXISTS (SELECT 1 FROM import_locks l
+        WHERE l.section = 'music' AND l.category = 'shows' AND l.status = 'running'
+          AND l.expires_at > NOW() AND l.meta->>'operationId' = substring(s.snapshot_key FROM $1::integer))
+        AND s.data->>'status' = 'running'`;
+      const read = async (active, limit) => (await client.query(`
+        SELECT s.snapshot_key, s.data FROM stats_snapshots s
+        WHERE s.section = 'music' AND s.category = 'venues'
+          AND starts_with(s.snapshot_key, $2) AND (${activeSql}) IS ${active ? 'TRUE' : 'NOT TRUE'}
+        ORDER BY s.generated_at DESC, s.snapshot_key LIMIT $3`, [PREFIX.length + 1, PREFIX, limit + 1])).rows;
+      const activeRows = await read(true, 10), recentRows = await read(false, 20);
+      const summarize = (rows, active, limit) => rows.slice(0, limit).map(row => {
+        const id = row.snapshot_key.slice(PREFIX.length);
+        operationKey(id);
+        const value = displayJournal({ ...(row.data || {}), operationId: id }, active);
+        return { operationId: value.operationId, status: value.status, startedAt: value.startedAt,
+          finishedAt: value.finishedAt, summary: value.summary, results: value.results.slice(0, 10),
+          providerRequests: value.providerRequests, stopReason: value.stopReason,
+          requiresReconciliation: value.requiresReconciliation };
+      });
+      return { ok: true, readOnly: true, databaseMutated: false,
+        active: summarize(activeRows, true, 10), recent: summarize(recentRows, false, 20),
+        limits: { active: 10, recent: 20 },
+        hasMore: { active: activeRows.length > 10, recent: recentRows.length > 20 } };
+    });
+  }
   async function execute(input, { signal } = {}) {
     const options = normalizeBatchOptions(input);
     if (options.mode !== 'execute') return preview(options);
@@ -458,7 +486,7 @@ function createMusicVenuePhotoCensusBatch({ db, createService, dateFolder, fetch
         requiresReconciliation: uncertain || !!job.inflight };
     }, { signal });
   }
-  return { preview, status, execute };
+  return { preview, status, discover, execute };
 }
 
 module.exports = { createCensusRequestScope, assertMusicVenueCensusReconciled, normalizeBatchOptions, planMusicVenueCensusBatch: classify, withMusicVenueCensusGate, createMusicVenuePhotoCensusBatch };

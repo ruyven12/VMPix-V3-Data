@@ -143,25 +143,55 @@ function createV3AdminAuthRouter({ db, env = process.env, verifyPassword = verif
     res.vary("Access-Control-Request-Headers");
     return res.status(204).end();
   };
-  const validatedSession = async (req) => {
+  const validatedSession = async (req, options) => {
     const token = readBearer(req);
     if (!token) return { ok: false, error: "invalid_session" };
-    const result = await getSessions().validateSession(token);
+    const result = await getSessions().validateSession(token, options);
     if (result?.ok === true && isSessionId(result.sessionId) && timestamp(result.expiresAt) !== null) return result;
     return result?.ok === false && result.error === "invalid_session" ? result : { ok: false, error: "database_error" };
   };
 
   // Called only for existing protected routes, after legitimate legacy credentials have matched.
-  Object.defineProperty(router, "authorizeSession", { value: async (req, res) => {
+  Object.defineProperty(router, "authorizeSession", { value: async (req, res, options) => {
     if (!sessionAttempt(req) && !enabled) return null;
     if (!requestAllowed(req, res)) return false;
     try {
-      const result = await validatedSession(req);
+      const result = await validatedSession(req, options);
       if (result.ok === true && connected(req, res)) return true;
       respond(req, res, result.error === "invalid_session" ? 401 : 503,
         result.error === "invalid_session" ? "invalid_session" : "authentication_unavailable");
     } catch { respond(req, res, 503, "authentication_unavailable"); }
     return false;
+  } });
+  // Only the census batch mount uses this boundary. Legacy CLI requests may omit
+  // Origin; browser access is limited to the same explicit V3 Admin origin.
+  Object.defineProperty(router, "censusBatchCors", { value: (req, res, next) => {
+    securityHeaders(res);
+    res.vary("Origin");
+    res.removeHeader("Access-Control-Allow-Credentials");
+    const origin = req.headers.origin;
+    if (!uniqueHeaders(req) || origin !== undefined && origin !== FRONTEND_ORIGIN) {
+      res.removeHeader("Access-Control-Allow-Origin");
+      return respond(req, res, 403, "request_rejected");
+    }
+    if (origin === FRONTEND_ORIGIN) res.set("Access-Control-Allow-Origin", origin);
+    if (req.method === "OPTIONS") {
+      res.vary("Access-Control-Request-Method"); res.vary("Access-Control-Request-Headers");
+      const requested = req.headers["access-control-request-headers"] || "";
+      const allowed = new Set([...CORS_HEADERS, "x-admin-token"]);
+      if (!origin || !["GET", "POST"].includes(req.headers["access-control-request-method"]) ||
+          typeof requested !== "string" || requested.length > 256 ||
+          requested && requested.split(",").some(name => !allowed.has(name.trim().toLowerCase())))
+        return respond(req, res, 403, "request_rejected");
+      res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-V3-Admin-Request, X-Admin-Token");
+      return res.status(204).end();
+    }
+    if (!["GET", "POST"].includes(req.method)) {
+      res.set("Allow", "GET, POST, OPTIONS");
+      return respond(req, res, 405, "method_not_allowed");
+    }
+    return next();
   } });
   Object.defineProperty(router, "controlPlaneCors", { value: (req, res, next) => {
     const requested = req.headers["access-control-request-headers"];

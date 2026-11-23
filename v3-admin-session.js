@@ -51,6 +51,19 @@ SET revoked_at = COALESCE(revoked_at, GREATEST(created_at, clock_timestamp()))
 WHERE session_id = $1::uuid
 RETURNING session_id, created_at, revoked_at`;
 
+// Census previews/polling check the same expiry policy without locks or activity writes.
+const READ_ONLY_VALIDATE_SQL = `
+WITH checked AS (SELECT clock_timestamp() AS checked_at)
+SELECT session_id, expires_at
+FROM admin_sessions, checked
+WHERE token_digest = $1::bytea
+  AND revoked_at IS NULL
+  AND expires_at > checked_at
+  AND created_at <= checked_at
+  AND created_at > checked_at - ($2::bigint * INTERVAL '1 millisecond')
+  AND last_activity_at <= checked_at
+  AND last_activity_at > checked_at - ($3::bigint * INTERVAL '1 millisecond')`;
+
 function isSessionId(value) {
   return typeof value === "string" && value.length === 36 && UUID_PATTERN.test(value);
 }
@@ -126,7 +139,7 @@ function createV3AdminSessionManager(options = {}) {
     }
   }
 
-  async function validateSession(token) {
+  async function validateSession(token, { readOnly = false } = {}) {
     if (typeof token !== "string" || token.length !== 64 || !TOKEN_PATTERN.test(token)) return INVALID_SESSION;
     let digest;
     try {
@@ -136,7 +149,8 @@ function createV3AdminSessionManager(options = {}) {
       return INTERNAL_ERROR;
     }
     try {
-      const row = singleRow(await query(VALIDATE_SQL, [digest, policy.absoluteLifetimeMs, policy.idleTimeoutMs]));
+      const row = singleRow(await query(readOnly === true ? READ_ONLY_VALIDATE_SQL : VALIDATE_SQL,
+        [digest, policy.absoluteLifetimeMs, policy.idleTimeoutMs]));
       if (!row) return INVALID_SESSION;
       const expiresAt = timestamp(row.expires_at);
       if (expiresAt === null) return DATABASE_ERROR;
