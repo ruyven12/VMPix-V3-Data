@@ -6,6 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const storeModule = require('../music-people-relationship-store');
 const { createMusicPeopleReadiness } = require('../music-people-readiness');
+const { databasePool, disconnected } = require('./db-resilience-fixture');
 const { projectSource, readSource, createMusicPeopleRelationshipStore, describeRelationships } = storeModule;
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -165,10 +166,11 @@ test('generic stats payloads and health exclude only the private population name
 
 async function boot(db, provider = async () => ({ Response: { AlbumImage: [], Pages: { Total: 0, Start: 1 } } })) {
   let app, listened = false, providerCalls = 0, serverLoads = 0;
+  const listening = deferred();
   const noop = () => {};
   const express = () => {
     app = new Proxy({ routes: new Map(), locals: {}, get(route, ...handlers) { this.routes.set(route, handlers.at(-1)); return this; },
-      listen(_port, callback) { listened = true; callback(); return { close: noop }; } },
+      listen(_port, callback) { listened = true; callback(); listening.resolve(); return { close: noop }; } },
     { get(target, key) { return key in target ? target[key] : () => app; } });
     return app;
   };
@@ -198,6 +200,13 @@ async function boot(db, provider = async () => ({ Response: { AlbumImage: [], Pa
     fetch: async () => { providerCalls++; return { ok: true, json: () => provider() }; } });
   assert.equal(require('../package.json').scripts.start, 'node server-runtime.js');
   vm.runInContext(fs.readFileSync(require.resolve('../server-runtime.js'), 'utf8'), ctx, { filename: 'server-runtime.js' });
+  let startupTimer;
+  try {
+    await Promise.race([listening.promise, new Promise((_, reject) => {
+      startupTimer = setTimeout(() => reject(Error('mock startup did not listen')), 1000);
+    })]);
+    await vm.runInContext('musicPeopleSourceCheck', ctx);
+  } finally { clearTimeout(startupTimer); }
   for (let n = 0; n < 15; n++) await tick();
   assert(listened); assert.equal(serverLoads, 1);
   return { ctx, calls: () => providerCalls, publicResponse: () => vm.runInContext("buildMusicPeoplePublicDbResponse()", ctx), async request(route, query = {}) {
@@ -260,4 +269,87 @@ test('public response and item-default readiness suppress reassigned identity pa
   assert(response.data.every(row => row.verified_photo_count === null && !row.matched_photos?.length));
   const item = vm.runInContext("buildMusicPersonDbApiItem({person_id:1,name:'Reassigned Identity',stats:{photo_count:0}}, musicPeopleReadiness.read())", runtime.ctx);
   assert.equal(item.verified_photo_count, null); assert.equal(item.photo_count, 0); assert(!item.matched_photos?.length);
+});
+
+test('REAL startup with db.js pool has no checkout during provider scan and survives an idle disconnect', async t => {
+  const f = databasePool(), held = deferred(); t.after(() => f.pool.end());
+  const runtime = await boot(f.pool, () => held.promise);
+  try {
+    assert.equal(runtime.calls(), 1);
+    assert.equal(f.pool.totalCount - f.pool.idleCount, 0);
+    const preparing = await runtime.request('/api/music/people/db', { archive: 'cache' });
+    assert.equal(preparing.relationship_readiness.authoritative, false);
+    assert.equal(preparing.relationship_readiness.status, 'preparing');
+    f.state.clients.at(-1).emit('error', disconnected()); await tick();
+    held.resolve({ Response: { AlbumImage: [], Pages: { Total: 0, Start: 1 } } });
+    for (let n = 0; n < 30 && !f.state.data; n++) await tick();
+    const ready = await runtime.request('/api/music/people/db/:personId');
+    assert.equal(ready.relationship_readiness.authoritative, true);
+    assert.equal(ready.verified_photo_count, 0); assert.equal(runtime.calls(), 1);
+    assert.equal(f.pool.totalCount - f.pool.idleCount, 0); assert.equal(f.pool.waitingCount, 0);
+  } finally { held.resolve({ Response: { AlbumImage: [], Pages: { Total: 0, Start: 1 } } }); }
+});
+
+test('REAL startup restores List/Detail after pool replacement and never re-enumerates provider', async t => {
+  const f = databasePool(), store = createMusicPeopleRelationshipStore({ db: f.pool });
+  await store.publish({ source: await readSource(f.pool), value: new Map([['1', empty(3)]]), generation: 1 });
+  const verified = f.state.data.verified_at; await f.pool.end();
+  const restarted = databasePool(f.state); t.after(() => restarted.pool.end());
+  const runtime = await boot(restarted.pool, () => { throw Error('provider must not run'); });
+  const list = await runtime.request('/api/music/people/db', { archive: 'cache' });
+  restarted.state.clients.at(-1).emit('error', disconnected()); await tick();
+  const detail = await runtime.request('/api/music/people/db/:personId');
+  assert.equal(list.data[0].verified_photo_count, 3); assert.equal(detail.verified_photo_count, 3);
+  assert.equal(list.relationship_readiness.completed_at, verified);
+  assert.equal(detail.relationship_readiness.completed_at, verified);
+  assert.equal(runtime.calls(), 0); assert.equal(restarted.pool.totalCount - restarted.pool.idleCount, 0);
+});
+
+test('REAL runtime publication disconnect stays non-authoritative until intentional Retry succeeds', async t => {
+  const f = databasePool(); t.after(() => f.pool.end());
+  let writes = 0;
+  f.state.hook = (sql, client, when) => {
+    if (sql.startsWith('INSERT INTO stats_snapshots') && when === 'before') { writes++; client.emit('error', disconnected()); }
+  };
+  const runtime = await boot(f.pool);
+  for (let n = 0; n < 30 && !writes; n++) await tick();
+  const failed = await runtime.request('/api/music/people/db/:personId');
+  assert.equal(failed.relationship_readiness.status, 'error');
+  assert.equal(failed.relationship_readiness.authoritative, false);
+  assert.equal(failed.verified_photo_count, null); assert.equal(f.state.data, null);
+  await runtime.request('/api/music/people/db', { archive: 'cache' }); assert.equal(writes, 1);
+  f.state.hook = null;
+  const recovered = await runtime.request('/api/music/people/db/:personId', { retry_relationships: '1' });
+  assert.equal(recovered.relationship_readiness.authoritative, true);
+  assert.equal(recovered.verified_photo_count, 0); assert.equal(runtime.calls(), 1);
+  assert.equal(f.pool.totalCount - f.pool.idleCount, 0);
+});
+
+test('REAL runtime snapshot-read interruption recovers once and source failure withholds authority until verified', async t => {
+  const f = databasePool(), store = createMusicPeopleRelationshipStore({ db: f.pool }); t.after(() => f.pool.end());
+  await store.publish({ source: await readSource(f.pool), value: new Map([['1', empty(3)]]), generation: 0 });
+  let reads = 0;
+  f.state.hook = (sql, client, when) => {
+    if (sql.includes('SELECT data FROM stats_snapshots') && when === 'before' && reads++ === 0) client.emit('error', disconnected());
+  };
+  const runtime = await boot(f.pool); assert.equal(reads, 2); assert.equal(runtime.calls(), 0);
+  f.state.hook = (sql, client, when) => {
+    if (sql.includes('AS people') && when === 'before') client.emit('error', disconnected());
+  };
+  const failed = await runtime.request('/api/music/people/db/:personId');
+  assert.equal(failed.relationship_readiness.authoritative, false); assert.equal(failed.verified_photo_count, null);
+  f.state.hook = null;
+  const recovered = await runtime.request('/api/music/people/db/:personId', { retry_relationships: '1' });
+  assert.equal(recovered.verified_photo_count, 3); assert.equal(runtime.calls(), 0);
+});
+
+test('REAL runtime source invalidation reloads the matching durable generation, not the old restore promise', async t => {
+  const f = databasePool(), store = createMusicPeopleRelationshipStore({ db: f.pool }); t.after(() => f.pool.end());
+  await store.publish({ source: await readSource(f.pool), value: new Map([['1', empty(3)]]), generation: 0 });
+  const runtime = await boot(f.pool);
+  f.state.people[0] = { ...f.state.people[0], aliases: ['New exact alias'] };
+  await store.publish({ source: await readSource(f.pool), value: new Map([['1', empty(8)]]), generation: 1 });
+  const detail = await runtime.request('/api/music/people/db/:personId');
+  assert.equal(detail.verified_photo_count, 8); assert.equal(detail.relationship_readiness.authoritative, true);
+  assert.equal(runtime.calls(), 0);
 });

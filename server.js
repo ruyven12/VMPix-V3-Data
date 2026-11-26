@@ -2064,12 +2064,15 @@ async function restoreMusicPeopleRelationshipSnapshot(source, reconcile = false)
     const value = await musicPeopleRelationshipStore.load(source);
     const previous = describeMusicPeopleRelationships(musicPeopleReadiness.read());
     const restored = describeMusicPeopleRelationships(value);
+    const sourceRecovered = musicPeopleReadiness.snapshot(new Map()).reason === 'source_check_failed';
     if (value && musicPeopleSourceSnapshot?.fingerprint === source.fingerprint
-      && (!previous || Date.parse(restored.verifiedAt) > Date.parse(previous.verifiedAt))) musicPeopleReadiness.restore(value);
+      && (!previous || Date.parse(restored.verifiedAt) > Date.parse(previous.verifiedAt)
+        || sourceRecovered && restored.verifiedAt === previous.verifiedAt)) musicPeopleReadiness.restore(value);
   };
   if (reconcile) { await load(); return; }
   if (!musicPeopleRestorePromise) musicPeopleRestorePromise = load().catch(() => {
-    musicPeopleReadiness.fail('persistence_failed', { preserveCache: true });
+    if (musicPeopleSourceSnapshot?.fingerprint === source.fingerprint)
+      musicPeopleReadiness.fail('persistence_failed', { preserveCache: true });
   });
   await musicPeopleRestorePromise;
 }
@@ -2082,6 +2085,7 @@ async function checkMusicPeopleRelationshipSource() {
       if (musicPeopleSourceVersion !== null && musicPeopleSourceVersion !== source.fingerprint) {
         musicPeopleSourceGeneration++;
         musicPeopleReadiness.invalidate('source_changed', { resetError: true });
+        musicPeopleRestorePromise = null;
         smugMusicPeopleArchiveAlbumPhotosCache.clear();
       }
       musicPeopleSourceVersion = source.fingerprint;
@@ -2115,6 +2119,7 @@ async function buildMusicPeopleArchiveRelationships({ retry = false, refresh = f
         musicPeopleSourceGeneration++;
         musicPeopleSourceVersion = null;
         musicPeopleSourceSnapshot = null;
+        musicPeopleRestorePromise = null;
         musicPeopleReadiness.invalidate('source_changed', { resetError: true });
         smugMusicPeopleArchiveAlbumPhotosCache.clear();
       }

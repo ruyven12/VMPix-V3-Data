@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { guardClient, clientFailure, isConnectionError, retryDatabaseRead } = require('./db-resilience');
 const VERSION = 1;
 const DEFINITION = 'music_people_linked_album_caption_relationships_v1';
 const SNAPSHOT_KEY = 'relationship_population:v1';
@@ -38,10 +39,11 @@ function projectSource(people, shows) {
   return { people: population, shows: albums, identities, fingerprint };
 }
 
-async function readSource(db) {
-  const result = await db.query(`SELECT
+async function readSource(db, { retry = true } = {}) {
+  const read = () => db.query(`SELECT
     coalesce((SELECT jsonb_agg(p) FROM (${PEOPLE_SQL}) p), '[]'::jsonb) AS people,
     coalesce((SELECT jsonb_agg(s) FROM (${SHOWS_SQL}) s), '[]'::jsonb) AS shows`);
+  const result = await (retry ? retryDatabaseRead(read) : read());
   const row = result.rows?.[0];
   if (!Array.isArray(row?.people) || !Array.isArray(row?.shows)) throw failure('source_check_failed');
   return projectSource(row.people, row.shows);
@@ -134,20 +136,21 @@ function matchesIdentity(value, row) {
 
 function createMusicPeopleRelationshipStore({ db, now = Date.now }) {
   async function load(source) {
-    const result = await db.query(`SELECT data FROM stats_snapshots
-      WHERE section = 'music' AND category = 'people' AND snapshot_key = $1`, [SNAPSHOT_KEY]);
+    const result = await retryDatabaseRead(() => db.query(`SELECT data FROM stats_snapshots
+      WHERE section = 'music' AND category = 'people' AND snapshot_key = $1`, [SNAPSHOT_KEY]));
     return decode(result.rows?.[0]?.data, source);
   }
   async function publish({ source, value, generation, startedAt = new Date(now()).toISOString(), coverage = { total_albums: 0, albums_processed: 0, pages_processed: 0, albums_from_cache: 0 }, isCancelled = () => false }) {
-    const client = await db.connect();
+    let client;
     let damaged = false;
     try {
+      client = guardClient(await db.connect());
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       await client.query("SET LOCAL lock_timeout = '3000ms'");
       await client.query("SET LOCAL statement_timeout = '10000ms'");
       await client.query('LOCK TABLE music_people, music_shows IN SHARE MODE');
       await client.query("SELECT pg_advisory_xact_lock(hashtext('music_people_relationship_population_v1'))");
-      const current = await readSource(client);
+      const current = await readSource(client, { retry: false });
       if (isCancelled() || current.fingerprint !== source.fingerprint) throw failure('preparation_invalidated');
       const verifiedAt = new Date(now()).toISOString();
       const previous = await client.query(`SELECT data FROM stats_snapshots
@@ -155,6 +158,7 @@ function createMusicPeopleRelationshipStore({ db, now = Date.now }) {
       const newer = decode(previous.rows?.[0]?.data, current);
       if (newer && Date.parse(describeRelationships(newer).startedAt) > Date.parse(startedAt)) {
         await client.query('COMMIT');
+        if (clientFailure(client)) throw clientFailure(client);
         return newer;
       }
       const envelope = encode(current, value, generation, verifiedAt, startedAt, coverage);
@@ -166,14 +170,18 @@ function createMusicPeopleRelationshipStore({ db, now = Date.now }) {
       [SNAPSHOT_KEY, JSON.stringify(envelope), verifiedAt, JSON.stringify({ definition: DEFINITION, version: VERSION })]);
       if (isCancelled()) throw failure('preparation_invalidated');
       await client.query('COMMIT');
+      if (clientFailure(client)) throw clientFailure(client);
       return decode(envelope, current);
     } catch (error) {
-      try { await client.query('ROLLBACK'); } catch (_) { damaged = true; }
+      damaged = !!clientFailure(client) || isConnectionError(error);
+      if (client && !damaged) {
+        try { await client.query('ROLLBACK'); } catch (_) { damaged = true; }
+      }
       if (!['preparation_invalidated', 'source_check_failed', 'persistence_invalid'].includes(error?.code)) {
         throw failure('persistence_failed');
       }
       throw error;
-    } finally { client.release(damaged); }
+    } finally { if (client) client.release(damaged || !!clientFailure(client)); }
   }
   return { load, publish };
 }
