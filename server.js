@@ -244,6 +244,9 @@ let musicPeopleSourceCheck = null;
 let musicPeopleSourceGeneration = 0;
 let musicPeopleSourceSnapshot = null;
 let musicPeopleRestorePromise = null;
+// Retain only the completed population, never an authoritative public cache,
+// until publication succeeds or the source fingerprint changes.
+let musicPeopleCompletedPreparation = null;
 const smugBandArchiveCoverageCache = new Map();
 const smugBandArchiveCoverageInFlight = new Map();
 
@@ -2067,7 +2070,11 @@ async function restoreMusicPeopleRelationshipSnapshot(source, reconcile = false)
     const sourceRecovered = musicPeopleReadiness.snapshot(new Map()).reason === 'source_check_failed';
     if (value && musicPeopleSourceSnapshot?.fingerprint === source.fingerprint
       && (!previous || Date.parse(restored.verifiedAt) > Date.parse(previous.verifiedAt)
-        || sourceRecovered && restored.verifiedAt === previous.verifiedAt)) musicPeopleReadiness.restore(value);
+        || sourceRecovered && restored.verifiedAt === previous.verifiedAt)) {
+      if (musicPeopleReadiness.restore(value) && musicPeopleCompletedPreparation?.fingerprint === source.fingerprint
+        && Date.parse(restored.startedAt) >= Date.parse(musicPeopleCompletedPreparation.startedAt))
+        musicPeopleCompletedPreparation = null;
+    }
   };
   if (reconcile) { await load(); return; }
   if (!musicPeopleRestorePromise) musicPeopleRestorePromise = load().catch(() => {
@@ -2086,6 +2093,7 @@ async function checkMusicPeopleRelationshipSource() {
         musicPeopleSourceGeneration++;
         musicPeopleReadiness.invalidate('source_changed', { resetError: true });
         musicPeopleRestorePromise = null;
+        musicPeopleCompletedPreparation = null;
         smugMusicPeopleArchiveAlbumPhotosCache.clear();
       }
       musicPeopleSourceVersion = source.fingerprint;
@@ -2109,17 +2117,30 @@ async function buildMusicPeopleArchiveRelationships({ retry = false, refresh = f
       throw Object.assign(new Error('configuration_missing'), { code: 'configuration_missing' });
     const source = musicPeopleSourceSnapshot;
     if (!source) throw Object.assign(new Error('source_check_failed'), { code: 'source_check_failed' });
-    const finalized = await buildMusicPeopleArchiveRelationshipsForPeople(
-      source.people.filter(row => String(row.name || '').trim()), control, source.shows);
+    if (musicPeopleCompletedPreparation?.fingerprint !== source.fingerprint)
+      musicPeopleCompletedPreparation = null;
+    if (!musicPeopleCompletedPreparation) {
+      const value = await buildMusicPeopleArchiveRelationshipsForPeople(
+        source.people.filter(row => String(row.name || '').trim()), control, source.shows);
+      if (control.isCancelled()) throw Object.assign(new Error('preparation_invalidated'), { code: 'preparation_invalidated' });
+      musicPeopleCompletedPreparation = { fingerprint: source.fingerprint, value,
+        startedAt: control.startedAt, completedAt: new Date().toISOString(), coverage: control.progress() };
+    } else {
+      control.resumeProgress(musicPeopleCompletedPreparation.coverage);
+    }
+    const completed = musicPeopleCompletedPreparation;
     try {
-      return await musicPeopleRelationshipStore.publish({ source, value: finalized, generation: control.generation,
-        startedAt: control.startedAt, coverage: control.progress(), isCancelled: control.isCancelled });
+      const published = await musicPeopleRelationshipStore.publish({ source, value: completed.value, generation: control.generation,
+        startedAt: completed.startedAt, verifiedAt: completed.completedAt, coverage: completed.coverage, isCancelled: control.isCancelled });
+      if (musicPeopleCompletedPreparation === completed) musicPeopleCompletedPreparation = null;
+      return published;
     } catch (error) {
       if (error.code === 'preparation_invalidated' && musicPeopleSourceSnapshot?.fingerprint === source.fingerprint) {
         musicPeopleSourceGeneration++;
         musicPeopleSourceVersion = null;
         musicPeopleSourceSnapshot = null;
         musicPeopleRestorePromise = null;
+        musicPeopleCompletedPreparation = null;
         musicPeopleReadiness.invalidate('source_changed', { resetError: true });
         smugMusicPeopleArchiveAlbumPhotosCache.clear();
       }

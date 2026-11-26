@@ -28,7 +28,7 @@ function fixture() {
     MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS: 1000, MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS: 0,
     MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM: 2, MUSIC_PEOPLE_ARCHIVE_PHOTOS_PAGE_LIMIT: 2,
     musicPeopleReadiness: readiness, musicPeopleSourceVersion: null, musicPeopleSourceCheck: null, musicPeopleSourceGeneration: 0,
-    musicPeopleSourceSnapshot: null, musicPeopleRestorePromise: null,
+    musicPeopleSourceSnapshot: null, musicPeopleRestorePromise: null, musicPeopleCompletedPreparation: null,
     describeMusicPeopleRelationships: describe,
     readMusicPeopleRelationshipSource: async () => {
       if (failDb) throw Error('private source failure');

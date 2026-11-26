@@ -46,7 +46,7 @@ function database() {
     if (sql === 'ROLLBACK') { tx.unlock?.(); tx.unlock = null; return { rows: [] }; }
     if (sql.includes('SELECT data FROM stats_snapshots')) {
       if (db.failRead) throw Error('private snapshot read');
-      const data = tx?.repeatable ? tx.initial : db.data;
+      const data = tx?.wrote ? tx.staged : tx?.repeatable ? tx.initial : db.data;
       return { rows: data ? [{ data }] : [] };
     }
     if (sql.includes('count(*)::int AS total') && sql.includes('music_people')) return { rows: [{ total: db.people.length }] };
@@ -164,7 +164,7 @@ test('generic stats payloads and health exclude only the private population name
   assert.equal((await ctx.buildStatsHealth()).snapshots, 1);
 });
 
-async function boot(db, provider = async () => ({ Response: { AlbumImage: [], Pages: { Total: 0, Start: 1 } } })) {
+async function boot(db, provider = async () => ({ Response: { AlbumImage: [], Pages: { Total: 0, Start: 1 } } }), { Clock = Date } = {}) {
   let app, listened = false, providerCalls = 0, serverLoads = 0;
   const listening = deferred();
   const noop = () => {};
@@ -193,11 +193,11 @@ async function boot(db, provider = async () => ({ Response: { AlbumImage: [], Pa
     return require(id);
   };
   ctx = vm.createContext({ require: fakeRequire, __dirname: root, __filename: path.join(root, 'server-runtime.js'),
-    module: { exports: {} }, exports: {}, Buffer, URL, URLSearchParams, Map, Set, Date, Promise, AbortSignal, AbortController,
+    module: { exports: {} }, exports: {}, Buffer, URL, URLSearchParams, Map, Set, Date: Clock, Promise, AbortSignal, AbortController,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval: noop,
     console: { log: noop, warn: noop, error: noop },
     process: { env: environment, once: noop, on: noop, pid: 1, uptime: () => 0 },
-    fetch: async () => { providerCalls++; return { ok: true, json: () => provider() }; } });
+    fetch: async url => { providerCalls++; return { ok: true, json: () => provider(url) }; } });
   assert.equal(require('../package.json').scripts.start, 'node server-runtime.js');
   vm.runInContext(fs.readFileSync(require.resolve('../server-runtime.js'), 'utf8'), ctx, { filename: 'server-runtime.js' });
   let startupTimer;
@@ -318,11 +318,60 @@ test('REAL runtime publication disconnect stays non-authoritative until intentio
   assert.equal(failed.relationship_readiness.authoritative, false);
   assert.equal(failed.verified_photo_count, null); assert.equal(f.state.data, null);
   await runtime.request('/api/music/people/db', { archive: 'cache' }); assert.equal(writes, 1);
+  vm.runInContext('smugMusicPeopleArchiveAlbumPhotosCache.clear()', runtime.ctx);
+  assert(vm.runInContext('!!musicPeopleCompletedPreparation', runtime.ctx));
   f.state.hook = null;
   const recovered = await runtime.request('/api/music/people/db/:personId', { retry_relationships: '1' });
   assert.equal(recovered.relationship_readiness.authoritative, true);
   assert.equal(recovered.verified_photo_count, 0); assert.equal(runtime.calls(), 1);
+  assert.equal(vm.runInContext('musicPeopleCompletedPreparation', runtime.ctx), null);
   assert.equal(f.pool.totalCount - f.pool.idleCount, 0);
+});
+
+test('REAL runtime discards completed recovery data after an identity change', async t => {
+  const f = databasePool(); t.after(() => f.pool.end());
+  f.state.hook = (sql, client, when) => {
+    if (sql.startsWith('INSERT') && when === 'before') client.emit('error', disconnected());
+  };
+  const runtime = await boot(f.pool);
+  await runtime.request('/api/music/people/db/:personId');
+  assert(vm.runInContext('!!musicPeopleCompletedPreparation', runtime.ctx));
+  const before = runtime.calls(); f.state.people[0].name = 'Changed Identity'; f.state.hook = null;
+  const result = await runtime.request('/api/music/people/db/:personId', { retry_relationships: '1' });
+  assert.equal(result.relationship_readiness.authoritative, true);
+  assert.equal(runtime.calls(), before + 1);
+  assert.equal(vm.runInContext('musicPeopleCompletedPreparation', runtime.ctx), null);
+});
+
+test('REAL runtime concurrent intentional retries publish one retained population without provider work', async t => {
+  const f = databasePool(); t.after(() => f.pool.end()); let writes = 0;
+  f.state.hook = (sql, client, when) => {
+    if (sql.startsWith('INSERT') && when === 'before') { writes++; client.emit('error', disconnected()); }
+  };
+  const runtime = await boot(f.pool); await runtime.request('/api/music/people/db/:personId');
+  vm.runInContext('smugMusicPeopleArchiveAlbumPhotosCache.clear()', runtime.ctx);
+  f.state.hook = (sql, client, when) => { if (sql.startsWith('INSERT') && when === 'before') writes++; };
+  const results = await Promise.all(Array.from({ length: 4 }, () => runtime.request('/api/music/people/db/:personId', { retry_relationships: '1' })));
+  assert(results.every(result => result.relationship_readiness.authoritative));
+  assert.equal(runtime.calls(), 1); assert.equal(writes, 2);
+});
+
+test('REAL npm-start restores compressed snapshot with identical List/Detail counts and timestamps', async () => {
+  const db = database(), store = createMusicPeopleRelationshipStore({ db });
+  const photos = Array.from({ length: 1000 }, (_, i) => ({ image_key: `i-${i}`, caption: 'Person One',
+    thumbnail_url: `https://photos.smugmug.com/photos/i-${i}/Th/photo.jpg` }));
+  const saved = await store.publish({ source: await readSource(db), value: new Map([['1', {
+    ...empty(1000), matched_photos: photos.slice(0, 24),
+    tagged_shows: [{ show_id: 'show1', tagged_photo_count: 1000, matched_photos: photos }]
+  }]]), generation: 0 });
+  assert.equal(db.data.storage_format, 'gzip_json_v1');
+  const runtime = await boot(db, () => { throw Error('restoration must not scan'); });
+  const list = await runtime.request('/api/music/people/db', { archive: 'cache' });
+  const detail = await runtime.request('/api/music/people/db/:personId');
+  assert.equal(list.data[0].verified_photo_count, 1000); assert.equal(detail.verified_photo_count, 1000);
+  assert.equal(detail.relationship_readiness.completed_at, describeRelationships(saved).verifiedAt);
+  assert.equal(list.relationship_readiness.completed_at, detail.relationship_readiness.completed_at);
+  assert.equal(detail.tagged_shows[0].matched_photos.length, 1000); assert.equal(runtime.calls(), 0);
 });
 
 test('REAL runtime snapshot-read interruption recovers once and source failure withholds authority until verified', async t => {
@@ -352,4 +401,69 @@ test('REAL runtime source invalidation reloads the matching durable generation, 
   const detail = await runtime.request('/api/music/people/db/:personId');
   assert.equal(detail.verified_photo_count, 8); assert.equal(detail.relationship_readiness.authoritative, true);
   assert.equal(runtime.calls(), 0);
+});
+
+
+test('REAL nonzero packed retained candidate survives publication failure and retries without rescanning', async t => {
+  const f = databasePool(); t.after(() => f.pool.ending ? undefined : f.pool.end());
+  f.state.shows = [
+    { id: 2, show_id: 'showB', name: 'Second Show', show_date: '2026-02-03', album_id: 'AlbumB', smug_albums: [] },
+    { id: 1, show_id: 'showA', name: 'First Show', show_date: '2026-01-02', album_id: 'AlbumA', smug_albums: [] }
+  ];
+  let clock = Date.now();
+  class Clock extends Date {
+    constructor(...args) { super(...(args.length ? args : [clock])); }
+    static now() { return clock; }
+  }
+  const totals = { AlbumA: 235, AlbumB: 216 };
+  const provider = async input => {
+    const url = new URL(input), album = /\/album\/([^/!]+)!images/.exec(url.pathname)?.[1];
+    assert(album in totals);
+    const start = Number(url.searchParams.get('start')), total = totals[album];
+    const images = Array.from({ length: Math.min(200, total - start + 1) }, (_, offset) => {
+      const n = start + offset, key = `${album}${String(n).padStart(4, '0')}`;
+      const base = `https://photos.smugmug.com/photos/i-${key}/0/ab12cd34`;
+      return { ImageKey: key, Caption: `Person One; Person Two; archive photograph ${n}`,
+        DateTimeOriginal: new Date(Date.parse(album === 'AlbumB' ? '2026-02-03T12:00:00Z' : '2026-01-02T12:00:00Z') + n * 1000).toISOString(),
+        ThumbnailUrl: `${base}/Th/i-${key}-Th.jpg`, SmallUrl: `${base}/S/i-${key}-S.jpg`,
+        MediumUrl: `${base}/M/i-${key}-M.jpg`, LargeUrl: `${base}/X3/i-${key}-X3.jpg` };
+    });
+    const next = start + images.length;
+    return { Response: { AlbumImage: images, Pages: { Total: total, Start: start,
+      ...(next <= total ? { NextPage: `/api/v2/album/${album}!images?count=200&start=${next}` } : {}) } } };
+  };
+  f.state.hook = (sql, client, when) => {
+    if (sql.startsWith('INSERT INTO stats_snapshots') && when === 'before') client.emit('error', disconnected());
+  };
+  const runtime = await boot(f.pool, provider, { Clock });
+  const failed = await runtime.request('/api/music/people/db/:personId');
+  assert.equal(failed.relationship_readiness.authoritative, false);
+  assert.equal(failed.verified_photo_count, null); assert.equal(f.state.data, null); assert.equal(runtime.calls(), 4);
+  const retained = vm.runInContext('musicPeopleCompletedPreparation', runtime.ctx);
+  assert.equal(retained.value.get('1').photo_count, 451); assert.equal(retained.value.get('2').photo_count, 451);
+  assert.equal(retained.coverage.pages_processed, 4); assert.equal(retained.coverage.albums_processed, 2);
+  const expected = JSON.parse(JSON.stringify(retained.value.get('1'))), completedAt = retained.completedAt;
+  assert.equal(completedAt, new Date(clock).toISOString());
+  clock += 60 * 60 * 1000; // Publication retry must not renew provider verification age.
+  vm.runInContext('smugMusicPeopleArchiveAlbumPhotosCache.clear()', runtime.ctx);
+  f.state.hook = null;
+  const recovered = await runtime.request('/api/music/people/db/:personId', { retry_relationships: '1' });
+  assert.equal(recovered.relationship_readiness.authoritative, true);
+  assert.equal(recovered.relationship_readiness.completed_at, completedAt);
+  assert.equal(recovered.verified_photo_count, 451); assert.equal(runtime.calls(), 4);
+  assert.equal(f.state.data.storage_format, 'gzip_json_v1');
+  assert.deepEqual(JSON.parse(JSON.stringify(recovered.matched_photos)), expected.matched_photos);
+  assert.deepEqual(JSON.parse(JSON.stringify(recovered.tagged_shows)), expected.tagged_shows);
+  const list = await runtime.request('/api/music/people/db', { archive: 'cache' });
+  assert(list.data.every(row => row.verified_photo_count === 451));
+  assert.equal(list.relationship_readiness.completed_at, completedAt);
+  assert.equal(vm.runInContext('musicPeopleCompletedPreparation', runtime.ctx), null);
+  await f.pool.end();
+  const replacement = databasePool(f.state); t.after(() => replacement.pool.end());
+  const restarted = await boot(replacement.pool, () => { throw Error('restoration must not re-enumerate'); }, { Clock });
+  const detail = await restarted.request('/api/music/people/db/:personId');
+  assert.equal(restarted.calls(), 0); assert.equal(detail.verified_photo_count, 451);
+  assert.equal(detail.relationship_readiness.completed_at, completedAt);
+  assert.deepEqual(JSON.parse(JSON.stringify(detail.tagged_shows)), expected.tagged_shows);
+  assert.equal(detail.tagged_shows[0].matched_photos[0].large_url, expected.tagged_shows[0].matched_photos[0].large_url);
 });

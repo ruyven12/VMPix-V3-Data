@@ -2,7 +2,10 @@
 
 const clients = new WeakMap();
 const pools = new WeakSet();
-const connectionError = () => Object.assign(new Error('Database connection unavailable'), { code: 'DATABASE_CONNECTION_LOST' });
+const connectionError = error => Object.assign(new Error('Database connection unavailable'), {
+  code: 'DATABASE_CONNECTION_LOST',
+  databaseCode: /^(?:[0-9A-Z]{5}|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH)$/.test(error?.code || '') ? error.code : null
+});
 function isConnectionError(error) {
   return /^(08[A-Z0-9]{3}|57P0[123]|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|DATABASE_CONNECTION_LOST)$/.test(error?.code || '')
     || /^(Connection terminated|Client has encountered a connection error|Client was closed)/i.test(error?.message || '');
@@ -16,11 +19,11 @@ function guardClient(client, report = () => {}) {
   if (clients.has(client) || typeof client.on !== 'function') return client;
   const state = { error: null, pending: new Set() };
   clients.set(client, state);
-  const fail = () => {
-    if (!state.error) state.error = connectionError();
+  const fail = error => {
+    if (!state.error) state.error = connectionError(error);
     for (const finish of [...state.pending]) finish(state.error);
   };
-  client.on('error', () => { const first = !state.error; fail(); if (first) report('client_disconnect'); });
+  client.on('error', error => { const first = !state.error; fail(error); if (first) report('client_disconnect'); });
   client.on('end', fail);
   const query = client.query.bind(client);
   client.query = (...args) => {
@@ -39,7 +42,7 @@ function guardClient(client, report = () => {}) {
         if (finished) return;
         finished = true; state.pending.delete(finish);
         const sql = typeof args[0] === 'string' ? args[0] : args[0]?.text;
-        if (isConnectionError(error) || error && /^\s*ROLLBACK\s*;?\s*$/i.test(sql || '')) fail();
+        if (isConnectionError(error) || error && /^\s*ROLLBACK\s*;?\s*$/i.test(sql || '')) fail(error);
         done(state.error || error, result);
       };
       if (state.error) { queueMicrotask(() => finish(state.error)); return; }

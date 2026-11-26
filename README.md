@@ -723,3 +723,47 @@ use staged fake PostgreSQL, synthetic provider data, and blocked sockets; they d
 prove production role privileges or execute a real migration:
 
 `node --test scripts/test-music-people-readiness.js scripts/test-music-people-persistence.js`
+
+### Snapshot publication recovery and storage bounds
+
+Large populations now intern identical finalized photograph records and store the
+versioned envelope as an opaque `gzip_json_v1` JSONB wrapper, with indexed photo
+references, original ordering, byte length and SHA-256 integrity checks. New code
+also reads prior plain envelopes. Old f17 code cannot read this packed format:
+rolling back to it after a packed publication is not a safe recovery plan. Only a
+format-compatible fallback retaining the private-namespace exclusions is supported.
+Any separate rebuild plan requires review and approval and must not reintroduce
+the confirmed failed large-UPSERT path.
+
+Indexed JSON and decompression are bounded at 128 MiB; stored JSONB is bounded at
+8 MiB. Compression output is bounded before base64/string copies. These bounds
+are resource protections, not an RSS guarantee: building, indexing and validating
+a population still requires memory. A separate synthetic Node run under
+`--max-old-space-size=384` used 910 People, 245 Shows, 494 albums, 16,000 distinct
+photographs and 128,000 per-person photo records. Expanded relationships measured
+200,546,755 bytes, indexed JSON 22,341,447 bytes and stored JSON 3,730,000 bytes;
+peak process RSS was 326,932 KiB (about 319.3 MiB). The photographs/distribution
+are test data, not production measurements or PostgreSQL acceptance evidence.
+
+A completed, source-valid population is retained in process after failed
+publication. Intentional Retry reconciles the durable row first, then may publish
+the retained candidate without repeating provider work. Its original completion/
+verification time is preserved; publication retries do not renew freshness.
+The old f17 process Map is not durable and cannot survive a deploy/restart.
+Sanitized publication diagnostics report stage, safe error/SQLSTATE codes,
+JSON/stored byte counts, elapsed time and COMMIT acknowledgement; transaction
+and fresh-connection durable readbacks must pass before authority is attached.
+
+Local tests cover disconnects, uncertain COMMIT, integrity/readback failures and
+a nonzero packed multi-page candidate reused without additional provider calls.
+They do not establish the cause of the observed PostgreSQL backend SIGKILL,
+prove an OOM, or show that compression fixes production. No real PostgreSQL
+acceptance has run. A separately approved production check must cover one initial
+new-process build if no compatible snapshot exists, then one controlled recovery/
+restart and verification of original timestamps, List/Detail parity and no rescan.
+
+`node --test scripts/test-db-resilience.js scripts/test-music-people-readiness.js scripts/test-music-people-persistence.js scripts/test-music-people-snapshot-recovery.js`
+
+Run the memory fixture separately so rejection-cap tests do not contaminate peak RSS:
+
+`node --max-old-space-size=384 --test --test-name-pattern="mixed production-shaped" scripts/test-music-people-snapshot-recovery.js`

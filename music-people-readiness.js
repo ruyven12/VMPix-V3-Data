@@ -64,6 +64,8 @@ function createMusicPeopleReadiness({ ttlMs, now = Date.now, describe = () => nu
       generation: version, startedAt: state.started_at,
       progress: () => ({ total_albums: state.total_albums, albums_processed: state.albums_processed,
         pages_processed: state.pages_processed, albums_from_cache: state.albums_from_cache }),
+      resumeProgress: coverage => progress({ total_albums: coverage.total_albums, albums_processed: coverage.albums_processed,
+        pages_processed: coverage.pages_processed, albums_from_cache: coverage.albums_from_cache }),
       isCancelled: () => version !== generation || state.status === 'error',
       setAlbumsTotal: total => progress({ total_albums: total }),
       albumProcessed: () => progress({ albums_processed: state.albums_processed + 1 }),

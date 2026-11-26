@@ -42,7 +42,8 @@ function databasePool(state = databaseState()) {
           if (!this.tx) throw Error('snapshot write outside transaction');
           this.tx.staged = JSON.parse(params[1]);
         } else if (sql.includes('SELECT data FROM stats_snapshots')) {
-          result = { rows: state.data ? [{ data: state.data }] : [] };
+          const data = this.tx?.staged || state.data;
+          result = { rows: data ? [{ data }] : [] };
         } else if (sql.includes('count(*)::int AS total') && sql.includes('music_people')) {
           result = { rows: [{ total: state.people.length }] };
         } else if (sql.includes('FROM music_people')) {
