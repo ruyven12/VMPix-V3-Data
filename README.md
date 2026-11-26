@@ -683,3 +683,43 @@ GO for local adapter review. NO-GO for production activation until actual native
 CAPTCHA rejection, form configuration, frontend integration, proxy limit acceptance
 and deployment-overlap safeguards are verified and separately approved.
 No live Formspree submission or actual email was used for verification.
+
+
+## Durable Music People relationships
+
+The linked-album caption relationship population is persisted in the existing
+`stats_snapshots` JSONB row `music / people / relationship_population:v1`. No
+new table, migration, initializer, or scheduled service is introduced. The versioned
+complete envelope retains its original verification time, identity hashes for every
+known person (including unmatched verified-zero people), safe coverage counters, and
+only the finalized relationship fields already used by the public People DTO. Raw
+Sheet/Show blobs and credentials are not stored. Generic stats payload readers and
+summary-health counts exclude this exact private namespace.
+
+A single shared startup/first-request restore reads a matching snapshot without
+provider access. Its source fingerprint covers IDs, names, aliases, and actual
+Show/album matching inputs; a changed source cannot reuse old authority. List and
+Detail use the same population. Row identity checks also prevent an SQL-row/cache
+race from attaching another identity's counts or photos.
+
+Same-source TTL expiry serves the original verified snapshot as `ready` with
+`stale: true` while a background refresh runs. Refresh failure leaves that snapshot
+and the durable row intact, reports separate `refresh_status`/`refresh_reason` and
+`refresh_retry_allowed`, and does not restart on every GET. An intentional existing
+`retry_relationships=1` request may retry after workers drain; it first reconciles
+a durable result in case a prior COMMIT succeeded but its acknowledgement was lost.
+Source-read failure withholds authority until source identity can be checked again.
+
+Publication uses a short READ COMMITTED transaction, source SHARE locks and a
+namespace-only transaction advisory lock (3s lock wait, 10s statements), then a fresh
+source check and one atomic replacement. A later-started complete snapshot wins over
+an older concurrent completion. Provider requests never hold those DB locks. Existing
+album/page limits and two-worker scheduling remain; each People provider request has
+a 45s abort covering fetch/body completion.
+
+Before deployment, verify the application's existing role can read source/snapshot
+rows, take these bounded locks, and insert/update the snapshot row. Local regressions
+use staged fake PostgreSQL, synthetic provider data, and blocked sockets; they do not
+prove production role privileges or execute a real migration:
+
+`node --test scripts/test-music-people-readiness.js scripts/test-music-people-persistence.js`
