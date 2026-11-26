@@ -1,7 +1,7 @@
 'use strict';
 
 const REASONS = new Set(['configuration_missing', 'album_limit_reached', 'photo_page_limit_reached',
-  'pagination_incomplete', 'source_check_failed', 'provider_request_failed', 'preparation_invalidated']);
+  'pagination_incomplete', 'source_check_failed', 'provider_request_failed', 'preparation_invalidated', 'persistence_failed', 'persistence_invalid']);
 const failure = code => Object.assign(new Error(code), { code });
 const safeReason = error => REASONS.has(error?.code) ? error.code : 'preparation_failed';
 const safeAlbum = value => typeof value === 'string' && /^[A-Za-z0-9]{1,128}$/.test(value) ? value : null;
@@ -10,36 +10,50 @@ const emptyState = () => ({ status: 'preparing', reason: 'not_prepared', started
   pages_processed: 0, albums_from_cache: 0, failed_album_id: null });
 
 // One lifecycle per prepared population, never per response page.
-function createMusicPeopleReadiness({ ttlMs, now = Date.now }) {
+function createMusicPeopleReadiness({ ttlMs, now = Date.now, describe = () => null }) {
   let generation = 0, cache = null, pending = null;
   let state = emptyState();
-  function invalidate(reason = 'source_changed') {
-    generation++; cache = null;
-    // Retain the active promise until its workers drain. Source changes cannot
-    // clear a sticky error or permit overlapping preparation.
-    if (state.status !== 'error') state = { ...emptyState(), reason };
+  const read = () => cache?.value || null;
+  const needsRefresh = () => !!cache && now() - cache.at >= ttlMs;
+  function restore(value) {
+    const saved = describe(value);
+    const at = Date.parse(saved?.verifiedAt);
+    if (pending || !saved || !Number.isFinite(at)) return false;
+    generation = Math.max(generation, saved.generation);
+    cache = { value, at, generation: saved.generation };
+    state = { ...emptyState(), ...saved.coverage, status: 'ready', reason: null, completed_at: saved.verifiedAt, finished_at: saved.verifiedAt };
+    return true;
   }
-  function read() {
-    if (cache && now() - cache.at >= ttlMs) invalidate('cache_expired');
-    return cache?.value || null;
+  function invalidate(reason = 'source_changed', { resetError = false } = {}) {
+    generation++; cache = null;
+    if (state.status !== 'error' || resetError) state = { ...emptyState(), reason };
   }
   function snapshot(value) {
-    const current = read();
-    return { ...state, generation, authoritative: !!current && value === current,
-      active: !!pending, retry_allowed: state.status === 'error' && !pending,
+    const current = read(), authoritative = !!current && value === current;
+    const saved = authoritative ? describe(current) : null;
+    return { ...state, status: authoritative ? 'ready' : state.status, reason: authoritative ? null : state.reason,
+      completed_at: authoritative ? new Date(cache.at).toISOString() : state.completed_at,
+      generation: authoritative ? cache.generation : generation, authoritative,
+      stale: authoritative && needsRefresh(), refreshing: authoritative && !!pending,
+      refresh_status: authoritative ? state.status : null,
+      refresh_reason: authoritative && state.status === 'error' ? state.reason : null,
+      refresh_retry_allowed: authoritative && state.status === 'error' && !pending,
+      source_fingerprint: saved?.fingerprint || null,
+      active: !!pending, retry_allowed: !authoritative && state.status === 'error' && !pending,
       elapsed_ms: state.started_at ? Math.max(0, (state.finished_at ? Date.parse(state.finished_at) : now()) - Date.parse(state.started_at)) : 0,
       scope: 'linked_music_show_albums', expires_at: cache ? new Date(cache.at + ttlMs).toISOString() : null };
   }
-  function fail(reason) {
-    invalidate(reason);
+  function fail(reason, { preserveCache = false } = {}) {
+    if (preserveCache) generation++;
+    else invalidate(reason);
     state = { ...state, status: 'error', reason, failed_at: new Date(now()).toISOString() };
   }
-  function prepare(build, { retry = false } = {}) {
+  function prepare(build, { retry = false, refresh = false } = {}) {
     const current = read();
-    if (current) return Promise.resolve(current);
+    if (current && !refresh && !needsRefresh()) return Promise.resolve(current);
     if (pending) return pending;
-    if (state.status === 'error' && !retry) return Promise.resolve(new Map());
-    if (state.status === 'error') generation++;
+    if (state.status === 'error' && !retry) return Promise.resolve(current || new Map());
+    if (current || state.status === 'error') generation++;
     const version = generation;
     state = { ...emptyState(), status: 'preparing', reason: 'building', started_at: new Date(now()).toISOString(),
       attempt_generation: version };
@@ -47,6 +61,9 @@ function createMusicPeopleReadiness({ ttlMs, now = Date.now }) {
       if (version === generation) state = { ...state, ...update, last_progress_at: new Date(now()).toISOString() };
     };
     const control = {
+      generation: version, startedAt: state.started_at,
+      progress: () => ({ total_albums: state.total_albums, albums_processed: state.albums_processed,
+        pages_processed: state.pages_processed, albums_from_cache: state.albums_from_cache }),
       isCancelled: () => version !== generation || state.status === 'error',
       setAlbumsTotal: total => progress({ total_albums: total }),
       albumProcessed: () => progress({ albums_processed: state.albums_processed + 1 }),
@@ -58,14 +75,17 @@ function createMusicPeopleReadiness({ ttlMs, now = Date.now }) {
       }
     };
     const run = Promise.resolve().then(() => build(control)).then(value => {
-      if (version !== generation) return new Map();
-      if (state.status === 'error') return new Map();
-      cache = { value, at: now() };
-      state = { ...state, status: 'ready', reason: null, completed_at: new Date(now()).toISOString() };
+      if (version !== generation || state.status === 'error') return read() || new Map();
+      const saved = describe(value), verified = Date.parse(saved?.verifiedAt);
+      const at = Number.isFinite(verified) ? verified : now();
+      cache = { value, at, generation: saved?.generation ?? version };
+      generation = Math.max(generation, cache.generation);
+      state = { ...state, status: 'ready', reason: null, completed_at: new Date(at).toISOString(),
+        finished_at: new Date(now()).toISOString() };
       return value;
     }).catch(error => {
       control.failure(error);
-      return new Map();
+      return read() || new Map();
     }).finally(() => {
       if (pending === run) {
         pending = null;
@@ -75,7 +95,7 @@ function createMusicPeopleReadiness({ ttlMs, now = Date.now }) {
     pending = run;
     return run;
   }
-  return { read, snapshot, prepare, invalidate, fail };
+  return { read, snapshot, prepare, invalidate, fail, restore, needsRefresh };
 }
 
 // Person-detail and population scans share this in-process gate. Waiting scans

@@ -17,24 +17,40 @@ function loadFunction(ctx, name) {
 function fixture() {
   let time = 10000, version = 'v1', builds = 0, failDb = false;
   let build = async () => new Map([['1', { photo_count: 3 }]]);
-  const readiness = createMusicPeopleReadiness({ ttlMs: 1000, now: () => time });
-  const ctx = vm.createContext({ Map, Set, Date, Promise, setTimeout, clearTimeout, createMusicPeopleReadiness,
+  const descriptions = new WeakMap();
+  const describe = value => descriptions.get(value) || null;
+  const readiness = createMusicPeopleReadiness({ ttlMs: 1000, now: () => time, describe });
+  const people = () => [{ person_id: 1, name: 'Person One', aliases: [], stats: { photo_count: 9 } },
+    { person_id: 2, name: 'Person Two', aliases: [], stats: { photo_count: 8 } }];
+  const ctx = vm.createContext({ Map, Set, Date, Promise, AbortSignal, setTimeout, clearTimeout, createMusicPeopleReadiness,
     musicPeopleAlbumPage, musicPeoplePreparationGate: createMusicPeoplePreparationGate(),
     process: { env: { DATABASE_URL: 'synthetic' } }, SMUG_API_KEY: 'synthetic',
     MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS: 1000, MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS: 0,
     MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM: 2, MUSIC_PEOPLE_ARCHIVE_PHOTOS_PAGE_LIMIT: 2,
     musicPeopleReadiness: readiness, musicPeopleSourceVersion: null, musicPeopleSourceCheck: null, musicPeopleSourceGeneration: 0,
+    musicPeopleSourceSnapshot: null, musicPeopleRestorePromise: null,
+    describeMusicPeopleRelationships: describe,
+    readMusicPeopleRelationshipSource: async () => {
+      if (failDb) throw Error('private source failure');
+      return { fingerprint: version, people: people(), shows: [] };
+    },
+    musicPeopleRelationshipsMatchIdentity: (map, row) => describe(map)?.people.some(person => person.person_id === row.person_id && person.name === row.name),
+    musicPeopleRelationshipStore: { load: async () => null, publish: async ({ source, value, generation, startedAt, isCancelled }) => {
+      if (isCancelled() || source.fingerprint !== version) throw Object.assign(Error(), { code: 'preparation_invalidated' });
+      const result = new Map(value);
+      people().forEach(person => { if (!result.has(String(person.person_id))) result.set(String(person.person_id), ctx.createEmptyMusicPersonArchivePayload()); });
+      descriptions.set(result, { fingerprint: version, people: source.people, generation, startedAt, verifiedAt: new Date(time).toISOString() });
+      return result;
+    } },
     smugMusicPersonArchiveRelationshipCache: new Map(), smugMusicPeopleArchiveAlbumPhotosCache: new Map(),
     smugMusicPeopleArchiveAlbumPhotosInFlight: new Map(),
     dbPool: { query: async sql => {
       assert(!/\b(UPDATE|INSERT|DELETE|ALTER|CREATE)\b/.test(sql));
       if (failDb) throw Error('private detail');
-      if (sql.includes('AS people')) return { rows: [{ people: version, shows: version }] };
       if (sql.includes('count(*)::int AS total')) return { rows: [{ total: 2 }] };
-      return { rows: [{ person_id: 1, name: 'Person One', stats: { photo_count: 9 } },
-        { person_id: 2, name: 'Person Two', stats: { photo_count: 8 } }] };
+      return { rows: people() };
     } },
-    buildMusicPeopleArchiveRelationshipsForPeople: async () => { builds++; return build(); },
+    buildMusicPeopleArchiveRelationshipsForPeople: async (...args) => { builds++; return build(...args); },
     getCanonicalCount: n => Math.max(0, Number(n) || 0), toIntegerCount: n => Number(n) || 0,
     getClampedLimit: n => Number(n) || 25, getPageNumber: n => Number(n) || 1,
     buildMusicPeopleDbQueryOptions: () => ({ values: [], whereSql: '', orderBySql: 'name', filters: {}, sort: {} }),
@@ -44,20 +60,19 @@ function fixture() {
     buildSmugAlbumPhotosPagination: (json, images, limit, start) => ({ has_more: start + images.length - 1 < json.Response.Pages.Total,
       next_start: start + images.length }), fetchSmugJson: async () => { throw Error('provider'); }
   });
-  for (const name of ['checkMusicPeopleRelationshipSource', 'buildMusicPeopleArchiveRelationships',
+  for (const name of ['restoreMusicPeopleRelationshipSnapshot', 'checkMusicPeopleRelationshipSource', 'buildMusicPeopleArchiveRelationships',
     'getCachedMusicPeopleArchiveRelationships', 'getMusicPeopleArchiveRelationshipsForRequest',
     'shouldIncludeMusicPeopleArchive', 'shouldUseCachedMusicPeopleArchive', 'getMusicPeopleArchiveRelationshipsForListRequest',
-    'getMusicPersonArchiveRelationship', 'createEmptyMusicPersonArchivePayload', 'buildMusicPersonDbApiItem',
+    'getMusicPersonArchiveRelationship', 'getMusicPeopleReadinessForRows', 'createEmptyMusicPersonArchivePayload', 'buildMusicPersonDbApiItem',
     'fetchMusicPeopleArchiveAlbumPhotos', 'handleMusicPeopleDbRequest', 'getMusicStatsNumber', 'addMusicCanonicalAliases',
-    'getCanonicalNullableString']) {
-    loadFunction(ctx, name);
-  }
+    'getCanonicalNullableString']) loadFunction(ctx, name);
   return { ctx, readiness, builds: () => builds, advance: () => { time += 1001; },
     changeSource: () => { version += 'x'; }, failDb: value => { failDb = value; }, build: fn => { build = fn; } };
 }
 
 function runtimeFixture() {
   const f = fixture(), routes = new Map();
+  f.ctx.MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS = 100;
   const start = require('../package.json').scripts.start;
   assert.equal(start, 'node server-runtime.js');
   f.ctx.app = { get(route, handler) {
@@ -99,7 +114,7 @@ test('npm start detail preserves the three-photo Map, complete readiness and leg
   assert.deepEqual(body.matched_photos, photos); assert.deepEqual(body.data.matched_photos, photos);
   assert.equal(body.verified_photo_count, 3); assert.equal(body.photo_count_status, 'verified');
   assert.equal(body.photo_count_source, 'relationship_cache');
-  const state = f.ctx.smugMusicPersonArchiveRelationshipCache.get('1');
+  const state = f.readiness;
   const expected = state.snapshot(state.read());
   assert.deepEqual(body.relationship_readiness, expected);
   for (const field of ['route', 'source', 'generatedAt', 'generatedTime', 'person_id', 'name', 'category',
@@ -113,7 +128,7 @@ test('npm start detail preserves the three-photo Map, complete readiness and leg
 test('npm start detail exposes preparing after an invalidated in-flight result, never stale photos', async () => {
   const f = runtimeFixture(), gate = deferred(); f.build(() => gate.promise);
   const request = f.request(); await tick();
-  assert.equal(f.ctx.smugMusicPersonArchiveRelationshipCache.get('1').snapshot().status, 'preparing');
+  assert.equal(f.readiness.snapshot().status, 'preparing');
   f.changeSource(); await f.ctx.checkMusicPeopleRelationshipSource();
   gate.resolve(new Map([['1', { photo_count: 99 }]]));
   const { body } = await request;
@@ -195,10 +210,16 @@ test('source invalidation drains obsolete work before allowing rebuilding', asyn
   assert.equal(f.readiness.snapshot(f.readiness.read()).status, 'ready');
 });
 
-test('TTL invalidation is preparing until new work finishes', async () => {
+test('same-source TTL expiry serves original verified data during background refresh', async () => {
   const f = fixture(); await f.ctx.getMusicPeopleArchiveRelationshipsForRequest(); await tick();
-  f.advance(); assert.equal(f.readiness.snapshot().status, 'preparing'); assert.equal(f.readiness.read(), null);
-  await f.ctx.buildMusicPeopleArchiveRelationships(); assert.equal(f.readiness.snapshot().status, 'ready');
+  const old = f.readiness.read(), completed = f.readiness.snapshot(old).completed_at;
+  const held = deferred(); f.build(() => held.promise); f.advance();
+  const stale = await f.ctx.getMusicPeopleArchiveRelationshipsForRequest();
+  assert.equal(stale, old); assert.equal(f.readiness.snapshot(stale).authoritative, true);
+  assert.equal(f.readiness.snapshot(stale).stale, true); assert.equal(f.readiness.snapshot(stale).completed_at, completed);
+  held.resolve(new Map([['1', { photo_count: 4 }]])); await tick();
+  assert.equal(f.readiness.read().get('1').photo_count, 4);
+  assert.notEqual(f.readiness.snapshot(f.readiness.read()).completed_at, completed);
 });
 
 test('failed preparation stays visible to polling, then recovers only with explicit retry', async () => {
@@ -224,7 +245,7 @@ test('fallback zero stays unavailable; verified absence becomes true zero withou
   const ready = f.ctx.buildMusicPersonDbApiItem(row, f.readiness.read());
   assert.equal(ready.photo_count, 0); assert.equal(ready.photo_count_status, 'verified'); assert.equal(ready.verified_photo_count, 0);
   assert.equal(ready.name, row.name); assert.equal(ready.first_seen, row.stats.first_seen);
-  assert.equal(f.ctx.buildMusicPersonDbApiItem({ person_id: 1 }, f.readiness.read()).photo_count, 3);
+  assert.equal(f.ctx.buildMusicPersonDbApiItem({ person_id: 1, name: 'Person One' }, f.readiness.read()).photo_count, 3);
 });
 
 test('pagination exposes identical population readiness and keeps existing response fields', async () => {
@@ -263,13 +284,15 @@ test('album failures and page limits are not cached as verified empty albums', a
   assert.equal((await f.ctx.fetchMusicPeopleArchiveAlbumPhotos('album')).length, 0);
 });
 
-test('single-person readiness has verified zero and does not falsely ready the global population', async () => {
+test('detail shares population verified zero and readiness', async () => {
   const f = fixture(); f.build(async () => new Map());
   const map = await f.ctx.getMusicPersonArchiveRelationship({ person_id: 2, name: 'Person Two' });
-  const status = f.ctx.smugMusicPersonArchiveRelationshipCache.get('2').snapshot(map);
+  await f.ctx.buildMusicPeopleArchiveRelationships();
+  const ready = f.readiness.read();
+  const status = f.readiness.snapshot(ready);
   assert.equal(status.status, 'ready'); assert.equal(status.authoritative, true);
-  assert.equal(f.ctx.buildMusicPersonDbApiItem({ person_id: 2 }, map, status).verified_photo_count, 0);
-  assert.equal(f.readiness.snapshot().status, 'preparing');
+  assert.equal(f.ctx.buildMusicPersonDbApiItem({ person_id: 2, name: 'Person Two' }, ready, status).verified_photo_count, 0);
+  assert.equal(f.readiness.snapshot().status, 'ready');
 });
 
 function albumPage(total, start, count, albumId = 'AlbumA') {
@@ -305,7 +328,7 @@ for (const total of [0, 200, 216, 235, 1600]) test(`complete ${total}-photo albu
   const map = await f.ctx.buildMusicPeopleArchiveRelationships();
   const diagnostic = f.readiness.snapshot(map);
   assert.equal(diagnostic.status, 'ready'); assert.equal(diagnostic.authoritative, true);
-  assert.equal(f.ctx.buildMusicPersonDbApiItem({ person_id: 1 }, map).verified_photo_count, total);
+  assert.equal(f.ctx.buildMusicPersonDbApiItem({ person_id: 1, name: 'Person One' }, map).verified_photo_count, total);
   assert.equal(calls, Math.max(1, Math.ceil(total / 200)));
   assert.equal(diagnostic.pages_processed, calls); assert.equal(diagnostic.albums_processed, 1);
   assert.equal(diagnostic.total_albums, 1); assert.equal(diagnostic.active, false);
@@ -417,10 +440,9 @@ test('a missing or repeated album page never publishes partial counts', async ()
   }
 });
 
-test('source invalidation cannot silently clear a sticky failure', async () => {
+test('same-source polling cannot silently clear a sticky failure', async () => {
   const f = fixture(); f.build(async () => { throw Error('failure'); });
   await f.ctx.checkMusicPeopleRelationshipSource(); await f.ctx.buildMusicPeopleArchiveRelationships();
-  f.changeSource();
   await f.ctx.getMusicPeopleArchiveRelationshipsForListRequest({ archive: 'cached' });
   assert.equal(f.readiness.snapshot().status, 'error'); assert.equal(f.builds(), 1);
   for (const retry_relationships of ['0', 'true', '', undefined])
@@ -448,16 +470,40 @@ test('elapsed and progress diagnostics advance while active and freeze after cle
   assert.equal(state.read(), null);
 });
 
-test('single-person retries are also intentional and leave the global population untouched', async () => {
+test('detail retries share the population lifecycle and verified zero cohort', async () => {
   const f = fixture(), row = { person_id: 2, name: 'Person Two' };
+  f.ctx.MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS = 100;
   f.build(async () => { throw Error('failure'); });
   await f.ctx.getMusicPersonArchiveRelationship(row);
   await f.ctx.getMusicPersonArchiveRelationship(row);
-  assert.equal(f.builds(), 1);
-  const state = f.ctx.smugMusicPersonArchiveRelationshipCache.get('2');
-  assert.equal(state.snapshot().status, 'error');
+  assert.equal(f.builds(), 1); assert.equal(f.readiness.snapshot().status, 'error');
   f.build(async () => new Map());
   const map = await f.ctx.getMusicPersonArchiveRelationship(row, { retry_relationships: '1' });
-  assert.equal(f.builds(), 2); assert.equal(state.snapshot(map).authoritative, true);
-  assert.equal(f.readiness.snapshot().status, 'preparing');
+  assert.equal(f.builds(), 2); assert.equal(f.readiness.snapshot(map).authoritative, true);
+  assert.equal(map.get('2').photo_count, 0); assert.equal(f.readiness.read(), map);
+});
+
+
+test('People provider timeout drains both workers before intentional retry', async () => {
+  const f = scanningFixture(['AlbumA', 'AlbumB', 'AlbumC']); let calls = 0;
+  f.ctx.AbortSignal = { timeout(ms) { assert.equal(ms, 45000); const c = new AbortController(); setTimeout(() => c.abort(), 1); return c.signal; } };
+  f.ctx.fetchSmugJson = async (_, { signal }) => { calls++; return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(Error('provider timeout')), { once: true })); };
+  await f.ctx.checkMusicPeopleRelationshipSource(); await f.ctx.buildMusicPeopleArchiveRelationships();
+  assert.equal(calls, 2); assert.equal(f.readiness.snapshot().active, false); assert.equal(f.readiness.snapshot().retry_allowed, true);
+  assert.equal(f.readiness.read(), null); assert.equal(f.readiness.snapshot().reason, 'provider_request_failed');
+  f.ctx.fetchSmugJson = async () => albumPage(0, 1, 200);
+  await f.ctx.buildMusicPeopleArchiveRelationships({ retry: true });
+  assert.equal(f.readiness.snapshot(f.readiness.read()).authoritative, true);
+});
+
+test('identity mismatch cannot attach archive photos or appearance metadata', async () => {
+  const f = fixture();
+  f.build(async () => new Map([['1', { ...f.ctx.createEmptyMusicPersonArchivePayload(), photo_count: 12, event_count: 7, show_count: 7, set_count: 9, matched_photos: [{ image_key: 'old' }], tagged_shows: [{ title: 'old' }] }]]));
+  await f.ctx.getMusicPeopleArchiveRelationshipsForRequest(); await tick();
+  const map = f.readiness.read(), row = { person_id: 1, name: 'Reassigned Person', stats: { photo_count: 0, event_count: 1, show_count: 1, set_count: 2 } };
+  const status = f.ctx.getMusicPeopleReadinessForRows(map, [row]);
+  const item = f.ctx.buildMusicPersonDbApiItem(row, map, status);
+  assert.equal(status.authoritative, false); assert.equal(item.verified_photo_count, null);
+  assert.equal(item.photo_count, 0); assert(!item.matched_photos?.length); assert(!item.tagged_shows?.length);
+  assert.equal(item.event_count, 1); assert.equal(item.show_count, 1); assert.equal(item.set_count, 2);
 });

@@ -13,6 +13,8 @@ const importReporting = require('./import-reporting');
 const { createCalendar } = require('./todoist-calendar');
 const { createContactRouter } = require('./contact');
 const { createMusicVenuePhotoCensus } = require('./music-venue-photo-census');
+const { createMusicPeopleRelationshipStore, readSource: readMusicPeopleRelationshipSource,
+  describeRelationships: describeMusicPeopleRelationships, matchesIdentity: musicPeopleRelationshipsMatchIdentity } = require('./music-people-relationship-store');
 const { createMusicVenuePhotoCensusBatch, withMusicVenueCensusGate, createCensusRequestScope, assertMusicVenueCensusReconciled } = require('./music-venue-photo-census-batch');
 
 function loadLocalEnv() {
@@ -234,11 +236,14 @@ const smugMusicPeopleArchiveAlbumPhotosInFlight = new Map();
 const smugMusicPersonArchiveRelationshipCache = new Map();
 const { createMusicPeopleReadiness, createMusicPeoplePreparationGate, runMusicPeopleAlbumWorkers,
   musicPeopleAlbumPage } = require('./music-people-readiness');
-const musicPeopleReadiness = createMusicPeopleReadiness({ ttlMs: MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS });
+const musicPeopleRelationshipStore = createMusicPeopleRelationshipStore({ db: dbPool });
+const musicPeopleReadiness = createMusicPeopleReadiness({ ttlMs: MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS, describe: describeMusicPeopleRelationships });
 const musicPeoplePreparationGate = createMusicPeoplePreparationGate();
 let musicPeopleSourceVersion = null;
 let musicPeopleSourceCheck = null;
 let musicPeopleSourceGeneration = 0;
+let musicPeopleSourceSnapshot = null;
+let musicPeopleRestorePromise = null;
 const smugBandArchiveCoverageCache = new Map();
 const smugBandArchiveCoverageInFlight = new Map();
 
@@ -1893,7 +1898,7 @@ async function fetchMusicPeopleArchiveAlbumPhotos(albumId, control) {
     for (let page = 0; page < MUSIC_PEOPLE_ARCHIVE_MAX_PHOTO_PAGES_PER_ALBUM; page += 1) {
       check();
       const endpoint = `/album/${encodeURIComponent(cacheKey)}!images?count=${MUSIC_PEOPLE_ARCHIVE_PHOTOS_PAGE_LIMIT}&start=${start}&_accept=application/json&_expand=Image`;
-      const json = await fetchSmugJson(endpoint);
+      const json = await fetchSmugJson(endpoint, { signal: AbortSignal.timeout(45000) });
       control?.pageProcessed();
       check();
       const response = json && (json.Response || json);
@@ -1935,8 +1940,8 @@ async function fetchMusicPeopleArchiveAlbumPhotos(albumId, control) {
   return run;
 }
 
-async function getMusicPeopleArchiveAlbumsForScan() {
-  const showsResult = await dbPool.query(`
+async function getMusicPeopleArchiveAlbumsForScan(sourceShows = null) {
+  const showsResult = sourceShows ? { rows: sourceShows } : await dbPool.query(`
     SELECT id, show_id, name, date, show_date, show_url, venue, city, state, gallery_id, album_id, cover_image_url, smug_albums
     FROM music_shows
     WHERE (
@@ -1959,11 +1964,11 @@ async function getMusicPeopleArchiveAlbumsForScan() {
   return Array.from(albumMap.values());
 }
 
-async function buildMusicPeopleArchiveRelationshipsForPeople(people, control) {
+async function buildMusicPeopleArchiveRelationshipsForPeople(people, control, sourceShows = null) {
   const matchers = createMusicPeopleArchivePersonMatchers(people);
   if (!matchers.length) { control.setAlbumsTotal(0); return new Map(); }
 
-  const albums = await getMusicPeopleArchiveAlbumsForScan();
+  const albums = await getMusicPeopleArchiveAlbumsForScan(sourceShows);
   const relationships = new Map();
   await runMusicPeopleAlbumWorkers(albums, SMUG_REQUEST_CONCURRENCY, async (album) => {
     const photos = await fetchMusicPeopleArchiveAlbumPhotos(album.album_id, control);
@@ -2054,29 +2059,39 @@ function addMusicPeopleArchiveMatch(relationships, personId, album, photo) {
   }
 }
 
+async function restoreMusicPeopleRelationshipSnapshot(source, reconcile = false) {
+  const load = async () => {
+    const value = await musicPeopleRelationshipStore.load(source);
+    const previous = describeMusicPeopleRelationships(musicPeopleReadiness.read());
+    const restored = describeMusicPeopleRelationships(value);
+    if (value && musicPeopleSourceSnapshot?.fingerprint === source.fingerprint
+      && (!previous || Date.parse(restored.verifiedAt) > Date.parse(previous.verifiedAt))) musicPeopleReadiness.restore(value);
+  };
+  if (reconcile) { await load(); return; }
+  if (!musicPeopleRestorePromise) musicPeopleRestorePromise = load().catch(() => {
+    musicPeopleReadiness.fail('persistence_failed', { preserveCache: true });
+  });
+  await musicPeopleRestorePromise;
+}
+
 async function checkMusicPeopleRelationshipSource() {
   if (musicPeopleSourceCheck) return musicPeopleSourceCheck;
   musicPeopleSourceCheck = (async () => {
     try {
-      // Existing imports/resolver writes advance updated_at. Check the whole source,
-      // not the selected page, before serving or publishing a prepared generation.
-      const result = await dbPool.query(`SELECT
-        (SELECT md5(coalesce(jsonb_agg(jsonb_build_array(person_id, updated_at) ORDER BY person_id)::text, '[]')) FROM music_people) AS people,
-        (SELECT md5(coalesce(jsonb_agg(jsonb_build_array(id, updated_at) ORDER BY id)::text, '[]')) FROM music_shows) AS shows`);
-      if (!result.rows?.[0]) throw new Error('source_check_failed');
-      const version = JSON.stringify(result.rows[0]);
-      if (musicPeopleSourceVersion !== null && musicPeopleSourceVersion !== version) {
+      const source = await readMusicPeopleRelationshipSource(dbPool);
+      if (musicPeopleSourceVersion !== null && musicPeopleSourceVersion !== source.fingerprint) {
         musicPeopleSourceGeneration++;
-        musicPeopleReadiness.invalidate();
-        for (const state of smugMusicPersonArchiveRelationshipCache.values()) state.invalidate();
+        musicPeopleReadiness.invalidate('source_changed', { resetError: true });
         smugMusicPeopleArchiveAlbumPhotosCache.clear();
       }
-      musicPeopleSourceVersion = version;
+      musicPeopleSourceVersion = source.fingerprint;
+      musicPeopleSourceSnapshot = source;
+      await restoreMusicPeopleRelationshipSnapshot(source);
       return true;
     } catch (_) {
       musicPeopleSourceGeneration++;
-      musicPeopleReadiness.fail('source_check_failed');
-      for (const state of smugMusicPersonArchiveRelationshipCache.values()) state.fail('source_check_failed');
+      musicPeopleSourceSnapshot = null;
+      musicPeopleReadiness.fail('source_check_failed', { preserveCache: true });
       smugMusicPeopleArchiveAlbumPhotosCache.clear();
       return false;
     }
@@ -2084,43 +2099,55 @@ async function checkMusicPeopleRelationshipSource() {
   return musicPeopleSourceCheck;
 }
 
-async function buildMusicPeopleArchiveRelationships({ retry = false } = {}) {
+async function buildMusicPeopleArchiveRelationships({ retry = false, refresh = false } = {}) {
   return musicPeopleReadiness.prepare((control) => musicPeoplePreparationGate(async () => {
     if (!SMUG_API_KEY || !String(process.env.DATABASE_URL || '').trim())
       throw Object.assign(new Error('configuration_missing'), { code: 'configuration_missing' });
-    const peopleResult = await dbPool.query(`
-      SELECT person_id, name, aliases
-      FROM music_people
-      WHERE trim(coalesce(name, '')) <> ''
-      ORDER BY name ASC, person_id ASC
-    `);
-    const finalized = await buildMusicPeopleArchiveRelationshipsForPeople(peopleResult.rows || [], control);
-    if (!await checkMusicPeopleRelationshipSource()) throw Object.assign(new Error('source_check_failed'), { code: 'source_check_failed' });
-    return finalized;
-  }, control), { retry });
+    const source = musicPeopleSourceSnapshot;
+    if (!source) throw Object.assign(new Error('source_check_failed'), { code: 'source_check_failed' });
+    const finalized = await buildMusicPeopleArchiveRelationshipsForPeople(
+      source.people.filter(row => String(row.name || '').trim()), control, source.shows);
+    try {
+      return await musicPeopleRelationshipStore.publish({ source, value: finalized, generation: control.generation,
+        startedAt: control.startedAt, coverage: control.progress(), isCancelled: control.isCancelled });
+    } catch (error) {
+      if (error.code === 'preparation_invalidated' && musicPeopleSourceSnapshot?.fingerprint === source.fingerprint) {
+        musicPeopleSourceGeneration++;
+        musicPeopleSourceVersion = null;
+        musicPeopleSourceSnapshot = null;
+        musicPeopleReadiness.invalidate('source_changed', { resetError: true });
+        smugMusicPeopleArchiveAlbumPhotosCache.clear();
+      }
+      throw error;
+    }
+  }, control), { retry, refresh });
 }
 
 function getCachedMusicPeopleArchiveRelationships() {
   return musicPeopleReadiness.read();
 }
 
-async function getMusicPeopleArchiveRelationshipsForRequest(query = {}) {
+async function getMusicPeopleArchiveRelationshipsForRequest(query = {}, waitForBuild = true) {
   if (!await checkMusicPeopleRelationshipSource()) return new Map();
+  if (query.retry_relationships === '1' && !musicPeopleReadiness.snapshot(new Map()).active) {
+    try { await restoreMusicPeopleRelationshipSnapshot(musicPeopleSourceSnapshot, true); }
+    catch (_) { musicPeopleReadiness.fail('persistence_failed', { preserveCache: true }); }
+  }
   const cached = getCachedMusicPeopleArchiveRelationships();
-  if (cached) return cached;
-
+  if (cached) {
+    const state = musicPeopleReadiness.snapshot(cached);
+    if (musicPeopleReadiness.needsRefresh() || query.retry_relationships === '1' && state.refresh_retry_allowed) {
+      buildMusicPeopleArchiveRelationships({ retry: query.retry_relationships === '1', refresh: true }).catch(() => {});
+    }
+    return cached;
+  }
   const relationshipBuild = buildMusicPeopleArchiveRelationships({ retry: query.retry_relationships === '1' });
-  if (!MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS) {
+  if (!waitForBuild || !MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS) {
     relationshipBuild.catch(() => {});
     return new Map();
   }
-
-  return Promise.race([
-    relationshipBuild,
-    new Promise((resolve) => {
-      setTimeout(() => resolve(new Map()), MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS);
-    })
-  ]);
+  return Promise.race([relationshipBuild,
+    new Promise(resolve => setTimeout(() => resolve(new Map()), MUSIC_PEOPLE_ARCHIVE_REQUEST_WAIT_MS))]);
 }
 
 function shouldIncludeMusicPeopleArchive(query) {
@@ -2134,34 +2161,24 @@ function shouldUseCachedMusicPeopleArchive(query) {
 }
 
 async function getMusicPeopleArchiveRelationshipsForListRequest(query) {
-  if (shouldIncludeMusicPeopleArchive(query)) {
-    return getMusicPeopleArchiveRelationshipsForRequest(query);
-  }
+  if (shouldIncludeMusicPeopleArchive(query)) return getMusicPeopleArchiveRelationshipsForRequest(query);
   if (shouldUseCachedMusicPeopleArchive(query) || query.retry_relationships === '1') {
-    if (!await checkMusicPeopleRelationshipSource()) return new Map();
-    const cached = getCachedMusicPeopleArchiveRelationships();
-    if (cached) return cached;
-    buildMusicPeopleArchiveRelationships({ retry: query.retry_relationships === '1' }).catch(() => {});
+    return getMusicPeopleArchiveRelationshipsForRequest(query, false);
   }
-  else await checkMusicPeopleRelationshipSource();
+  await checkMusicPeopleRelationshipSource();
   return new Map();
 }
 
 async function getMusicPersonArchiveRelationship(row, query = {}) {
-  if (!await checkMusicPeopleRelationshipSource()) return new Map();
-  const personId = String(row.person_id || '').trim();
-  let state = smugMusicPersonArchiveRelationshipCache.get(personId);
-  if (!state) {
-    state = createMusicPeopleReadiness({ ttlMs: MUSIC_PEOPLE_ARCHIVE_CACHE_TTL_MS });
-    smugMusicPersonArchiveRelationshipCache.set(personId, state);
+  return getMusicPeopleArchiveRelationshipsForRequest(query);
+}
+
+function getMusicPeopleReadinessForRows(relationships, rows) {
+  const state = musicPeopleReadiness.snapshot(relationships);
+  if (state.authoritative && rows.some(row => !musicPeopleRelationshipsMatchIdentity(relationships, row))) {
+    return { ...state, status: 'preparing', authoritative: false, retry_allowed: false, reason: 'source_changed' };
   }
-  return state.prepare((control) => musicPeoplePreparationGate(async () => {
-    if (!SMUG_API_KEY) throw Object.assign(new Error('configuration_missing'), { code: 'configuration_missing' });
-    const relationships = await buildMusicPeopleArchiveRelationshipsForPeople([row], control);
-    if (!await checkMusicPeopleRelationshipSource()) throw Object.assign(new Error('source_check_failed'), { code: 'source_check_failed' });
-    if (!relationships.has(personId)) relationships.set(personId, createEmptyMusicPersonArchivePayload());
-    return relationships;
-  }, control), { retry: query.retry_relationships === '1' });
+  return state;
 }
 
 function getMusicBandSmugTarget(row) {
@@ -3622,7 +3639,7 @@ async function buildMusicPeoplePublicDbResponse() {
     LIMIT 1000
   `);
   const archiveRelationships = await getMusicPeopleArchiveRelationshipsForRequest();
-  const readiness = musicPeopleReadiness.snapshot(archiveRelationships);
+  const readiness = getMusicPeopleReadinessForRows(archiveRelationships, result.rows || []);
   const data = (result.rows || []).map((row) => buildMusicPersonDbApiItem(row, archiveRelationships, readiness));
 
   return {
@@ -10672,9 +10689,13 @@ async function buildWrestlingVenuesDbStatsResponse() {
   };
 }
 
-function buildMusicPersonDbApiItem(row, archiveRelationships = new Map(), readiness = musicPeopleReadiness.snapshot(archiveRelationships)) {
+function buildMusicPersonDbApiItem(row, archiveRelationships = new Map(), readiness = getMusicPeopleReadinessForRows(archiveRelationships, [row])) {
+  if (readiness.authoritative && !musicPeopleRelationshipsMatchIdentity(archiveRelationships, row)) {
+    readiness = { ...readiness, status: 'preparing', authoritative: false };
+  }
   const bands = Array.isArray(row.bands) ? row.bands : [];
-  const archive = archiveRelationships.get(String(row.person_id || '').trim()) || {};
+  const archive = musicPeopleRelationshipsMatchIdentity(archiveRelationships, row)
+    ? archiveRelationships.get(String(row.person_id || '').trim()) || {} : {};
   const hasArchive = Object.keys(archive).length > 0;
   const stats = row.stats && typeof row.stats === 'object' ? { ...row.stats } : {};
   const statsAliases = {
@@ -10869,7 +10890,7 @@ async function handleMusicPeopleDbRequest(req, res) {
       dataValues
     );
     const archiveRelationships = await getMusicPeopleArchiveRelationshipsForListRequest(req.query);
-    const readiness = musicPeopleReadiness.snapshot(archiveRelationships);
+    const readiness = getMusicPeopleReadinessForRows(archiveRelationships, result.rows);
     const data = result.rows.map((row) => buildMusicPersonDbApiItem(row, archiveRelationships, readiness));
     const pagination = buildPaginationMeta(page, limit, total, data.length);
 
@@ -10958,8 +10979,7 @@ async function handleMusicPersonDbDetailRequest(req, res) {
     }
 
     const archiveRelationships = await getMusicPersonArchiveRelationship(row, req.query);
-    const readiness = (smugMusicPersonArchiveRelationshipCache.get(String(row.person_id || '').trim()) || musicPeopleReadiness)
-      .snapshot(archiveRelationships);
+    const readiness = getMusicPeopleReadinessForRows(archiveRelationships, [row]);
     const data = buildMusicPersonDbApiItem(row, archiveRelationships, readiness);
     // Preserve the detail envelope previously supplied by the runtime wrapper.
     const stats = data.stats || {};
@@ -20562,7 +20582,7 @@ async function getLatestStatsSnapshots({ section } = {}) {
   if (!ready) throw new Error('Missing DATABASE_URL environment variable.');
 
   const values = [];
-  const where = [];
+  const where = ["NOT (section = 'music' AND category = 'people' AND snapshot_key = 'relationship_population:v1')"];
   const cleanSection = String(section || '').trim().toLowerCase();
   if (cleanSection) {
     values.push(cleanSection);
@@ -20589,7 +20609,7 @@ async function buildStatsHealth(section) {
     if (!existingTables.has('stats_snapshots')) return health;
 
     const values = [];
-    const where = [];
+    const where = ["NOT (section = 'music' AND category = 'people' AND snapshot_key = 'relationship_population:v1')"];
     const cleanSection = String(section || '').trim().toLowerCase();
     if (cleanSection) {
       values.push(cleanSection);
@@ -20735,6 +20755,7 @@ async function getAdminOverviewStatsSummary(warnings) {
   const result = await dbPool.query(`
     SELECT id, section, category, snapshot_key, data, generated_at, meta, created_at
     FROM stats_snapshots
+    WHERE NOT (section = 'music' AND category = 'people' AND snapshot_key = 'relationship_population:v1')
     ORDER BY section ASC, category ASC, snapshot_key ASC
   `);
   const items = result.rows.map(buildStatsSnapshotApiItem);
@@ -25193,6 +25214,9 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log(`VMPix V3 Data API listening on ${PORT}`);
     calendar.start();
+    if (String(process.env.DATABASE_URL || '').trim()) {
+      getMusicPeopleArchiveRelationshipsForListRequest({ archive: 'cache' }).catch(() => {});
+    }
   });
 }
 
