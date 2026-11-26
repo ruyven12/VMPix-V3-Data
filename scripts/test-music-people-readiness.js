@@ -56,6 +56,118 @@ function fixture() {
     changeSource: () => { version += 'x'; }, failDb: value => { failDb = value; }, build: fn => { build = fn; } };
 }
 
+function runtimeFixture() {
+  const f = fixture(), routes = new Map();
+  const start = require('../package.json').scripts.start;
+  assert.equal(start, 'node server-runtime.js');
+  f.ctx.app = { get(route, handler) {
+    assert(!routes.has(route), 'runtime must not shadow the canonical route');
+    routes.set(route, handler);
+  } };
+  // Execute the real npm-start entrypoint, isolating server startup side effects.
+  // Its server dependency installs the actual route declarations and handlers
+  // against the existing mocked DB/provider fixture, never migrations or sockets.
+  let loads = 0;
+  vm.runInNewContext(fs.readFileSync(require.resolve('../server-runtime.js'), 'utf8'), {
+    require(id) {
+      assert.equal(id, './server'); loads++;
+      for (const name of ['slugifyMusicBandId', 'handleMusicPersonDbDetailRequest']) loadFunction(f.ctx, name);
+      const declarations = source.match(/app\.get\('\/api\/music\/people\/db(?:\/:personId)?', async \(req, res\) => \{[\s\S]*?\n\}\);/g);
+      assert.equal(declarations.length, 2);
+      vm.runInContext(declarations.join('\n'), f.ctx);
+    }
+  }, { filename: 'server-runtime.js' });
+  assert.equal(loads, 1);
+  f.request = async (query = {}, personId = '1', route = '/api/music/people/db/:personId') => {
+    const res = { statusCode: 200, status(code) { this.statusCode = code; return this; },
+      json(value) { this.value = value; } };
+    await routes.get(route)({ params: { personId }, query }, res);
+    return { status: res.statusCode, body: res.value };
+  };
+  return f;
+}
+
+test('npm start detail preserves the three-photo Map, complete readiness and legacy envelope', async () => {
+  const f = runtimeFixture();
+  const photos = [1, 2, 3].map(n => ({ image_key: `fixture${n}` }));
+  const shows = [{ show_id: 1 }];
+  f.build(async () => new Map([['1', { photo_count: 3, matched_photos: photos, tagged_shows: shows,
+    show_count: 1, set_count: 2, event_count: 1, first_seen: '2001-01-01', latest_seen: '2002-01-01' }]]));
+  const { status, body } = await f.request();
+  assert.equal(status, 200); assert.equal(body.ok, true);
+  assert.equal(body.photo_count, 3); assert.equal(body.data.photo_count, 3);
+  assert.deepEqual(body.matched_photos, photos); assert.deepEqual(body.data.matched_photos, photos);
+  assert.equal(body.verified_photo_count, 3); assert.equal(body.photo_count_status, 'verified');
+  assert.equal(body.photo_count_source, 'relationship_cache');
+  const state = f.ctx.smugMusicPersonArchiveRelationshipCache.get('1');
+  const expected = state.snapshot(state.read());
+  assert.deepEqual(body.relationship_readiness, expected);
+  for (const field of ['route', 'source', 'generatedAt', 'generatedTime', 'person_id', 'name', 'category',
+    'aliases', 'bands', 'instruments', 'photo_count', 'event_count', 'show_count', 'set_count',
+    'first_seen', 'latest_seen', 'matched_photos', 'tagged_shows', 'data']) assert(field in body, field);
+  assert.equal(body.first_seen, '2001-01-01'); assert.equal(body.latest_seen, '2002-01-01');
+  assert.equal(body.show_count, 1); assert.equal(body.set_count, 2);
+  await f.request(); assert.equal(f.builds(), 1);
+});
+
+test('npm start detail exposes preparing after an invalidated in-flight result, never stale photos', async () => {
+  const f = runtimeFixture(), gate = deferred(); f.build(() => gate.promise);
+  const request = f.request(); await tick();
+  assert.equal(f.ctx.smugMusicPersonArchiveRelationshipCache.get('1').snapshot().status, 'preparing');
+  f.changeSource(); await f.ctx.checkMusicPeopleRelationshipSource();
+  gate.resolve(new Map([['1', { photo_count: 99 }]]));
+  const { body } = await request;
+  assert.equal(body.relationship_readiness.status, 'preparing');
+  assert.equal(body.relationship_readiness.authoritative, false);
+  assert.equal(body.photo_count_status, 'unavailable'); assert.equal(body.verified_photo_count, null);
+  assert.equal(body.photo_count, 9); assert.equal(body.photo_count_source, 'stored_fallback');
+  assert.equal(body.matched_photos.length, 0);
+});
+
+test('npm start detail keeps errors sticky and forwards intentional Retry to the lifecycle', async () => {
+  const f = runtimeFixture(); f.build(async () => { throw Error('private provider details'); });
+  const failed = (await f.request()).body;
+  assert.equal(failed.relationship_readiness.status, 'error');
+  assert.equal(failed.relationship_readiness.retry_allowed, true);
+  assert.equal(failed.photo_count_status, 'unavailable');
+  assert(!JSON.stringify(failed).includes('private provider'));
+  f.build(async () => new Map([['1', { photo_count: 3 }]]));
+  assert.equal((await f.request()).body.relationship_readiness.status, 'error');
+  assert.equal(f.builds(), 1);
+  const recovered = (await f.request({ retry_relationships: '1' })).body;
+  assert.equal(recovered.relationship_readiness.status, 'ready');
+  assert.equal(recovered.relationship_readiness.authoritative, true);
+  assert.equal(recovered.photo_count, 3); assert.equal(f.builds(), 2);
+});
+
+test('npm start list and detail share verified zero and readiness contracts', async () => {
+  const f = runtimeFixture(); f.build(async () => new Map());
+  const detail = (await f.request()).body;
+  await f.ctx.buildMusicPeopleArchiveRelationships();
+  const list = (await f.request({ archive: 'cached' }, '', '/api/music/people/db')).body;
+  for (const payload of [detail, list]) {
+    assert.equal(payload.relationship_readiness.status, 'ready');
+    assert.equal(payload.relationship_readiness.authoritative, true);
+  }
+  assert.deepEqual(Object.keys(detail.relationship_readiness).sort(), Object.keys(list.relationship_readiness).sort());
+  for (const person of [detail.data, list.data[0]]) {
+    assert.equal(person.photo_count, 0); assert.equal(person.verified_photo_count, 0);
+    assert.equal(person.photo_count_status, 'verified'); assert.equal(person.photo_count_source, 'relationship_cache');
+  }
+  assert.equal(detail.photo_count, 0); assert.equal(detail.verified_photo_count, 0);
+});
+
+test('npm start detail preserves ID validation, missing record and DB failure responses', async () => {
+  const f = runtimeFixture();
+  assert.equal((await f.request({}, '')).status, 400);
+  f.ctx.dbPool.query = async () => ({ rows: [] });
+  const missing = await f.request();
+  assert.equal(missing.status, 404); assert.equal(missing.body.error, 'MUSIC_PERSON_NOT_FOUND');
+  f.ctx.dbPool.query = async () => { throw Error('private DB details'); };
+  const failed = await f.request(); assert.equal(failed.status, 500); assert.equal(failed.body.ok, false);
+  assert.equal(f.builds(), 0);
+});
+
 test('cold, delayed, concurrent and warm requests share population preparation, never a timer-derived ready', async () => {
   const f = fixture(), gate = deferred(); f.build(() => gate.promise);
   const first = await f.ctx.getMusicPeopleArchiveRelationshipsForRequest();

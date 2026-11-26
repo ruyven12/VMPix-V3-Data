@@ -10961,6 +10961,18 @@ async function handleMusicPersonDbDetailRequest(req, res) {
     const readiness = (smugMusicPersonArchiveRelationshipCache.get(String(row.person_id || '').trim()) || musicPeopleReadiness)
       .snapshot(archiveRelationships);
     const data = buildMusicPersonDbApiItem(row, archiveRelationships, readiness);
+    // Preserve the detail envelope previously supplied by the runtime wrapper.
+    const stats = data.stats || {};
+    const matchedPhotos = Array.isArray(data.matched_photos) ? data.matched_photos
+      : Array.isArray(stats.matched_photos) ? stats.matched_photos : [];
+    const taggedShows = Array.isArray(data.tagged_shows) ? data.tagged_shows
+      : Array.isArray(stats.tagged_shows) ? stats.tagged_shows : [];
+    const bands = Array.isArray(data.bands) ? data.bands : [];
+    const instruments = Array.from(new Set(bands
+      .flatMap((band) => String(band && (band.instrument || band.instruments) || '').split(','))
+      .map((value) => value.trim()).filter(Boolean)));
+    const showCount = data.show_count ?? stats.show_count ?? taggedShows.length;
+    const generated = new Date();
     res.json({
       ok: true,
       route: '/api/music/people/db/:personId',
@@ -10969,9 +10981,25 @@ async function handleMusicPersonDbDetailRequest(req, res) {
         type: 'postgres',
         table: 'music_people'
       },
-      generatedAt: new Date().toISOString(),
-      generatedTime: formatEasternGeneratedTime(new Date()),
+      generatedAt: generated.toISOString(),
+      generatedTime: formatEasternGeneratedTime(generated),
       person_id: data.person_id,
+      name: data.name,
+      category: data.category,
+      aliases: Array.isArray(data.aliases) ? data.aliases : [],
+      bands,
+      instruments,
+      photo_count: data.photo_count ?? stats.photo_count ?? matchedPhotos.length,
+      photo_count_status: data.photo_count_status,
+      photo_count_source: data.photo_count_source,
+      verified_photo_count: data.verified_photo_count,
+      event_count: data.event_count ?? stats.event_count ?? showCount,
+      show_count: showCount,
+      set_count: data.set_count ?? stats.set_count ?? taggedShows.length,
+      first_seen: data.first_seen ?? stats.first_seen ?? null,
+      latest_seen: data.latest_seen ?? stats.latest_seen ?? null,
+      matched_photos: matchedPhotos,
+      tagged_shows: taggedShows,
       data
     });
   } catch (err) {
